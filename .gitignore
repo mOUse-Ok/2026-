@@ -1,0 +1,55 @@
+# 编译产物和构建目录
+build/
+out/
+bin/
+obj/
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+Testing/
+Makefile
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+*.o
+*.a
+*.so
+*.dylib
+*.exe
+*.dll
+
+# 模型文件和大数据文件
+models/
+*.gguf
+*.bin
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# Python 相关
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.env
+.venv
+pip-log.txt
+pip-delete-this-directory.txt
+*.egg-info/
+.eggs/
+
+# IDE 和编辑器配置
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# 日志文件
+*.log
