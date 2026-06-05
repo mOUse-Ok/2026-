@@ -14,6 +14,7 @@
 #include "ops.h"
 #include "ggml.h"
 #include "common.h"
+#include "trace_event.h"
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
 #include <malloc.h> // using malloc.h with MSC/MINGW
@@ -3040,6 +3041,10 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             continue;
         }
 
+        if (llm_mem_trace_enabled()) {
+            llm_mem_trace_tensor_begin(node);
+        }
+
         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
         // Try fused ops, fall back to normal compute
         const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
@@ -3047,6 +3052,12 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             node_n += n_fused;
         } else {
             ggml_compute_forward(&params, node);
+        }
+
+        if (llm_mem_trace_enabled()) {
+            llm_mem_trace_tensor_end(node);
+            llm_mem_trace_kv_set_rows(node);
+            llm_mem_trace_moe_weights(node);
         }
 
         if (state->ith == 0 && cplan->abort_callback &&

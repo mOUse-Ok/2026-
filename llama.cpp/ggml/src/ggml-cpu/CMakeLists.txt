@@ -56,6 +56,20 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
 
     target_compile_features(${GGML_CPU_NAME} PRIVATE c_std_11 cxx_std_17)
     target_include_directories(${GGML_CPU_NAME} PRIVATE . ggml-cpu)
+    if (LLAMA_MEM_TRACE)
+        target_include_directories(${GGML_CPU_NAME} PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../trace
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../src
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+        )
+        target_sources(${GGML_CPU_NAME} PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../trace/trace_writer.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../trace/tensor_trace.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../trace/kv_trace.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../trace/expert_trace.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../trace/os_trace.cpp
+        )
+    endif()
 
     if (APPLE AND GGML_ACCELERATE)
         find_library(ACCELERATE_FRAMEWORK Accelerate)

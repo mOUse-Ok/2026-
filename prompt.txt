@@ -1,0 +1,337 @@
+你是一名“LLM Systems + Operating Systems + Memory Architecture”方向的高级系统研究工程师。
+
+你的任务是：
+
+在 llama.cpp 推理框架中，实现一个“基础版 LLM 推理访存行为观测系统（Memory Behavior Observation System）”。
+
+当前实验环境：
+
+- OS: Ubuntu under WSL2
+- Framework: llama.cpp
+- Model: Qwen3.5-35B-A3B-Q3_K_M.gguf
+- 推理方式：llama-cli
+- 支持 CPU 推理与部分 CUDA offload
+- 目标不是优化，而是“高质量可观测化（observability）”
+
+====================================================
+一、总体目标
+====================================================
+
+请你实现一个“分层事件驱动”的访存行为分析框架。
+
+核心要求：
+
+1. 不修改模型语义
+2. 不改变推理结果
+3. 以“低侵入式 instrumentation”为主
+4. 所有事件必须带统一时间戳
+5. 支持后续离线分析
+6. 输出结构化日志（JSONL / CSV）
+
+系统目标：
+
+建立如下关联：
+
+token
+→ layer
+→ tensor access
+→ KV cache behavior
+→ expert activation
+→ OS memory event
+→ latency
+
+====================================================
+二、必须实现的研究重点
+====================================================
+
+系统必须覆盖以下研究重点。
+
+----------------------------------------------------
+[1] Parameter Loading（参数加载行为）
+----------------------------------------------------
+
+目标：
+
+观测模型参数的实际访问行为。
+
+需要捕获：
+
+- tensor name
+- layer id
+- tensor size
+- tensor address
+- tensor backend（CPU/GPU）
+- tensor first-touch timestamp
+- tensor compute begin/end
+- 是否触发首次 page fault（如果可行）
+
+重点研究：
+
+- lazy mmap loading
+- layer-wise parameter streaming
+- tensor locality
+- quantized tensor layout locality
+- prefill/decode阶段差异
+
+建议hook位置：
+
+- ggml_compute_forward_*()
+- tensor lookup/load位置
+- ggml backend dispatch位置
+
+输出事件示例：
+
+{
+  "event": "TENSOR_ACCESS",
+  "ts_ns": ...,
+  "layer": 12,
+  "tensor": "blk.12.attn_q.weight",
+  "size": 33554432,
+  "backend": "CPU"
+}
+
+----------------------------------------------------
+[2] KV Cache Behavior（KV Cache行为）
+----------------------------------------------------
+
+目标：
+
+观测 KV cache 的增长、访问、局部性。
+
+必须捕获：
+
+- token id
+- layer id
+- KV append
+- KV size
+- KV memory address
+- context length
+- prefill/decode phase
+- attention access range
+- KV block reuse statistics
+
+重点研究：
+
+- append-only增长行为
+- locality
+- long-context memory growth
+- 高频KV区域
+- decode阶段memory-bound特征
+
+建议：
+
+在attention相关kernel附近hook。
+
+输出示例：
+
+{
+  "event": "KV_APPEND",
+  "ts_ns": ...,
+  "layer": 18,
+  "token": 523,
+  "kv_bytes": 1048576,
+  "ctx_len": 8192
+}
+
+----------------------------------------------------
+[3] Expert Activation（MoE专家激活）
+----------------------------------------------------
+
+模型是 MoE（Qwen3.5-A3B）。
+
+目标：
+
+观测 token-routing 导致的访存行为。
+
+必须捕获：
+
+- token id
+- layer id
+- routed experts
+- top-k routing score
+- expert tensor access
+- expert load latency
+- expert frequency distribution
+
+重点研究：
+
+- 热点专家
+- 专家局部性
+- token→expert映射规律
+- expert activation skew
+- expert memory footprint
+
+输出示例：
+
+{
+  "event": "EXPERT_ROUTE",
+  "ts_ns": ...,
+  "layer": 22,
+  "token": 531,
+  "experts": [3, 17],
+  "scores": [0.72, 0.21]
+}
+
+====================================================
+三、系统层访存观测
+====================================================
+
+必须实现 Linux/WSL2 层面的内存行为统计。
+
+至少支持：
+
+- RSS
+- page fault
+- mmap统计
+- major/minor fault
+- virtual memory size
+- memory bandwidth（若可行）
+- cache miss（若可行）
+
+优先方案：
+
+- perf
+- /proc/<pid>/*
+- eBPF（如果环境允许）
+- mincore()
+- pagemap
+
+不要实现复杂内核模块。
+
+只做用户态可行方案。
+
+输出示例：
+
+{
+  "event": "PAGE_FAULT",
+  "ts_ns": ...,
+  "minor_fault": 128,
+  "major_fault": 0
+}
+
+====================================================
+四、阶段识别（非常重要）
+====================================================
+
+系统必须区分：
+
+1. PREFILL
+2. DECODE
+
+并为所有事件打标签。
+
+因为：
+
+- prefill偏compute-bound
+- decode偏memory-bound
+
+这是后续分析重点。
+
+====================================================
+五、统一事件流架构
+====================================================
+
+实现统一trace pipeline：
+
+TOKEN_BEGIN
+LAYER_BEGIN
+TENSOR_ACCESS
+KV_APPEND
+EXPERT_ROUTE
+PAGE_FAULT
+CACHE_STAT
+TOKEN_END
+
+要求：
+
+- 全局单调时间戳
+- 低锁开销
+- 不阻塞推理线程
+- 支持异步flush
+
+====================================================
+六、日志与数据输出
+====================================================
+
+要求：
+
+1. 输出 JSONL
+2. 每行一个事件
+3. 字段统一
+4. 易于 pandas 分析
+5. 可离线回放
+
+建议目录：
+
+trace/
+ ├── tensor_trace.jsonl
+ ├── kv_trace.jsonl
+ ├── expert_trace.jsonl
+ ├── memory_trace.jsonl
+ └── summary.json
+
+====================================================
+七、分析目标（重要）
+====================================================
+
+系统最终必须支持后续分析：
+
+1. token-latency曲线
+2. layer memory hotspot
+3. page fault burst
+4. expert heatmap
+5. KV增长曲线
+6. prefill/decode对比
+7. tensor访问频率统计
+8. memory footprint timeline
+
+====================================================
+八、代码架构要求
+====================================================
+
+要求：
+
+- instrumentation模块化
+- 不污染核心推理逻辑
+- 使用 compile-time flag 开关
+
+例如：
+
+#ifdef LLM_MEM_TRACE
+
+建议模块：
+
+/trace
+  trace_event.h
+  trace_writer.cpp
+  tensor_trace.cpp
+  kv_trace.cpp
+  expert_trace.cpp
+  os_trace.cpp
+
+====================================================
+九、输出内容要求
+====================================================
+
+请输出：
+
+1. 完整系统设计
+2. llama.cpp 中需要修改的位置
+3. instrumentation插桩方案
+4. trace事件结构定义
+5. 日志格式设计
+6. 运行流程
+7. Linux侧统计方案
+8. 性能开销控制方法
+9. 后续可扩展方向
+10. 推荐的可视化分析方法
+
+不要只给概念。
+
+要结合 llama.cpp 实际代码结构。
+
+不要写伪学术空话。
+
+重点放在：
+
+“如何真正实现一个基础版访存行为分析系统”。

@@ -4,6 +4,7 @@
 #include "llama-io.h"
 #include "llama-model.h"
 #include "llama-context.h"
+#include "trace_event.h"
 
 #include <algorithm>
 #include <cassert>
@@ -1022,6 +1023,8 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
         seq_pos_max_rm[s] = -1;
     }
 
+    uint32_t reuse_count = 0;
+
     assert(ubatch.n_tokens == sinfo.n_stream()*sinfo.size());
 
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
@@ -1033,6 +1036,7 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
             const auto idx = sinfo.idxs[s][ii];
 
             if (!cells.is_empty(idx)) {
+                reuse_count++;
                 assert(cells.seq_count(idx) == 1);
 
                 const llama_seq_id seq_id = cells.seq_get(idx);
@@ -1085,6 +1089,8 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
         head = sinfo.idxs[s].back() + 1;
     }
+
+    llm_mem_trace_kv_reuse(ubatch.n_tokens, reuse_count);
 }
 
 bool llama_kv_cache::get_can_shift() const {

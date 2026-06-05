@@ -41,6 +41,10 @@ add_library(llama
             ${LLAMA_MODELS_SOURCES}
             )
 
+if (LLAMA_MEM_TRACE)
+    target_include_directories(llama PRIVATE ../trace)
+endif()
+
 set_target_properties(llama PROPERTIES
     VERSION ${LLAMA_INSTALL_VERSION}
     SOVERSION 0

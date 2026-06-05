@@ -9,6 +9,7 @@
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
+#include "trace_event.h"
 #include "llama.h"
 
 #include <cinttypes>
@@ -1243,6 +1244,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 int llama_context::encode(const llama_batch & batch_inp) {
     GGML_ASSERT((!batch_inp.token && batch_inp.embd) || (batch_inp.token && !batch_inp.embd)); // NOLINT
 
+    llm_mem_trace_init(nullptr);
+
     if (batch_inp.n_tokens == 0) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
@@ -1298,8 +1301,20 @@ int llama_context::encode(const llama_batch & batch_inp) {
     //       ref: https://github.com/ggml-org/llama.cpp/pull/12181#issuecomment-2730451223
     cparams.causal_attn = false;
 
+    const uint64_t trace_step = llm_mem_trace_next_step();
+    llm_mem_trace_set_ubatch(&ubatch, LLM_MEM_TRACE_PHASE_PREFILL, trace_step);
+    llm_mem_trace_ubatch_guard ubatch_guard;
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        llm_mem_trace_token_begin((int) i);
+    }
+
     ggml_status status;
     const auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_ENCODER, nullptr, status);
+
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        llm_mem_trace_token_end((int) i);
+    }
+    llm_mem_trace_clear_ubatch();
 
     cparams.causal_attn = causal_attn_org;
 
@@ -1533,6 +1548,8 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 int llama_context::decode(const llama_batch & batch_inp) {
     GGML_ASSERT((!batch_inp.token && batch_inp.embd) || (batch_inp.token && !batch_inp.embd)); // NOLINT
 
+    llm_mem_trace_init(nullptr);
+
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
@@ -1688,8 +1705,21 @@ int llama_context::decode(const llama_batch & batch_inp) {
             n_outputs = n_outputs_new;
         }
 
+        const int trace_phase = ubatch.n_tokens > 1 ? LLM_MEM_TRACE_PHASE_PREFILL : LLM_MEM_TRACE_PHASE_DECODE;
+        const uint64_t trace_step = llm_mem_trace_next_step();
+        llm_mem_trace_set_ubatch(&ubatch, trace_phase, trace_step);
+        llm_mem_trace_ubatch_guard ubatch_guard;
+        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+            llm_mem_trace_token_begin((int) i);
+        }
+
         ggml_status status;
         const auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_DECODER, mctx.get(), status);
+
+        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+            llm_mem_trace_token_end((int) i);
+        }
+        llm_mem_trace_clear_ubatch();
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module

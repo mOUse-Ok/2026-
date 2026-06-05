@@ -214,6 +214,9 @@ set_target_properties(ggml-base PROPERTIES
 )
 
 target_include_directories(ggml-base PRIVATE .)
+if (LLAMA_MEM_TRACE)
+    target_include_directories(ggml-base PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../trace)
+endif()
 if (GGML_BACKEND_DL)
     target_compile_definitions(ggml-base PUBLIC GGML_BACKEND_DL)
 endif()

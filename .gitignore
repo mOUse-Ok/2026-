@@ -53,3 +53,6 @@ pip-delete-this-directory.txt
 
 # 日志文件
 *.log
+
+# Trace 运行时输出（数据量大，不提交）
+llama.cpp/trace_output/

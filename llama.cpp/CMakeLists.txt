@@ -115,11 +115,16 @@ option(LLAMA_TESTS_INSTALL  "llama: install tests"        ON)
 # 3rd party libs
 option(LLAMA_OPENSSL    "llama: use openssl to support HTTPS" ON)
 option(LLAMA_LLGUIDANCE "llama-common: include LLGuidance library for structured output in common utils" OFF)
+option(LLAMA_MEM_TRACE  "llama: enable memory trace instrumentation" OFF)
 
 
 # Required for relocatable CMake package
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/build-info.cmake)
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/common.cmake)
+
+if (LLAMA_MEM_TRACE)
+    add_compile_definitions(LLM_MEM_TRACE)
+endif()
 
 if (NOT DEFINED LLAMA_BUILD_NUMBER)
     set(LLAMA_BUILD_NUMBER        ${BUILD_NUMBER})

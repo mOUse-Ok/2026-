@@ -4,6 +4,7 @@
 #include "ggml.h"
 #include "gguf.h"
 #include "llama-hparams.h"
+#include "trace_event.h"
 
 #include <algorithm>
 #include <array>
@@ -1630,6 +1631,8 @@ bool llama_model_loader::load_all_data(
                 }
             }
         }
+
+        llm_mem_trace_tensor_loaded(cur, use_mmap ? "mmap" : "io");
 
         size_done += n_size;
     }
