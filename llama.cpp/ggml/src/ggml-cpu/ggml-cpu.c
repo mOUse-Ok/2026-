@@ -3041,7 +3041,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             continue;
         }
 
-        if (llm_mem_trace_enabled()) {
+        if (state->ith == 0 && llm_mem_trace_enabled()) {
             llm_mem_trace_tensor_begin(node);
         }
 
@@ -3054,7 +3054,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             ggml_compute_forward(&params, node);
         }
 
-        if (llm_mem_trace_enabled()) {
+        if (state->ith == 0 && llm_mem_trace_enabled()) {
             llm_mem_trace_tensor_end(node);
             llm_mem_trace_kv_set_rows(node);
             llm_mem_trace_moe_weights(node);

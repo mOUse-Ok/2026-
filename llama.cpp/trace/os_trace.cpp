@@ -108,6 +108,7 @@ extern "C" void llm_mem_trace_memory_sample(const char * reason) {
 
 #ifdef __linux__
     static StatData prev = {};
+    static bool have_prev = false;
 
     StatData cur = {};
     if (!read_proc_stat(cur)) {
@@ -118,10 +119,11 @@ extern "C" void llm_mem_trace_memory_sample(const char * reason) {
     const uint64_t rss_bytes = cur.rss_pages * page_size;
     const uint64_t vms_bytes = cur.vsize;
 
-    const uint64_t minflt_delta = cur.minflt >= prev.minflt ? cur.minflt - prev.minflt : 0;
-    const uint64_t majflt_delta = cur.majflt >= prev.majflt ? cur.majflt - prev.majflt : 0;
+    const uint64_t minflt_delta = have_prev && cur.minflt >= prev.minflt ? cur.minflt - prev.minflt : 0;
+    const uint64_t majflt_delta = have_prev && cur.majflt >= prev.majflt ? cur.majflt - prev.majflt : 0;
 
     prev = cur;
+    have_prev = true;
 
     const uint64_t mmap_count = count_maps();
 

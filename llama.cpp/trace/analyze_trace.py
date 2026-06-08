@@ -156,6 +156,55 @@ def add_relative_time(records: list[dict]) -> list[dict]:
     return records
 
 
+def env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+
+
+EXPERT_TOPK_MAX = env_int("LLM_MEM_TRACE_EXPERT_TOPK_MAX", 16)
+EXPERT_ID_MAX = env_int("LLM_MEM_TRACE_MAX_EXPERT_ID", 255)
+
+
+def valid_experts(record: dict) -> list[int]:
+    experts = record.get("experts", [])
+    if not isinstance(experts, list) or not experts:
+        return []
+    if len(experts) > EXPERT_TOPK_MAX:
+        return []
+    out: list[int] = []
+    for eid in experts:
+        if not isinstance(eid, int) or eid < 0 or eid > EXPERT_ID_MAX:
+            return []
+        out.append(eid)
+    return out
+
+
+def kv_append_key(record: dict) -> tuple:
+    return (
+        record.get("phase"),
+        record.get("step"),
+        record.get("layer"),
+        record.get("kind"),
+        record.get("kv_addr"),
+        tuple(record.get("token_ids", [])),
+        record.get("kv_bytes", 0),
+    )
+
+
+def dedupe_kv_appends(records: list[dict]) -> list[dict]:
+    seen: set[tuple] = set()
+    deduped: list[dict] = []
+    for record in records:
+        key = kv_append_key(record)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(record)
+    return deduped
+
+
 # ─────────────────────────────────────────────
 #  Plot 1: Memory Timeline (RSS / VMS / Page Faults)
 # ─────────────────────────────────────────────
@@ -258,12 +307,15 @@ def plot_memory_timeline(memory_records: list[dict], out_dir: str):
 # ─────────────────────────────────────────────
 
 def plot_kv_cache(kv_records: list[dict], out_dir: str):
-    appends = [r for r in kv_records if r.get("event") == "KV_APPEND"]
+    appends_raw = [r for r in kv_records if r.get("event") == "KV_APPEND"]
+    appends = dedupe_kv_appends(appends_raw)
     reuses = [r for r in kv_records if r.get("event") == "KV_REUSE"]
 
     if not appends and not reuses:
         print("  [SKIP] No KV cache events")
         return None
+    if len(appends) != len(appends_raw):
+        print(f"  [INFO] KV append dedupe: {len(appends):,} unique from {len(appends_raw):,} events")
 
     appends = add_relative_time(appends)
     reuses = add_relative_time(reuses)
@@ -355,8 +407,11 @@ def plot_expert_activation(expert_records: list[dict], out_dir: str):
         layer = r.get("layer", -1)
         if layer < 0:
             continue
+        experts = valid_experts(r)
+        if not experts:
+            continue
         layer_token_counts[layer] += 1
-        for expert in r.get("experts", []):
+        for expert in experts:
             layer_expert_counts[layer][expert] += 1
 
     if not layer_expert_counts:
@@ -373,7 +428,7 @@ def plot_expert_activation(expert_records: list[dict], out_dir: str):
         return None
 
     max_expert = max(all_experts)
-    n_experts = min(max_expert + 1, 64)  # cap at 64 for readability
+    n_experts = min(max_expert + 1, EXPERT_ID_MAX + 1)
 
     # Build heatmap matrix: rows=layers, cols=experts
     matrix = np.zeros((len(layers), n_experts))
@@ -402,7 +457,7 @@ def plot_expert_activation(expert_records: list[dict], out_dir: str):
     # Aggregate across all layers
     global_counts: dict[int, int] = defaultdict(int)
     for r in routes:
-        for eid in r.get("experts", []):
+        for eid in valid_experts(r):
             global_counts[eid] += 1
 
     top_n = 20
@@ -622,7 +677,7 @@ def plot_token_latency(memory_records: list[dict], out_dir: str):
 def plot_summary_dashboard(data: dict[str, list[dict]], out_dir: str):
     """Create a summary dashboard combining key metrics."""
     mem_events = [r for r in data["memory"] if r.get("event") == "MEMORY_STAT" and "rss_bytes" in r]
-    kv_appends = [r for r in data["kv"] if r.get("event") == "KV_APPEND"]
+    kv_appends = dedupe_kv_appends([r for r in data["kv"] if r.get("event") == "KV_APPEND"])
     expert_routes = [r for r in data["expert"] if r.get("event") == "EXPERT_ROUTE"]
     tensor_accesses = [r for r in data["tensor"] if r.get("event") == "TENSOR_ACCESS"]
     token_ends = [r for r in data["memory"] if r.get("event") == "TOKEN_END" and "latency_ns" in r]
@@ -673,7 +728,7 @@ def plot_summary_dashboard(data: dict[str, list[dict]], out_dir: str):
     if expert_routes:
         expert_counts: dict[int, int] = defaultdict(int)
         for r in expert_routes:
-            for eid in r.get("experts", []):
+            for eid in valid_experts(r):
                 expert_counts[eid] += 1
         top15 = sorted(expert_counts.items(), key=lambda x: -x[1])[:15]
         if top15:
@@ -745,8 +800,10 @@ def collect_metrics(data: dict[str, list[dict]]) -> dict:
         rss_values = [r["rss_bytes"] for r in mem_events]
         metrics["rss_peak_gb"] = max(rss_values) / (1024**3)
         metrics["rss_avg_gb"] = np.mean(rss_values) / (1024**3)
-        metrics["total_minor_faults"] = mem_events[-1].get("minor_faults", 0)
-        metrics["total_major_faults"] = mem_events[-1].get("major_faults", 0)
+        metrics["total_minor_faults"] = sum(max(0, r.get("minor_faults_delta", 0)) for r in mem_events)
+        metrics["total_major_faults"] = sum(max(0, r.get("major_faults_delta", 0)) for r in mem_events)
+        metrics["minor_faults_cumulative_final"] = mem_events[-1].get("minor_faults", 0)
+        metrics["major_faults_cumulative_final"] = mem_events[-1].get("major_faults", 0)
         metrics["mmap_count"] = mem_events[-1].get("mmap_count", 0)
 
     # Token latency
@@ -762,9 +819,13 @@ def collect_metrics(data: dict[str, list[dict]]) -> dict:
     # KV Cache
     kv_appends = [r for r in data["kv"] if r.get("event") == "KV_APPEND"]
     if kv_appends:
-        metrics["kv_total_mb"] = sum(r.get("kv_bytes", 0) for r in kv_appends) / (1024**2)
+        kv_unique = dedupe_kv_appends(kv_appends)
+        metrics["kv_event_bytes_mb"] = sum(r.get("kv_bytes", 0) for r in kv_appends) / (1024**2)
+        metrics["kv_total_mb"] = sum(r.get("kv_bytes", 0) for r in kv_unique) / (1024**2)
         metrics["kv_append_events"] = len(kv_appends)
-        kv_layers = set(r.get("layer", -1) for r in kv_appends)
+        metrics["kv_append_events_unique"] = len(kv_unique)
+        metrics["kv_append_duplicate_events"] = len(kv_appends) - len(kv_unique)
+        kv_layers = set(r.get("layer", -1) for r in kv_unique)
         metrics["kv_layers"] = len(kv_layers)
 
     kv_reuses = [r for r in data["kv"] if r.get("event") == "KV_REUSE"]
@@ -784,14 +845,21 @@ def collect_metrics(data: dict[str, list[dict]]) -> dict:
         layer_experts: dict[int, set[int]] = defaultdict(set)
         # Global expert activation count (expert ID only, across all layers)
         expert_counts: dict[int, int] = defaultdict(int)
+        valid_route_events = 0
         for r in expert_routes:
             layer = r.get("layer", -1)
-            for eid in r.get("experts", []):
+            experts = valid_experts(r)
+            if not experts:
+                continue
+            valid_route_events += 1
+            for eid in experts:
                 if layer >= 0:
                     layer_experts[layer].add(eid)
                 expert_counts[eid] += 1
 
         total_unique = sum(len(s) for s in layer_experts.values())
+        metrics["expert_route_events_valid"] = valid_route_events
+        metrics["expert_route_events_skipped"] = len(expert_routes) - valid_route_events
         metrics["unique_experts_per_layer"] = total_unique
         metrics["expert_layers"] = len(layer_experts)
         # Global: how many distinct expert IDs appear across all layers
@@ -801,7 +869,7 @@ def collect_metrics(data: dict[str, list[dict]]) -> dict:
     # Tensor
     tensor_accesses = [r for r in data["tensor"] if r.get("event") == "TENSOR_ACCESS"]
     if tensor_accesses:
-        metrics["tensor_access_events"] = len(tensor_accesses)
+        metrics["tensor_access_events_sampled"] = len(tensor_accesses)
         first_touches = [r for r in tensor_accesses if r.get("first_touch") is True]
         metrics["first_touch_events"] = len(first_touches)
         metrics["first_touch_gb"] = sum(r.get("size", 0) for r in first_touches) / (1024**3)
@@ -822,15 +890,14 @@ def generate_recommendations(metrics: dict, data: dict[str, list[dict]]) -> list
     if rss_peak > 0:
         recs.append({
             "priority": "HIGH",
-            "title": "Reduce Peak Physical Memory (RSS)",
-            "finding": f"Peak RSS reached {rss_peak:.2f} GB during inference.",
+            "title": "降低峰值物理内存 RSS",
+            "finding": f"推理过程中峰值 RSS 达到 {rss_peak:.2f} GB。",
             "recommendation": (
-                "Implement layer-by-layer weight streaming: use madvise(MADV_DONTNEED) "
-                "on weight tensors after each layer completes. Since layer computation is "
-                "sequential, weights for already-computed layers can have their physical "
-                "pages reclaimed without affecting correctness."
+                "实现逐层权重流式释放：每层计算完成后，对该层权重 tensor 使用 "
+                "madvise(MADV_DONTNEED)。由于 layer 计算是顺序执行的，已经完成计算的层可以释放其物理页，"
+                "不影响正确性。"
             ),
-            "expected_benefit": "Could reduce peak RSS by 40-60% for large models with mmap loading."
+            "expected_benefit": "对使用 mmap 加载的大模型，理论上可降低 40-60% 的峰值 RSS。"
         })
 
     # 2. Page fault analysis
@@ -840,20 +907,17 @@ def generate_recommendations(metrics: dict, data: dict[str, list[dict]]) -> list
         pf_per_gb = total_pf / ft_gb if ft_gb > 0 else 0
         recs.append({
             "priority": "HIGH",
-            "title": "Optimize mmap Page Fault Pattern",
+            "title": "优化 mmap Page Fault 模式",
             "finding": (
-                f"{total_pf:,} minor page faults triggered to load {ft_gb:.2f} GB of weight data "
-                f"({pf_per_gb:,.0f} faults/GB). Each fault triggers kernel page allocation."
+                f"在 first-touch {ft_gb:.2f} GB tensor 数据时，观测到 {total_pf:,} 次 minor page-fault delta "
+                f"（约 {pf_per_gb:,.0f} faults/GB）。每次 fault 都会触发内核页分配或页表处理。"
             ),
             "recommendation": (
-                "1. Pre-fault critical weight pages at model load time using MAP_POPULATE "
-                "on hot layers.\n"
-                "2. Use madvise(MADV_SEQUENTIAL) on mmap regions to hint the kernel about "
-                "access patterns, improving readahead.\n"
-                "3. Consider using huge pages (2MB or 1GB) for weight tensors to reduce "
-                "TLB misses and page fault count by 512x or more."
+                "1. 对热点层，在模型加载时使用 MAP_POPULATE 预先触发关键权重页加载。\n"
+                "2. 对 mmap 区域使用 madvise(MADV_SEQUENTIAL)，向内核提示顺序访问模式，改善 readahead。\n"
+                "3. 考虑为权重 tensor 使用 huge pages（2MB 或 1GB），减少 TLB miss 和页级 fault 数量。"
             ),
-            "expected_benefit": "Reduce minor faults by 80-90% and improve TLB coverage."
+            "expected_benefit": "有机会显著减少 minor faults，并改善 TLB 覆盖率。"
         })
 
     # 3. Prefill vs Decode
@@ -862,18 +926,17 @@ def generate_recommendations(metrics: dict, data: dict[str, list[dict]]) -> list
     if pf_us > 0 and dc_us > 0 and pf_us > dc_us:
         recs.append({
             "priority": "MEDIUM",
-            "title": "Prefill Phase Memory Prefetching",
+            "title": "Prefill 阶段内存预取",
             "finding": (
-                f"Prefill average latency ({pf_us:.0f}μs) is much lower per-token than "
-                f"decode ({dc_us:.0f}μs), indicating compute-bound prefill vs memory-bound decode. "
-                "Prefill touches many weight pages in rapid succession."
+                f"Prefill traced-token latency（{pf_us:.0f}μs）高于 decode（{dc_us:.0f}μs）。"
+                "这里应把 prefill 看作 ubatch/prompt-processing 延迟，而不是与生成 token 延迟直接对比。"
+                "Prefill 会在短时间内连续触碰大量权重页。"
             ),
             "recommendation": (
-                "During prefill, use asynchronous prefetch (prefetch() or software pipelining) "
-                "to bring the next layer's weights into cache while computing the current layer. "
-                "This overlaps compute and memory access."
+                "在 prefill 期间使用异步预取（prefetch() 或软件流水线），在计算当前层时提前把下一层权重带入 cache。"
+                "这样可以重叠计算和内存访问。"
             ),
-            "expected_benefit": "10-20% prefill speedup by hiding memory latency."
+            "expected_benefit": "通过隐藏部分内存延迟，可能带来 10-20% 的 prefill 加速。"
         })
 
     # 4. KV Cache
@@ -882,20 +945,18 @@ def generate_recommendations(metrics: dict, data: dict[str, list[dict]]) -> list
     if kv_mb > 0:
         recs.append({
             "priority": "HIGH",
-            "title": "KV Cache Memory Management",
+            "title": "KV Cache 内存管理",
             "finding": (
-                f"KV cache grew to {kv_mb:.1f} MB across {metrics.get('kv_layers', 0)} layers. "
-                f"KV reuse rate: {reuse:.1f}% — indicating {'good cache utilization' if reuse > 30 else 'significant new allocations'}."
+                f"KV cache 在 {metrics.get('kv_layers', 0)} 个层上增长到 {kv_mb:.1f} MB。"
+                f"KV reuse rate 为 {reuse:.1f}%；这里表示旧 KV slot 复用情况，"
+                f"{'当前复用情况较好' if reuse > 30 else '这次运行主要是在追加新 KV'}。"
             ),
             "recommendation": (
-                "1. Implement KV cache quantization (e.g., KV cache in int8/fp8) to reduce "
-                "memory footprint by 50-75%.\n"
-                "2. For long-context scenarios, consider sliding window attention or "
-                "token eviction policies to bound KV cache growth.\n"
-                "3. Use a dedicated memory pool for KV cache with pre-allocated buffers "
-                "to avoid runtime allocation overhead."
+                "1. 实现 KV cache 量化（例如 int8/fp8 KV cache），降低内存占用。\n"
+                "2. 对长上下文场景，考虑 sliding window attention 或 token eviction 策略，限制 KV cache 增长。\n"
+                "3. 为 KV cache 使用专用内存池和预分配 buffer，减少运行时分配开销。"
             ),
-            "expected_benefit": "Reduce KV cache memory by 50-75% with quantization, enabling larger batch sizes."
+            "expected_benefit": "KV 量化通常可显著降低 KV cache 内存，从而支持更长上下文或更大 batch。"
         })
 
     # 5. Expert skew
@@ -903,7 +964,7 @@ def generate_recommendations(metrics: dict, data: dict[str, list[dict]]) -> list
     if expert_routes:
         expert_counts: dict[int, int] = defaultdict(int)
         for r in expert_routes:
-            for eid in r.get("experts", []):
+            for eid in valid_experts(r):
                 expert_counts[eid] += 1
 
         if expert_counts:
@@ -915,45 +976,42 @@ def generate_recommendations(metrics: dict, data: dict[str, list[dict]]) -> list
             max_eid = max(expert_counts.keys())
             expert_layers = len(set(r.get("layer", -1) for r in expert_routes if r.get("layer", -1) >= 0))
             note = (
-                f"Expert IDs range 0–{max_eid} across {expert_layers} MoE layers. "
-                f"IDs appear to be per-layer (0-255 per layer)."
+                f"Expert ID 范围为 0-{max_eid}，分布在 {expert_layers} 个 MoE 层中。"
+                f"这些 ID 看起来是每层内部编号（例如每层 0-255）。"
                 if max_eid <= 255 else ""
             )
 
             recs.append({
                 "priority": "MEDIUM",
-                "title": "MoE Expert Placement Optimization",
+                "title": "MoE Expert 放置优化",
                 "finding": (
-                    f"{n_experts_global} distinct expert IDs across {expert_layers} MoE layers. "
-                    f"Top 5 expert IDs account for {top5_pct:.1f}% of all activations, "
-                    f"indicating {'strong' if top5_pct > 60 else 'significant' if top5_pct > 20 else 'moderate'} expert activation skew. "
+                    f"在 {expert_layers} 个 MoE 层中观测到 {n_experts_global} 个有效 expert ID。"
+                    f"全局 top 5 expert ID 占全部激活的 {top5_pct:.1f}%，说明 expert 激活偏斜"
+                    f"{'很强' if top5_pct > 60 else '比较明显' if top5_pct > 20 else '中等'}。"
                     f"{note}"
                 ),
                 "recommendation": (
-                    "Hot experts (frequently activated): keep their weights in physical memory "
-                    "or in faster storage tier (GPU, HBM).\n"
-                    "Cold experts (rarely activated): keep as mmap'd files, only fault in on demand. "
-                    "This expert-aware tiered placement can significantly reduce average "
-                    "physical memory pressure for MoE models."
+                    "对 hot experts（高频激活）：尽量让权重常驻物理内存，或放到更快的存储层级（GPU/HBM）。\n"
+                    "对 cold experts（低频激活）：保留 mmap 懒加载，需要时再 fault in。"
+                    "这种 expert-aware 的分层放置可以降低 MoE 模型的平均物理内存压力。"
                 ),
                 "expected_benefit": (
-                    "If top 5 experts are 60%+ of activations, keeping only those hot experts "
-                    "resident can reduce MoE weight memory by 50-70%."
+                    "如果某些层内 expert 热点足够集中，按 (layer, expert) pin 热点权重会比全局 top expert 更有效。"
                 )
             })
 
     # 6. General
     recs.append({
         "priority": "LOW",
-        "title": "OS-Level Tuning",
-        "finding": "WSL2/Linux environment — kernel parameters affect page reclamation behavior.",
+        "title": "操作系统层调优",
+        "finding": "当前为 WSL2/Linux 环境，内核参数会影响页面回收和 fault 行为。",
         "recommendation": (
-            "1. Set vm.swappiness=1 to minimize swap (keep more in RAM).\n"
-            "2. Enable transparent huge pages: echo madvise > /sys/kernel/mm/transparent_hugepage/enabled\n"
-            "3. Increase vm.max_map_count if mmap_count is high: sysctl -w vm.max_map_count=262144\n"
-            "4. Consider using cgroups v2 memory limits to test constrained-memory scenarios."
+            "1. 设置 vm.swappiness=1，尽量减少 swap。\n"
+            "2. 启用 transparent huge pages：echo madvise > /sys/kernel/mm/transparent_hugepage/enabled\n"
+            "3. 如果 mmap_count 很高，提高 vm.max_map_count：sysctl -w vm.max_map_count=262144\n"
+            "4. 使用 cgroups v2 memory limit 测试受限内存场景。"
         ),
-        "expected_benefit": "System-level stability and 5-15% TLB miss reduction with THP."
+        "expected_benefit": "提升系统层稳定性；THP 场景下可能减少一部分 TLB miss。"
     })
 
     return recs
@@ -984,53 +1042,65 @@ def generate_html_report(
     rec_cards = ""
     priority_order = {"HIGH": 1, "MEDIUM": 2, "LOW": 3}
     priority_colors = {"HIGH": "#F44336", "MEDIUM": "#FF9800", "LOW": "#4CAF50"}
+    priority_labels = {"HIGH": "高", "MEDIUM": "中", "LOW": "低"}
     for rec in sorted(recommendations, key=lambda r: priority_order.get(r["priority"], 99)):
         bg = priority_colors.get(rec["priority"], "#9E9E9E")
         rec_cards += f"""
         <div class="rec-card" style="border-left: 4px solid {bg};">
             <div class="rec-header">
-                <span class="rec-priority" style="background: {bg};">{rec['priority']}</span>
+                <span class="rec-priority" style="background: {bg};">{priority_labels.get(rec['priority'], rec['priority'])}</span>
                 <span class="rec-title">{rec['title']}</span>
             </div>
-            <div class="rec-finding"><strong>🔍 Finding:</strong> {rec['finding']}</div>
-            <div class="rec-action"><strong>💡 Recommendation:</strong><br>{rec['recommendation'].replace(chr(10), '<br>')}</div>
-            <div class="rec-benefit"><strong>📊 Expected Benefit:</strong> {rec['expected_benefit']}</div>
+            <div class="rec-finding"><strong>🔍 发现：</strong>{rec['finding']}</div>
+            <div class="rec-action"><strong>💡 建议：</strong><br>{rec['recommendation'].replace(chr(10), '<br>')}</div>
+            <div class="rec-benefit"><strong>📊 预期收益：</strong>{rec['expected_benefit']}</div>
         </div>
         """
 
     # Build metric cards
+    kv_reuse = metrics.get("kv_reuse_rate_pct")
+    kv_reuse_display = "N/A" if kv_reuse is None else f"{kv_reuse:.1f}"
     metric_cards = f"""
-    <div class="metric-card"><div class="metric-value">{_opt(metrics.get('rss_peak_gb'))} GB</div><div class="metric-label">Peak RSS</div></div>
-    <div class="metric-card"><div class="metric-value">{_opt(metrics.get('rss_avg_gb'))} GB</div><div class="metric-label">Avg RSS</div></div>
-    <div class="metric-card"><div class="metric-value">{metrics.get('total_minor_faults', 0):,}</div><div class="metric-label">Minor Page Faults</div></div>
-    <div class="metric-card"><div class="metric-value">{_opt(metrics.get('kv_total_mb'))} MB</div><div class="metric-label">KV Cache Size</div></div>
-    <div class="metric-card"><div class="metric-value">{_opt(metrics.get('kv_reuse_rate_pct'), '.1f')}%</div><div class="metric-label">KV Reuse Rate</div></div>
-    <div class="metric-card"><div class="metric-value">{_opt(metrics.get('prefill_avg_latency_us'), '.0f')} μs</div><div class="metric-label">Prefill Latency</div></div>
-    <div class="metric-card"><div class="metric-value">{_opt(metrics.get('decode_avg_latency_us'), '.0f')} μs</div><div class="metric-label">Decode Latency</div></div>
-    <div class="metric-card"><div class="metric-value">{metrics.get('unique_experts_global', 'N/A')}</div><div class="metric-label">Distinct Expert IDs</div></div>
-    <div class="metric-card"><div class="metric-value">{metrics.get('expert_layers', 'N/A')}</div><div class="metric-label">MoE Layers</div></div>
-    <div class="metric-card"><div class="metric-value">{_opt(metrics.get('first_touch_gb'))} GB</div><div class="metric-label">mmap Lazy Load</div></div>
-    <div class="metric-card"><div class="metric-value">{metrics.get('mmap_count', 'N/A')}</div><div class="metric-label">mmap Regions</div></div>
+    <div class="metric-card"><div class="metric-value">{_opt(metrics.get('rss_peak_gb'))} GB</div><div class="metric-label">峰值 RSS</div></div>
+    <div class="metric-card"><div class="metric-value">{_opt(metrics.get('rss_avg_gb'))} GB</div><div class="metric-label">平均 RSS</div></div>
+    <div class="metric-card"><div class="metric-value">{metrics.get('total_minor_faults', 0):,}</div><div class="metric-label">Minor 缺页次数</div></div>
+    <div class="metric-card"><div class="metric-value">{_opt(metrics.get('kv_total_mb'))} MB</div><div class="metric-label">KV Cache 大小</div></div>
+    <div class="metric-card"><div class="metric-value">{kv_reuse_display}%</div><div class="metric-label">KV Slot 复用率</div></div>
+    <div class="metric-card"><div class="metric-value">{_opt(metrics.get('prefill_avg_latency_us'), '.0f')} μs</div><div class="metric-label">Prefill 延迟</div></div>
+    <div class="metric-card"><div class="metric-value">{_opt(metrics.get('decode_avg_latency_us'), '.0f')} μs</div><div class="metric-label">Decode 延迟</div></div>
+    <div class="metric-card"><div class="metric-value">{metrics.get('unique_experts_global', 'N/A')}</div><div class="metric-label">唯一 Expert ID</div></div>
+    <div class="metric-card"><div class="metric-value">{metrics.get('expert_layers', 'N/A')}</div><div class="metric-label">MoE 层数</div></div>
+    <div class="metric-card"><div class="metric-value">{_opt(metrics.get('first_touch_gb'))} GB</div><div class="metric-label">mmap 懒加载量</div></div>
+    <div class="metric-card"><div class="metric-value">{metrics.get('mmap_count', 'N/A')}</div><div class="metric-label">mmap 区域数</div></div>
     """
 
     # Plot gallery
     plot_gallery = ""
+    plot_labels = {
+        "Memory Timeline": "内存时间线",
+        "KV Cache": "KV Cache 行为",
+        "Expert Activation": "Expert 激活分布",
+        "Tensor Access": "Tensor 访存",
+        "Token Latency": "Token 延迟",
+        "Summary Dashboard": "总览仪表盘",
+    }
     for name, path in plot_paths.items():
         if path:
             rel = os.path.relpath(path, out_dir)
+            label = plot_labels.get(name, name)
             plot_gallery += f"""
             <div class="plot-card">
-                <img src="{rel}" alt="{name}" loading="lazy">
-                <div class="plot-caption">{name}</div>
+                <img src="{rel}" alt="{label}" loading="lazy">
+                <div class="plot-caption">{label}</div>
             </div>
             """
 
     html = f"""<!DOCTYPE html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>LLM Memory Behavior Analysis Report</title>
+<title>LLM 访存行为分析报告</title>
 <style>
     * {{ box-sizing: border-box; margin: 0; padding: 0; }}
     body {{
@@ -1106,47 +1176,45 @@ def generate_html_report(
 <div class="container">
 
 <div class="header">
-    <h1>🔬 LLM Memory Behavior Analysis Report</h1>
+    <h1>🔬 LLM 访存行为分析报告</h1>
     <p>
-        Model: Qwen3.5-35B-A3B (Q3_K_M quantized, MoE, ~16GB on disk)<br>
-        Framework: llama.cpp with LLM_MEM_TRACE instrumentation<br>
-        Environment: Ubuntu under WSL2 · CPU-only inference<br>
-        Generated tokens: {num_generate} · Phase: PREFILL + DECODE
+        模型：Qwen3.5-35B-A3B（Q3_K_M 量化，MoE，磁盘约 16GB）<br>
+        框架：带 LLM_MEM_TRACE 插桩的 llama.cpp<br>
+        环境：WSL2 下 Ubuntu · 纯 CPU 推理<br>
+        生成 token：{num_generate} · 阶段：PREFILL + DECODE
     </p>
     <div class="phase-legend">
-        <span><span class="phase-dot" style="background:#2196F3;"></span> PREFILL (compute-bound)</span>
-        <span><span class="phase-dot" style="background:#FF9800;"></span> DECODE (memory-bound)</span>
+        <span><span class="phase-dot" style="background:#2196F3;"></span> PREFILL（偏计算/首触加载）</span>
+        <span><span class="phase-dot" style="background:#FF9800;"></span> DECODE（偏访存/逐 token）</span>
     </div>
 </div>
 
 <div class="test-case">
-    <h3>🧪 Test Case Design</h3>
+    <h3>🧪 测试用例设计</h3>
     <p>
-        <strong>Prompt:</strong> Comprehensive technical analysis covering CPU architecture, memory hierarchy,
-        GPU computing, OS memory management, and ML inference — designed to exercise diverse
-        MoE expert routing across multiple knowledge domains.<br>
-        <strong>Generation:</strong> {num_generate} tokens (single batch decode to observe memory-bound behavior).<br>
-        <strong>Purpose:</strong> Capture complete memory behavior across both prefill (compute-bound, touches all model weights)
-        and decode (memory-bound, KV-cache heavy) phases.
+        <strong>Prompt：</strong>覆盖 CPU 架构、内存层次、GPU 计算、操作系统内存管理和机器学习推理的综合技术分析，
+        用来触发多个知识域上的 MoE expert 路由。<br>
+        <strong>生成：</strong>{num_generate} tokens，用于观察 decode 阶段逐 token 访存行为。<br>
+        <strong>目的：</strong>同时捕获 prefill 阶段的大范围权重 first-touch，以及 decode 阶段的 KV cache 与重复计算图访存。
     </p>
 </div>
 
-<h2 class="section-title">📊 Key Metrics</h2>
+<h2 class="section-title">📊 关键指标</h2>
 <div class="metrics-grid">
     {metric_cards}
 </div>
 
-<h2 class="section-title">📈 Visual Analysis</h2>
+<h2 class="section-title">📈 可视化分析</h2>
 <div class="plot-gallery">
     {plot_gallery}
 </div>
 
-<h2 class="section-title">🎯 Optimization Recommendations</h2>
+<h2 class="section-title">🎯 优化建议</h2>
 {rec_cards}
 
 <div class="footer">
-    <p>Generated by LLM Memory Trace Analysis Pipeline · llama.cpp LLM_MEM_TRACE</p>
-    <p>All timestamps are CLOCK_MONOTONIC nanoseconds · RSS/VMS from /proc/self/stat</p>
+    <p>由 LLM Memory Trace Analysis Pipeline 生成 · llama.cpp LLM_MEM_TRACE</p>
+    <p>所有时间戳为 CLOCK_MONOTONIC 纳秒 · RSS/VMS 来自 /proc/self/stat</p>
 </div>
 
 </div>

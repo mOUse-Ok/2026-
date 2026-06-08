@@ -5,6 +5,7 @@
 #include "llama-batch.h"
 
 #include <cstring>
+#include <cstdlib>
 #include <string>
 
 namespace {
@@ -67,6 +68,16 @@ bool is_host_tensor(const ggml_tensor * t) {
     return buf && ggml_backend_buffer_is_host(buf) && t->data;
 }
 
+int env_int_or_default(const char * key, int def_value) {
+    const char * val = std::getenv(key);
+    if (!val || !val[0]) {
+        return def_value;
+    }
+    char * end = nullptr;
+    const long parsed = std::strtol(val, &end, 10);
+    return end && *end == '\0' && parsed > 0 ? (int) parsed : def_value;
+}
+
 float read_f32(const ggml_tensor * t, const char * base, size_t offset) {
     switch (t->type) {
         case GGML_TYPE_F32:
@@ -118,6 +129,12 @@ extern "C" void llm_mem_trace_moe_weights(const ggml_tensor * t) {
     if (n_expert_used <= 0 || n_tokens <= 0) {
         return;
     }
+    const int max_topk = env_int_or_default("LLM_MEM_TRACE_EXPERT_TOPK_MAX", 16);
+    if (n_expert_used > max_topk) {
+        return;
+    }
+
+    const int max_expert_id = env_int_or_default("LLM_MEM_TRACE_MAX_EXPERT_ID", 255);
 
     const llama_ubatch * ubatch = llm_mem_trace_get_ubatch();
     const uint32_t ubatch_tokens = ubatch ? ubatch->n_tokens : 0;
@@ -137,15 +154,34 @@ extern "C" void llm_mem_trace_moe_weights(const ggml_tensor * t) {
         if (ubatch && ubatch->token && tok < ubatch_tokens) {
             line += ",\"token\":" + std::to_string(ubatch->token[tok]);
         }
+        int experts[64];
+        float scores[64];
+        bool valid = n_expert_used <= (int64_t) (sizeof(experts) / sizeof(experts[0]));
+
+        for (int64_t e = 0; valid && e < n_expert_used; ++e) {
+            const size_t idx_offset = (size_t) e * ids->nb[0] + (size_t) tok * ids->nb[1];
+            const int expert = read_idx(ids, ids_base, idx_offset);
+            if (expert < 0 || expert > max_expert_id) {
+                valid = false;
+                break;
+            }
+            const size_t w_offset = (size_t) e * t->nb[1] + (size_t) tok * t->nb[2];
+            experts[e] = expert;
+            scores[e] = read_f32(t, weights_base, w_offset);
+        }
+
+        if (!valid) {
+            continue;
+        }
+
+        line += ",\"top_k\":" + std::to_string(n_expert_used);
         line += ",\"experts\":[";
 
         for (int64_t e = 0; e < n_expert_used; ++e) {
             if (e) {
                 line += ",";
             }
-            const size_t idx_offset = (size_t) e * ids->nb[0] + (size_t) tok * ids->nb[1];
-            const int expert = read_idx(ids, ids_base, idx_offset);
-            line += std::to_string(expert);
+            line += std::to_string(experts[e]);
         }
         line += "]";
 
@@ -154,9 +190,7 @@ extern "C" void llm_mem_trace_moe_weights(const ggml_tensor * t) {
             if (e) {
                 line += ",";
             }
-            const size_t w_offset = (size_t) e * t->nb[1] + (size_t) tok * t->nb[2];
-            const float score = read_f32(t, weights_base, w_offset);
-            line += std::to_string(score);
+            line += std::to_string(scores[e]);
         }
         line += "]";
 

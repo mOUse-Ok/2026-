@@ -353,6 +353,7 @@ extern "C" void llm_mem_trace_tensor_end(const ggml_tensor * t) {
 }
 
 extern "C" void llm_mem_trace_tensor_loaded(const ggml_tensor * t, const char * stage) {
+    llm_mem_trace_init(nullptr);
     if (!llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_TENSOR) || !t) {
         return;
     }

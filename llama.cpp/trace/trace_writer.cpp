@@ -284,6 +284,8 @@ extern "C" void llm_mem_trace_set_ubatch(const struct llama_ubatch * ubatch, int
 extern "C" void llm_mem_trace_clear_ubatch(void) {
     auto & ctx = context();
     ctx.ubatch.store(nullptr, std::memory_order_release);
+    ctx.phase.store(LLM_MEM_TRACE_PHASE_UNKNOWN, std::memory_order_release);
+    ctx.step_id.store(0, std::memory_order_release);
     std::lock_guard<std::mutex> lock(ctx.token_mu);
     ctx.token_begin_ts.clear();
 }
@@ -364,6 +366,14 @@ extern "C" void llm_mem_trace_token_end(int token_idx) {
     line += ",\"step\":" + std::to_string(llm_mem_trace_get_step());
     line += ",\"token_idx\":" + std::to_string(token_idx);
     line += ",\"token\":" + std::to_string(ubatch->token[token_idx]);
+    if (ubatch->pos) {
+        line += ",\"pos\":" + std::to_string(ubatch->pos[token_idx]);
+    }
+    if (ubatch->seq_id && ubatch->n_seq_id) {
+        if (ubatch->n_seq_id[token_idx] > 0) {
+            line += ",\"seq_id\":" + std::to_string(ubatch->seq_id[token_idx][0]);
+        }
+    }
     if (start_ts != 0) {
         line += ",\"latency_ns\":" + std::to_string(ts - start_ts);
     }

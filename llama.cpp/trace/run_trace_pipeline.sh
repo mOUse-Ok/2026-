@@ -11,11 +11,13 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 BUILD_DIR="$PROJECT_DIR/build"
-TRACE_OUT_DIR="$PROJECT_DIR/trace_output"
 MODEL_DIR="$PROJECT_DIR/../models"
-MODEL_FILE="$MODEL_DIR/Qwen3.5-35B-A3B-Q3_K_M.gguf"
+TRACE_BASE_DIR="${TRACE_BASE_DIR:-$PROJECT_DIR/trace_output}"
+RUN_NAME="${RUN_NAME:-latest}"
+TRACE_OUT_DIR="${TRACE_OUT_DIR:-$TRACE_BASE_DIR/$RUN_NAME}"
+MODEL_FILE="${MODEL_FILE:-$MODEL_DIR/Qwen3.5-35B-A3B-Q3_K_M.gguf}"
 ANALYSIS_SCRIPT="$SCRIPT_DIR/analyze_trace.py"
-LLAMA_CLI="$BUILD_DIR/bin/llama-cli"
+LLAMA_CLI="${LLAMA_CLI:-$BUILD_DIR/bin/llama-cli}"
 
 # ------------------------------------------------------------------
 # Test Case Design
@@ -47,11 +49,11 @@ Question: Based on the above analysis, what are the three most critical memory b
 # ------------------------------------------------------------------
 # Configuration
 # ------------------------------------------------------------------
-NUM_TOKENS_PREDICT=80        # Decode 80 tokens — enough to observe decode behavior
-NUM_THREADS=8                 # CPU threads
-BATCH_SIZE=512                # Batch size for prefill
-CTX_SIZE=2048                 # Context window size
-TEMP=0.0                      # Deterministic output for reproducibility
+NUM_TOKENS_PREDICT="${NUM_TOKENS_PREDICT:-80}"  # Decode enough tokens to observe decode behavior
+NUM_THREADS="${NUM_THREADS:-8}"                 # CPU threads
+BATCH_SIZE="${BATCH_SIZE:-512}"                 # Batch size for prefill
+CTX_SIZE="${CTX_SIZE:-2048}"                    # Context window size
+TEMP="${TEMP:-0.0}"                             # Deterministic output for reproducibility
 
 # ------------------------------------------------------------------
 # Step 0: Check prerequisites
@@ -78,6 +80,7 @@ fi
 echo "[1/4] Running LLM inference with memory tracing..."
 echo "      Model: $(basename "$MODEL_FILE")"
 echo "      Predict tokens: $NUM_TOKENS_PREDICT"
+echo "      Output dir: $TRACE_OUT_DIR"
 echo ""
 
 rm -rf "$TRACE_OUT_DIR"
@@ -85,10 +88,10 @@ mkdir -p "$TRACE_OUT_DIR"
 
 export LLM_MEM_TRACE=1
 export LLM_MEM_TRACE_DIR="$TRACE_OUT_DIR"
-export LLM_MEM_TRACE_TENSOR=1
-export LLM_MEM_TRACE_KV=1
-export LLM_MEM_TRACE_EXPERT=1
-export LLM_MEM_TRACE_MEMORY=1
+export LLM_MEM_TRACE_TENSOR="${LLM_MEM_TRACE_TENSOR:-1}"
+export LLM_MEM_TRACE_KV="${LLM_MEM_TRACE_KV:-1}"
+export LLM_MEM_TRACE_EXPERT="${LLM_MEM_TRACE_EXPERT:-1}"
+export LLM_MEM_TRACE_MEMORY="${LLM_MEM_TRACE_MEMORY:-1}"
 
 # Write prompt to temp file for -f flag (avoids pipe issues)
 PROMPT_FILE="$TRACE_OUT_DIR/test_prompt.txt"
@@ -107,7 +110,10 @@ echo ""
     --temp "$TEMP" \
     --no-display-prompt \
     --simple-io \
+    --single-turn \
+    --no-warmup \
     --no-perf \
+    --no-show-timings \
     > "$TRACE_OUT_DIR/inference_output.txt" 2>"$TRACE_OUT_DIR/inference_stderr.txt"
 
 echo "      Inference completed."
