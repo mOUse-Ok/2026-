@@ -56,3 +56,6 @@ pip-delete-this-directory.txt
 
 # Trace 运行时输出（数据量大，不提交）
 llama.cpp/trace_output/
+
+# 本地 LLM 访存分析报告（由 trace 输出整理得到，不提交）
+llm_mem_trace_report.md

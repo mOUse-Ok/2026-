@@ -4,11 +4,19 @@
 #include "ggml-backend.h"
 
 #include <atomic>
+#include <cerrno>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <string>
 #include <unordered_set>
+#include <vector>
+
+#ifdef __linux__
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 namespace {
 
@@ -91,6 +99,127 @@ const char * tensor_backend_name(const ggml_tensor * t) {
         return "unknown";
     }
     return ggml_backend_buffer_name(buf);
+}
+
+bool env_truthy(const char * value) {
+    if (!value) {
+        return false;
+    }
+    return !(value[0] == '0' && value[1] == '\0');
+}
+
+bool residency_enabled() {
+    static const bool enabled = env_truthy(std::getenv("LLM_MEM_TRACE_RESIDENCY"));
+    return enabled;
+}
+
+size_t env_size_or_default(const char * key, size_t def_value) {
+    const char * val = std::getenv(key);
+    if (!val || !val[0]) {
+        return def_value;
+    }
+    char * end = nullptr;
+    const unsigned long long parsed = std::strtoull(val, &end, 10);
+    return end && *end == '\0' && parsed > 0 ? (size_t) parsed : def_value;
+}
+
+struct ResidencyInfo {
+    bool available = false;
+    bool exact = false;
+    int error = 0;
+    uint64_t page_size = 0;
+    uint64_t page_count = 0;
+    uint64_t sampled_pages = 0;
+    uint64_t resident_pages = 0;
+};
+
+#ifdef __linux__
+ResidencyInfo query_residency(uintptr_t addr, size_t nbytes) {
+    ResidencyInfo info;
+    if (!residency_enabled() || addr == 0 || nbytes == 0) {
+        return info;
+    }
+
+    const long sys_page_size = sysconf(_SC_PAGESIZE);
+    if (sys_page_size <= 0) {
+        return info;
+    }
+
+    const uintptr_t page_size = (uintptr_t) sys_page_size;
+    const uintptr_t start = addr & ~(page_size - 1);
+    const uintptr_t last = addr + nbytes - 1;
+    if (last < addr) {
+        return info;
+    }
+    const uintptr_t end = (last & ~(page_size - 1)) + page_size;
+    const uint64_t page_count = (uint64_t) ((end - start) / page_size);
+    if (page_count == 0) {
+        return info;
+    }
+
+    info.available = true;
+    info.page_size = (uint64_t) page_size;
+    info.page_count = page_count;
+
+    const size_t max_pages = env_size_or_default("LLM_MEM_TRACE_RESIDENCY_MAX_PAGES", 4096);
+    if (page_count <= max_pages) {
+        std::vector<unsigned char> vec((size_t) page_count);
+        if (mincore(reinterpret_cast<void *>(start), (size_t) (end - start), vec.data()) != 0) {
+            info.error = errno;
+            return info;
+        }
+        uint64_t resident = 0;
+        for (unsigned char v : vec) {
+            resident += (v & 1u) ? 1u : 0u;
+        }
+        info.exact = true;
+        info.sampled_pages = page_count;
+        info.resident_pages = resident;
+        return info;
+    }
+
+    uint64_t resident = 0;
+    uint64_t sampled = 0;
+    const uint64_t samples = max_pages > 0 ? (uint64_t) max_pages : 1;
+    for (uint64_t i = 0; i < samples; ++i) {
+        const uint64_t idx = samples == 1 ? 0 : (i * (page_count - 1)) / (samples - 1);
+        unsigned char vec = 0;
+        if (mincore(reinterpret_cast<void *>(start + idx * page_size), (size_t) page_size, &vec) != 0) {
+            info.error = errno;
+            return info;
+        }
+        resident += (vec & 1u) ? 1u : 0u;
+        ++sampled;
+    }
+
+    info.exact = false;
+    info.sampled_pages = sampled;
+    info.resident_pages = sampled ? (resident * page_count + sampled / 2) / sampled : 0;
+    return info;
+}
+#else
+ResidencyInfo query_residency(uintptr_t addr, size_t nbytes) {
+    (void) addr;
+    (void) nbytes;
+    return {};
+}
+#endif
+
+void append_residency(std::string & line, uintptr_t addr, size_t nbytes) {
+    const ResidencyInfo info = query_residency(addr, nbytes);
+    if (!info.available) {
+        return;
+    }
+    line += ",\"page_size\":" + std::to_string(info.page_size);
+    line += ",\"page_count\":" + std::to_string(info.page_count);
+    line += ",\"resident_sample_pages\":" + std::to_string(info.sampled_pages);
+    line += ",\"resident_exact\":" + std::string(info.exact ? "true" : "false");
+    if (info.error != 0) {
+        line += ",\"resident_error\":" + std::to_string(info.error);
+        return;
+    }
+    line += ",\"resident_pages\":" + std::to_string(info.resident_pages);
+    line += ",\"resident_bytes\":" + std::to_string(info.resident_pages * info.page_size);
 }
 
 uintptr_t tensor_addr(const ggml_tensor * t) {
@@ -191,6 +320,7 @@ void log_tensor_event(const ggml_tensor * t, const char * access_kind) {
     json_escape_append(line, backend);
     if (first) {
         line += ",\"first_touch\":true";
+        append_residency(line, addr, nbytes);
     }
     line += "}";
 
@@ -239,6 +369,7 @@ void log_param_access(const ggml_tensor * t, const char * parent_name) {
     json_escape_append(line, backend);
     if (first) {
         line += ",\"first_touch\":true";
+        append_residency(line, addr, nbytes);
     }
     line += "}";
 
@@ -387,6 +518,7 @@ extern "C" void llm_mem_trace_tensor_loaded(const ggml_tensor * t, const char * 
     json_escape_append(line, addr_buf);
     line += ",\"backend\":";
     json_escape_append(line, backend);
+    append_residency(line, addr, nbytes);
     line += "}";
 
     llm_mem_trace_write(LLM_MEM_TRACE_SINK_TENSOR, line.c_str(), line.size());

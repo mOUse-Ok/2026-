@@ -95,17 +95,16 @@ def load_all(trace_dir: str) -> dict[str, list[dict]]:
     tensor_path = os.path.join(trace_dir, "tensor_trace.jsonl")
     tensor_records = load_jsonl(tensor_path, max_records=200000)
 
-    # Also do a targeted pass for first-touch events from the full file
-    # These are sparse but critical for mmap analysis
-    ft_records = load_first_touches(tensor_path)
-    if ft_records:
-        print(f"  [INFO] First-touch pass: {len(ft_records)} events from full file")
-        # Merge: add first-touch events that weren't captured by sampling
-        sampled_tensors = {json.dumps(r, sort_keys=True) for r in tensor_records
-                          if r.get("first_touch") is True}
-        for ft in ft_records:
-            if json.dumps(ft, sort_keys=True) not in sampled_tensors:
-                tensor_records.append(ft)
+    # Also do a targeted pass for tensor load / first-touch / residency events
+    # from the full file. These are sparse but critical for mmap analysis.
+    key_records = load_key_tensor_events(tensor_path)
+    if key_records:
+        print(f"  [INFO] Tensor key-event pass: {len(key_records)} events from full file")
+        sampled_keys = {json.dumps(r, sort_keys=True) for r in tensor_records
+                        if r.get("event") == "TENSOR_LOAD" or r.get("first_touch") is True or "page_count" in r}
+        for record in key_records:
+            if json.dumps(record, sort_keys=True) not in sampled_keys:
+                tensor_records.append(record)
 
     return {
         "tensor": tensor_records,
@@ -115,23 +114,22 @@ def load_all(trace_dir: str) -> dict[str, list[dict]]:
     }
 
 
-def load_first_touches(path: str) -> list[dict]:
-    """Fast streaming pass to extract only first_touch=true events.
-    These are sparse (~100 events in millions) but critical for mmap analysis."""
+def load_key_tensor_events(path: str) -> list[dict]:
+    """Fast streaming pass to extract tensor load / first-touch / residency events."""
     if not os.path.exists(path):
         return []
     records = []
     with open(path, "r") as f:
         for line in f:
             # Fast string check before JSON parsing
-            if '"first_touch":true' not in line:
+            if '"first_touch":true' not in line and '"TENSOR_LOAD"' not in line and '"page_count"' not in line:
                 continue
             line = line.strip()
             if not line:
                 continue
             try:
                 r = json.loads(line)
-                if r.get("first_touch") is True:
+                if r.get("event") == "TENSOR_LOAD" or r.get("first_touch") is True or "page_count" in r:
                     records.append(r)
             except json.JSONDecodeError:
                 continue
@@ -154,6 +152,33 @@ def add_relative_time(records: list[dict]) -> list[dict]:
     for r in records:
         r["t_ms"] = (r.get("ts_ns", 0) - t0) / 1e6
     return records
+
+
+def has_residency(record: dict) -> bool:
+    return "page_count" in record and "resident_pages" in record and record.get("page_count", 0) > 0
+
+
+def residency_pct(record: dict) -> float:
+    if not has_residency(record):
+        return float("nan")
+    return record.get("resident_pages", 0) / max(1, record.get("page_count", 0)) * 100
+
+
+def residency_weighted_pct(records: list[dict]) -> float:
+    pages = sum(r.get("page_count", 0) for r in records if has_residency(r))
+    resident = sum(r.get("resident_pages", 0) for r in records if has_residency(r))
+    return resident / max(1, pages) * 100
+
+
+def residency_nonresident_bytes(records: list[dict]) -> int:
+    total = 0
+    for r in records:
+        if not has_residency(r):
+            continue
+        page_size = r.get("page_size", 4096)
+        missing_pages = max(0, r.get("page_count", 0) - r.get("resident_pages", 0))
+        total += missing_pages * page_size
+    return total
 
 
 def env_int(name: str, default: int) -> int:
@@ -787,6 +812,118 @@ def plot_summary_dashboard(data: dict[str, list[dict]], out_dir: str):
 
 
 # ─────────────────────────────────────────────
+#  Plot 7: Page Residency & PSS Analysis
+# ─────────────────────────────────────────────
+
+def plot_page_residency(data: dict[str, list[dict]], out_dir: str):
+    tensor_records = data["tensor"]
+    memory_records = data["memory"]
+    residency_records = [r for r in tensor_records if has_residency(r)]
+    mem_pss = [r for r in memory_records if r.get("event") == "MEMORY_STAT" and "pss_bytes" in r]
+
+    if not residency_records and not mem_pss:
+        print("  [SKIP] No page residency or smaps_rollup data")
+        return None
+
+    fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+    fig.suptitle("Page Residency and Process Memory Analysis", fontsize=14, fontweight="bold")
+
+    # --- First-touch residency scatter ---
+    ax = axes[0][0]
+    first_res = [r for r in residency_records if r.get("first_touch") is True]
+    if first_res:
+        ft = add_relative_time(first_res)
+        df = pd.DataFrame(ft)
+        pct = df.apply(residency_pct, axis=1)
+        sizes_mb = df["size"] / (1024**2)
+        sc = ax.scatter(df["t_ms"], sizes_mb, c=pct, cmap="RdYlGn", vmin=0, vmax=100,
+                        s=35, alpha=0.75, edgecolors="none")
+        fig.colorbar(sc, ax=ax, label="Resident Pages (%)")
+        ax.set_title("First-Touch Tensor Residency")
+        ax.set_xlabel("Time (ms)")
+        ax.set_ylabel("Tensor Size (MB)")
+        ax.grid(True, alpha=0.3)
+    else:
+        ax.set_title("First-Touch Tensor Residency (no data)")
+        ax.axis("off")
+
+    # --- Residency distribution ---
+    ax = axes[0][1]
+    if residency_records:
+        load_res = [r for r in residency_records if r.get("event") == "TENSOR_LOAD"]
+        access_res = [r for r in residency_records if r.get("first_touch") is True]
+        if load_res:
+            ax.hist([residency_pct(r) for r in load_res], bins=20, range=(0, 100),
+                    alpha=0.55, label="TENSOR_LOAD", color="#2196F3")
+        if access_res:
+            ax.hist([residency_pct(r) for r in access_res], bins=20, range=(0, 100),
+                    alpha=0.55, label="FIRST_TOUCH", color="#FF9800")
+        ax.set_title("Residency Ratio Distribution")
+        ax.set_xlabel("Resident Pages (%)")
+        ax.set_ylabel("Event Count")
+        ax.legend()
+        ax.grid(True, alpha=0.3, axis="y")
+    else:
+        ax.set_title("Residency Ratio Distribution (no data)")
+        ax.axis("off")
+
+    # --- Process memory from smaps_rollup ---
+    ax = axes[1][0]
+    if mem_pss:
+        mem = add_relative_time(mem_pss)
+        df = pd.DataFrame(mem)
+        ax.plot(df["t_ms"], df["rss_bytes"] / (1024**3), label="RSS (/proc/stat)", linewidth=1.4)
+        ax.plot(df["t_ms"], df["pss_bytes"] / (1024**3), label="PSS", linewidth=1.4)
+        ax.plot(df["t_ms"], df["private_dirty_bytes"] / (1024**3), label="Private Dirty", linewidth=1.2)
+        ax.plot(df["t_ms"], df["shared_clean_bytes"] / (1024**3), label="Shared Clean", linewidth=1.2)
+        if df["swap_bytes"].max() > 0:
+            ax.plot(df["t_ms"], df["swap_bytes"] / (1024**3), label="Swap", linewidth=1.2)
+        ax.set_title("Process Memory Breakdown (smaps_rollup)")
+        ax.set_xlabel("Time (ms)")
+        ax.set_ylabel("GiB")
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+    else:
+        ax.set_title("Process Memory Breakdown (no smaps data)")
+        ax.axis("off")
+
+    # --- Top non-resident first-touch tensors ---
+    ax = axes[1][1]
+    if first_res:
+        by_tensor: dict[str, int] = defaultdict(int)
+        for r in first_res:
+            if not has_residency(r):
+                continue
+            missing_pages = max(0, r.get("page_count", 0) - r.get("resident_pages", 0))
+            by_tensor[r.get("tensor", "<unnamed>")] += missing_pages * r.get("page_size", 4096)
+        top = sorted(by_tensor.items(), key=lambda kv: -kv[1])[:12]
+        if top:
+            names = [name if len(name) <= 32 else name[:29] + "..." for name, _ in top]
+            vals = [v / (1024**2) for _, v in top]
+            y = np.arange(len(names))
+            ax.barh(y, vals, color="#F44336", alpha=0.75)
+            ax.set_yticks(y)
+            ax.set_yticklabels(names, fontsize=8)
+            ax.invert_yaxis()
+            ax.set_title("Top First-Touch Non-Resident Tensors")
+            ax.set_xlabel("Estimated Non-Resident MB")
+            ax.grid(True, alpha=0.3, axis="x")
+        else:
+            ax.set_title("Top First-Touch Non-Resident Tensors (none)")
+            ax.axis("off")
+    else:
+        ax.set_title("Top First-Touch Non-Resident Tensors (no data)")
+        ax.axis("off")
+
+    plt.tight_layout()
+    path = os.path.join(out_dir, "07_page_residency.png")
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  [OK] {path}")
+    return path
+
+
+# ─────────────────────────────────────────────
 #  Collect Key Metrics for Report
 # ─────────────────────────────────────────────
 
@@ -805,6 +942,14 @@ def collect_metrics(data: dict[str, list[dict]]) -> dict:
         metrics["minor_faults_cumulative_final"] = mem_events[-1].get("minor_faults", 0)
         metrics["major_faults_cumulative_final"] = mem_events[-1].get("major_faults", 0)
         metrics["mmap_count"] = mem_events[-1].get("mmap_count", 0)
+
+        smaps_events = [r for r in mem_events if "pss_bytes" in r]
+        if smaps_events:
+            metrics["pss_peak_gb"] = max(r.get("pss_bytes", 0) for r in smaps_events) / (1024**3)
+            metrics["pss_avg_gb"] = np.mean([r.get("pss_bytes", 0) for r in smaps_events]) / (1024**3)
+            metrics["shared_clean_peak_gb"] = max(r.get("shared_clean_bytes", 0) for r in smaps_events) / (1024**3)
+            metrics["private_dirty_peak_gb"] = max(r.get("private_dirty_bytes", 0) for r in smaps_events) / (1024**3)
+            metrics["swap_peak_mb"] = max(r.get("swap_bytes", 0) for r in smaps_events) / (1024**2)
 
     # Token latency
     token_ends = [r for r in data["memory"] if r.get("event") == "TOKEN_END" and "latency_ns" in r]
@@ -874,6 +1019,19 @@ def collect_metrics(data: dict[str, list[dict]]) -> dict:
         metrics["first_touch_events"] = len(first_touches)
         metrics["first_touch_gb"] = sum(r.get("size", 0) for r in first_touches) / (1024**3)
 
+    tensor_residency = [r for r in data["tensor"] if has_residency(r)]
+    if tensor_residency:
+        first_touch_residency = [r for r in tensor_residency if r.get("first_touch") is True]
+        load_residency = [r for r in tensor_residency if r.get("event") == "TENSOR_LOAD"]
+        mmap_load_residency = [r for r in load_residency if r.get("stage") == "mmap"]
+        metrics["tensor_residency_events"] = len(tensor_residency)
+        metrics["tensor_residency_exact_events"] = sum(1 for r in tensor_residency if r.get("resident_exact") is True)
+        metrics["first_touch_residency_events"] = len(first_touch_residency)
+        metrics["first_touch_resident_pct_weighted"] = residency_weighted_pct(first_touch_residency)
+        metrics["first_touch_nonresident_gb_est"] = residency_nonresident_bytes(first_touch_residency) / (1024**3)
+        metrics["tensor_load_resident_pct_weighted"] = residency_weighted_pct(load_residency)
+        metrics["mmap_load_resident_pct_weighted"] = residency_weighted_pct(mmap_load_residency)
+
     return metrics
 
 
@@ -918,6 +1076,24 @@ def generate_recommendations(metrics: dict, data: dict[str, list[dict]]) -> list
                 "3. 考虑为权重 tensor 使用 huge pages（2MB 或 1GB），减少 TLB miss 和页级 fault 数量。"
             ),
             "expected_benefit": "有机会显著减少 minor faults，并改善 TLB 覆盖率。"
+        })
+
+    # 2b. Page residency analysis
+    ft_res_pct = metrics.get("first_touch_resident_pct_weighted")
+    ft_nonresident = metrics.get("first_touch_nonresident_gb_est", 0)
+    if ft_res_pct is not None:
+        recs.append({
+            "priority": "HIGH" if ft_res_pct < 50 else "MEDIUM",
+            "title": "基于页驻留率优化权重预取",
+            "finding": (
+                f"first-touch tensor 的加权页驻留率为 {ft_res_pct:.1f}%，"
+                f"估算未驻留 first-touch 页面为 {ft_nonresident:.2f} GiB。"
+            ),
+            "recommendation": (
+                "优先对未驻留比例高、且会在 PREFILL 或高频 DECODE 路径访问的 tensor 做预取实验。"
+                "可比较 madvise(MADV_WILLNEED)、posix_fadvise(POSIX_FADV_WILLNEED) 和按层/按 expert 预取。"
+            ),
+            "expected_benefit": "减少首次访问时的 page fault 突发，并降低 PREFILL 阶段尾部延迟。"
         })
 
     # 3. Prefill vs Decode
@@ -1060,8 +1236,13 @@ def generate_html_report(
     # Build metric cards
     kv_reuse = metrics.get("kv_reuse_rate_pct")
     kv_reuse_display = "N/A" if kv_reuse is None else f"{kv_reuse:.1f}"
+    ft_res = metrics.get("first_touch_resident_pct_weighted")
+    ft_res_display = "N/A" if ft_res is None else f"{ft_res:.1f}%"
+    pss_peak = metrics.get("pss_peak_gb")
+    pss_peak_display = "N/A" if pss_peak is None else f"{pss_peak:.2f} GB"
     metric_cards = f"""
     <div class="metric-card"><div class="metric-value">{_opt(metrics.get('rss_peak_gb'))} GB</div><div class="metric-label">峰值 RSS</div></div>
+    <div class="metric-card"><div class="metric-value">{pss_peak_display}</div><div class="metric-label">峰值 PSS</div></div>
     <div class="metric-card"><div class="metric-value">{_opt(metrics.get('rss_avg_gb'))} GB</div><div class="metric-label">平均 RSS</div></div>
     <div class="metric-card"><div class="metric-value">{metrics.get('total_minor_faults', 0):,}</div><div class="metric-label">Minor 缺页次数</div></div>
     <div class="metric-card"><div class="metric-value">{_opt(metrics.get('kv_total_mb'))} MB</div><div class="metric-label">KV Cache 大小</div></div>
@@ -1071,6 +1252,7 @@ def generate_html_report(
     <div class="metric-card"><div class="metric-value">{metrics.get('unique_experts_global', 'N/A')}</div><div class="metric-label">唯一 Expert ID</div></div>
     <div class="metric-card"><div class="metric-value">{metrics.get('expert_layers', 'N/A')}</div><div class="metric-label">MoE 层数</div></div>
     <div class="metric-card"><div class="metric-value">{_opt(metrics.get('first_touch_gb'))} GB</div><div class="metric-label">mmap 懒加载量</div></div>
+    <div class="metric-card"><div class="metric-value">{ft_res_display}</div><div class="metric-label">First-touch 驻留率</div></div>
     <div class="metric-card"><div class="metric-value">{metrics.get('mmap_count', 'N/A')}</div><div class="metric-label">mmap 区域数</div></div>
     """
 
@@ -1083,6 +1265,7 @@ def generate_html_report(
         "Tensor Access": "Tensor 访存",
         "Token Latency": "Token 延迟",
         "Summary Dashboard": "总览仪表盘",
+        "Page Residency": "页面驻留分析",
     }
     for name, path in plot_paths.items():
         if path:
@@ -1283,6 +1466,10 @@ def main():
         plot_paths["Token Latency"], pf_mean, dc_mean = result
 
     plot_paths["Summary Dashboard"] = plot_summary_dashboard(data, out_dir)
+
+    result = plot_page_residency(data, out_dir)
+    if result:
+        plot_paths["Page Residency"] = result
 
     # Data summary for report
     data_summary = {name: len(records) for name, records in data.items()}

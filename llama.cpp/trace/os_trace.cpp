@@ -1,5 +1,6 @@
 #include "trace_event.h"
 
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -23,6 +24,31 @@ struct StatData {
 };
 
 #ifdef __linux__
+
+struct SmapsRollupData {
+    bool ok = false;
+    uint64_t rss_kb = 0;
+    uint64_t pss_kb = 0;
+    uint64_t shared_clean_kb = 0;
+    uint64_t shared_dirty_kb = 0;
+    uint64_t private_clean_kb = 0;
+    uint64_t private_dirty_kb = 0;
+    uint64_t referenced_kb = 0;
+    uint64_t anonymous_kb = 0;
+    uint64_t swap_kb = 0;
+};
+
+bool env_truthy(const char * value) {
+    if (!value) {
+        return false;
+    }
+    return !(value[0] == '0' && value[1] == '\0');
+}
+
+bool smaps_rollup_enabled() {
+    static const bool enabled = env_truthy(std::getenv("LLM_MEM_TRACE_SMAPS"));
+    return enabled;
+}
 
 bool read_proc_stat(StatData & out) {
     FILE * fp = std::fopen("/proc/self/stat", "r");
@@ -83,6 +109,53 @@ bool read_proc_stat(StatData & out) {
     return true;
 }
 
+bool parse_kb_line(const char * line, const char * key, uint64_t & out) {
+    const size_t key_len = std::strlen(key);
+    if (std::strncmp(line, key, key_len) != 0) {
+        return false;
+    }
+    const char * p = line + key_len;
+    while (*p == ' ' || *p == '\t') {
+        ++p;
+    }
+    char * end = nullptr;
+    const uint64_t val = std::strtoull(p, &end, 10);
+    if (end == p) {
+        return false;
+    }
+    out = val;
+    return true;
+}
+
+SmapsRollupData read_smaps_rollup() {
+    SmapsRollupData data;
+    if (!smaps_rollup_enabled()) {
+        return data;
+    }
+
+    FILE * fp = std::fopen("/proc/self/smaps_rollup", "r");
+    if (!fp) {
+        return data;
+    }
+
+    char line[512];
+    while (std::fgets(line, sizeof(line), fp)) {
+        parse_kb_line(line, "Rss:", data.rss_kb) ||
+        parse_kb_line(line, "Pss:", data.pss_kb) ||
+        parse_kb_line(line, "Shared_Clean:", data.shared_clean_kb) ||
+        parse_kb_line(line, "Shared_Dirty:", data.shared_dirty_kb) ||
+        parse_kb_line(line, "Private_Clean:", data.private_clean_kb) ||
+        parse_kb_line(line, "Private_Dirty:", data.private_dirty_kb) ||
+        parse_kb_line(line, "Referenced:", data.referenced_kb) ||
+        parse_kb_line(line, "Anonymous:", data.anonymous_kb) ||
+        parse_kb_line(line, "Swap:", data.swap_kb);
+    }
+
+    std::fclose(fp);
+    data.ok = true;
+    return data;
+}
+
 uint64_t count_maps() {
     FILE * fp = std::fopen("/proc/self/maps", "r");
     if (!fp) {
@@ -126,6 +199,7 @@ extern "C" void llm_mem_trace_memory_sample(const char * reason) {
     have_prev = true;
 
     const uint64_t mmap_count = count_maps();
+    const SmapsRollupData smaps = read_smaps_rollup();
 
     std::string line;
     line.reserve(256);
@@ -142,6 +216,17 @@ extern "C" void llm_mem_trace_memory_sample(const char * reason) {
     line += ",\"minor_faults_delta\":" + std::to_string(minflt_delta);
     line += ",\"major_faults_delta\":" + std::to_string(majflt_delta);
     line += ",\"mmap_count\":" + std::to_string(mmap_count);
+    if (smaps.ok) {
+        line += ",\"smaps_rss_bytes\":" + std::to_string(smaps.rss_kb * 1024ull);
+        line += ",\"pss_bytes\":" + std::to_string(smaps.pss_kb * 1024ull);
+        line += ",\"shared_clean_bytes\":" + std::to_string(smaps.shared_clean_kb * 1024ull);
+        line += ",\"shared_dirty_bytes\":" + std::to_string(smaps.shared_dirty_kb * 1024ull);
+        line += ",\"private_clean_bytes\":" + std::to_string(smaps.private_clean_kb * 1024ull);
+        line += ",\"private_dirty_bytes\":" + std::to_string(smaps.private_dirty_kb * 1024ull);
+        line += ",\"referenced_bytes\":" + std::to_string(smaps.referenced_kb * 1024ull);
+        line += ",\"anonymous_bytes\":" + std::to_string(smaps.anonymous_kb * 1024ull);
+        line += ",\"swap_bytes\":" + std::to_string(smaps.swap_kb * 1024ull);
+    }
     line += "}";
 
     llm_mem_trace_write(LLM_MEM_TRACE_SINK_MEMORY, line.c_str(), line.size());
