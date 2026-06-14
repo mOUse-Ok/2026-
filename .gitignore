@@ -59,3 +59,6 @@ llama.cpp/trace_output/
 
 # 本地 LLM 访存分析报告（由 trace 输出整理得到，不提交）
 llm_mem_trace_report.md
+
+# 本地对比报告生成脚本（只用于整理实验结果，不提交）
+llama.cpp/trace/compare_trace_runs.py

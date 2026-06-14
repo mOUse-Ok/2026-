@@ -3,17 +3,21 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <cctype>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <string>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #ifdef __linux__
+#include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
@@ -222,6 +226,279 @@ void append_residency(std::string & line, uintptr_t addr, size_t nbytes) {
     line += ",\"resident_bytes\":" + std::to_string(info.resident_pages * info.page_size);
 }
 
+bool os_hints_enabled() {
+    static const bool enabled = env_truthy(std::getenv("LLM_MEM_TRACE_OS_HINTS"));
+    return enabled && llm_mem_trace_enabled();
+}
+
+bool os_hint_opt_enabled(const char * key) {
+    return os_hints_enabled() && env_truthy(std::getenv(key));
+}
+
+uint64_t env_u64_or_default(const char * key, uint64_t def_value) {
+    const char * val = std::getenv(key);
+    if (!val || !val[0]) {
+        return def_value;
+    }
+    char * end = nullptr;
+    const unsigned long long parsed = std::strtoull(val, &end, 10);
+    return end && *end == '\0' ? (uint64_t) parsed : def_value;
+}
+
+bool contains_substring_token(const char * name, const char * start, size_t len) {
+    if (!name || !start || len == 0) {
+        return false;
+    }
+    if (len == 1 && start[0] == '*') {
+        return true;
+    }
+    const std::string token(start, len);
+    return std::strstr(name, token.c_str()) != nullptr;
+}
+
+bool os_hint_target_matches(const char * name) {
+    const char * filter = std::getenv("LLM_MEM_TRACE_OPT_TARGETS");
+    if (!filter || !filter[0]) {
+        filter = "token_embd.weight,output.weight,ffn_down_exps.weight";
+    }
+
+    const char * p = filter;
+    while (*p) {
+        while (*p == ',' || std::isspace((unsigned char) *p)) {
+            ++p;
+        }
+        const char * begin = p;
+        while (*p && *p != ',') {
+            ++p;
+        }
+        const char * end = p;
+        while (end > begin && std::isspace((unsigned char) *(end - 1))) {
+            --end;
+        }
+        if (contains_substring_token(name, begin, (size_t) (end - begin))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool os_hint_size_allowed(size_t nbytes) {
+    const uint64_t max_bytes = env_u64_or_default("LLM_MEM_TRACE_OPT_MAX_BYTES", 512ull * 1024ull * 1024ull);
+    return max_bytes == 0 || nbytes <= max_bytes;
+}
+
+bool page_aligned_range(uintptr_t addr, size_t nbytes, uintptr_t & start, size_t & len) {
+    if (addr == 0 || nbytes == 0) {
+        return false;
+    }
+#ifdef __linux__
+    const long sys_page_size = sysconf(_SC_PAGESIZE);
+    if (sys_page_size <= 0) {
+        return false;
+    }
+    const uintptr_t page_size = (uintptr_t) sys_page_size;
+    start = addr & ~(page_size - 1);
+    const uintptr_t last = addr + nbytes - 1;
+    if (last < addr) {
+        return false;
+    }
+    const uintptr_t end = (last & ~(page_size - 1)) + page_size;
+    len = (size_t) (end - start);
+    return len > 0;
+#else
+    (void) addr;
+    (void) nbytes;
+    (void) start;
+    (void) len;
+    return false;
+#endif
+}
+
+void write_os_hint_event(
+        const char * action,
+        const char * trigger,
+        const char * tensor_name,
+        int layer,
+        int expert,
+        uintptr_t addr,
+        size_t nbytes,
+        size_t advised_bytes,
+        int result,
+        int error_code,
+        uint64_t file_offset = 0) {
+    if (!llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_MEMORY)) {
+        return;
+    }
+
+    char addr_buf[32];
+    std::snprintf(addr_buf, sizeof(addr_buf), "0x%llx", (unsigned long long) addr);
+
+    std::string line;
+    line.reserve(256);
+    line += "{\"event\":\"OS_HINT\",\"ts_ns\":" + std::to_string(llm_mem_trace_time_ns());
+    line += ",\"phase\":\"" + std::string(phase_name(llm_mem_trace_get_phase())) + "\"";
+    line += ",\"step\":" + std::to_string(llm_mem_trace_get_step());
+    line += ",\"action\":";
+    json_escape_append(line, action ? action : "");
+    line += ",\"trigger\":";
+    json_escape_append(line, trigger ? trigger : "");
+    line += ",\"tensor\":";
+    json_escape_append(line, tensor_name ? tensor_name : "");
+    if (layer >= 0) {
+        line += ",\"layer\":" + std::to_string(layer);
+    }
+    if (expert >= 0) {
+        line += ",\"expert\":" + std::to_string(expert);
+    }
+    line += ",\"addr\":";
+    json_escape_append(line, addr_buf);
+    line += ",\"size\":" + std::to_string(nbytes);
+    line += ",\"advised_bytes\":" + std::to_string(advised_bytes);
+    if (file_offset != 0) {
+        line += ",\"file_offset\":" + std::to_string(file_offset);
+    }
+    line += ",\"result\":" + std::to_string(result);
+    line += ",\"errno\":" + std::to_string(error_code);
+    line += "}";
+
+    llm_mem_trace_write(LLM_MEM_TRACE_SINK_MEMORY, line.c_str(), line.size());
+}
+
+void apply_madvise_hint(
+        const char * action,
+        int advice,
+        const char * trigger,
+        const char * tensor_name,
+        int layer,
+        int expert,
+        uintptr_t addr,
+        size_t nbytes) {
+#ifdef __linux__
+    uintptr_t start = 0;
+    size_t len = 0;
+    if (!page_aligned_range(addr, nbytes, start, len)) {
+        return;
+    }
+    errno = 0;
+    const int rc = madvise(reinterpret_cast<void *>(start), len, advice);
+    const int err = rc == 0 ? 0 : errno;
+    write_os_hint_event(action, trigger, tensor_name, layer, expert, addr, nbytes, len, rc, err);
+#else
+    (void) action; (void) advice; (void) trigger; (void) tensor_name; (void) layer; (void) expert; (void) addr; (void) nbytes;
+#endif
+}
+
+#ifdef __linux__
+struct FileMapping {
+    uintptr_t start = 0;
+    uintptr_t end = 0;
+    uint64_t offset = 0;
+    std::string path;
+};
+
+bool find_file_mapping(uintptr_t addr, FileMapping & out) {
+    FILE * fp = std::fopen("/proc/self/maps", "r");
+    if (!fp) {
+        return false;
+    }
+
+    char line[4096];
+    while (std::fgets(line, sizeof(line), fp)) {
+        unsigned long long start = 0;
+        unsigned long long end = 0;
+        unsigned long long offset = 0;
+        char perms[8] = {};
+        int path_pos = 0;
+        const int scanned = std::sscanf(line, "%llx-%llx %7s %llx %*s %*s %n", &start, &end, perms, &offset, &path_pos);
+        if (scanned < 4 || addr < (uintptr_t) start || addr >= (uintptr_t) end) {
+            continue;
+        }
+        std::fclose(fp);
+        if (std::strchr(perms, 'r') == nullptr || path_pos <= 0 || line[path_pos] == '\0') {
+            return false;
+        }
+        char * path = line + path_pos;
+        size_t path_len = std::strlen(path);
+        while (path_len > 0 && (path[path_len - 1] == '\n' || path[path_len - 1] == '\r')) {
+            path[--path_len] = '\0';
+        }
+        if (path_len == 0 || path[0] == '[') {
+            return false;
+        }
+        out.start = (uintptr_t) start;
+        out.end = (uintptr_t) end;
+        out.offset = (uint64_t) offset;
+        out.path = path;
+        return true;
+    }
+
+    std::fclose(fp);
+    return false;
+}
+#endif
+
+void apply_posix_fadvise_hint(
+        const char * action,
+        const char * trigger,
+        const char * tensor_name,
+        int layer,
+        int expert,
+        uintptr_t addr,
+        size_t nbytes) {
+#ifdef __linux__
+    FileMapping mapping;
+    if (!find_file_mapping(addr, mapping)) {
+        write_os_hint_event(action, trigger, tensor_name, layer, expert, addr, nbytes, 0, -1, ENOENT);
+        return;
+    }
+    if (addr >= mapping.end) {
+        return;
+    }
+    const uint64_t file_offset = mapping.offset + (uint64_t) (addr - mapping.start);
+    const size_t max_len = (size_t) (mapping.end - addr);
+    const size_t advise_len = std::min(nbytes, max_len);
+    const int fd = open(mapping.path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        write_os_hint_event(action, trigger, tensor_name, layer, expert, addr, nbytes, advise_len, -1, errno, file_offset);
+        return;
+    }
+    const int rc = posix_fadvise(fd, (off_t) file_offset, (off_t) advise_len, POSIX_FADV_WILLNEED);
+    close(fd);
+    write_os_hint_event(action, trigger, tensor_name, layer, expert, addr, nbytes, advise_len, rc == 0 ? 0 : -1, rc, file_offset);
+#else
+    (void) action; (void) trigger; (void) tensor_name; (void) layer; (void) expert; (void) addr; (void) nbytes;
+#endif
+}
+
+void apply_load_os_hints(
+        const char * trigger,
+        const char * tensor_name,
+        int layer,
+        uintptr_t addr,
+        size_t nbytes,
+        bool mapped_tensor) {
+    if (!os_hints_enabled() || !mapped_tensor || !os_hint_target_matches(tensor_name) || !os_hint_size_allowed(nbytes)) {
+        return;
+    }
+
+#ifdef __linux__
+    if (os_hint_opt_enabled("LLM_MEM_TRACE_OPT_MADVISE_SEQUENTIAL")) {
+        apply_madvise_hint("madvise_sequential", MADV_SEQUENTIAL, trigger, tensor_name, layer, -1, addr, nbytes);
+    }
+#ifdef MADV_HUGEPAGE
+    if (os_hint_opt_enabled("LLM_MEM_TRACE_OPT_THP")) {
+        apply_madvise_hint("madvise_hugepage", MADV_HUGEPAGE, trigger, tensor_name, layer, -1, addr, nbytes);
+    }
+#endif
+    if (os_hint_opt_enabled("LLM_MEM_TRACE_OPT_MADVISE_WILLNEED")) {
+        apply_madvise_hint("madvise_willneed", MADV_WILLNEED, trigger, tensor_name, layer, -1, addr, nbytes);
+    }
+#endif
+    if (os_hint_opt_enabled("LLM_MEM_TRACE_OPT_POSIX_FADVISE")) {
+        apply_posix_fadvise_hint("posix_fadvise_willneed", trigger, tensor_name, layer, -1, addr, nbytes);
+    }
+}
+
 uintptr_t tensor_addr(const ggml_tensor * t) {
     if (!t) {
         return 0;
@@ -274,6 +551,86 @@ struct FirstTouch {
 FirstTouch & first_touch() {
     static FirstTouch ft;
     return ft;
+}
+
+bool is_expert_weight_tensor_name(const char * name) {
+    return name &&
+           std::strstr(name, "blk.") &&
+           std::strstr(name, "_exps.weight") &&
+           (std::strstr(name, "ffn_gate_exps.weight") ||
+            std::strstr(name, "ffn_up_exps.weight") ||
+            std::strstr(name, "ffn_down_exps.weight") ||
+            std::strstr(name, "ffn_gate_up_exps.weight"));
+}
+
+struct ExpertTensorInfo {
+    std::string name;
+    int layer = -1;
+    uintptr_t addr = 0;
+    size_t nbytes = 0;
+    int64_t n_expert = 0;
+    size_t expert_stride = 0;
+};
+
+struct ExpertTensorRegistry {
+    std::mutex mu;
+    std::vector<ExpertTensorInfo> tensors;
+    std::unordered_set<std::string> hinted;
+
+    void add(const ggml_tensor * t, const char * name, int layer, uintptr_t addr, size_t nbytes) {
+        if (!t || layer < 0 || addr == 0 || nbytes == 0 || !is_expert_weight_tensor_name(name)) {
+            return;
+        }
+        const int64_t n_expert = t->ne[2];
+        const size_t expert_stride = (size_t) t->nb[2];
+        if (n_expert <= 0 || expert_stride == 0) {
+            return;
+        }
+
+        std::lock_guard<std::mutex> lock(mu);
+        for (const ExpertTensorInfo & info : tensors) {
+            if (info.addr == addr && info.nbytes == nbytes) {
+                return;
+            }
+        }
+        tensors.push_back({name ? name : "", layer, addr, nbytes, n_expert, expert_stride});
+    }
+
+    std::vector<ExpertTensorInfo> for_layer(int layer) {
+        std::vector<ExpertTensorInfo> out;
+        std::lock_guard<std::mutex> lock(mu);
+        for (const ExpertTensorInfo & info : tensors) {
+            if (info.layer == layer) {
+                out.push_back(info);
+            }
+        }
+        return out;
+    }
+
+    bool mark_hinted(uint64_t step, int layer, int expert, uintptr_t addr) {
+        std::string key = std::to_string(step) + ":" + std::to_string(layer) + ":" +
+                          std::to_string(expert) + ":" + std::to_string((uint64_t) addr);
+        std::lock_guard<std::mutex> lock(mu);
+        return hinted.insert(std::move(key)).second;
+    }
+};
+
+ExpertTensorRegistry & expert_tensor_registry() {
+    static ExpertTensorRegistry registry;
+    return registry;
+}
+
+bool expert_slice_range(const ExpertTensorInfo & info, int expert, uintptr_t & addr, size_t & nbytes) {
+    if (expert < 0 || expert >= info.n_expert || info.addr == 0 || info.expert_stride == 0) {
+        return false;
+    }
+    const size_t offset = (size_t) expert * info.expert_stride;
+    if (offset >= info.nbytes) {
+        return false;
+    }
+    addr = info.addr + offset;
+    nbytes = std::min(info.expert_stride, info.nbytes - offset);
+    return nbytes > 0;
 }
 
 void log_tensor_event(const ggml_tensor * t, const char * access_kind) {
@@ -335,12 +692,12 @@ void log_param_access(const ggml_tensor * t, const char * parent_name) {
         return;
     }
 
-    const uint64_t ts = llm_mem_trace_time_ns();
     const char * name = ggml_get_name(t);
     const size_t nbytes = ggml_nbytes(t);
     const int layer = parse_layer_from_name(name);
     const uintptr_t addr = tensor_addr(t);
     const char * backend = tensor_backend_name(t);
+    const uint64_t ts = llm_mem_trace_time_ns();
 
     bool first = first_touch().mark(t);
 
@@ -485,17 +842,26 @@ extern "C" void llm_mem_trace_tensor_end(const ggml_tensor * t) {
 
 extern "C" void llm_mem_trace_tensor_loaded(const ggml_tensor * t, const char * stage) {
     llm_mem_trace_init(nullptr);
-    if (!llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_TENSOR) || !t) {
+    if (!t) {
         return;
     }
 
-    const uint64_t ts = llm_mem_trace_time_ns();
     const char * name = ggml_get_name(t);
     const size_t nbytes = ggml_nbytes(t);
     const int layer = parse_layer_from_name(name);
     const uintptr_t addr = tensor_addr(t);
     const char * backend = tensor_backend_name(t);
+    const bool mapped_tensor = (stage && std::strcmp(stage, "mmap") == 0) ||
+                               (backend && std::strstr(backend, "Mapped") != nullptr);
 
+    expert_tensor_registry().add(t, name, layer, addr, nbytes);
+    apply_load_os_hints("tensor_load", name, layer, addr, nbytes, mapped_tensor);
+
+    if (!llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_TENSOR)) {
+        return;
+    }
+
+    const uint64_t ts = llm_mem_trace_time_ns();
     char addr_buf[32];
     std::snprintf(addr_buf, sizeof(addr_buf), "0x%llx", (unsigned long long) addr);
 
@@ -522,4 +888,47 @@ extern "C" void llm_mem_trace_tensor_loaded(const ggml_tensor * t, const char * 
     line += "}";
 
     llm_mem_trace_write(LLM_MEM_TRACE_SINK_TENSOR, line.c_str(), line.size());
+}
+
+extern "C" void llm_mem_trace_prefetch_expert_layer(int layer, const int * experts, int n_experts, const char * reason) {
+    if (!os_hints_enabled() || !os_hint_opt_enabled("LLM_MEM_TRACE_OPT_EXPERT_PREFETCH") ||
+            layer < 0 || !experts || n_experts <= 0) {
+        return;
+    }
+
+    const std::vector<ExpertTensorInfo> tensors = expert_tensor_registry().for_layer(layer);
+    if (tensors.empty()) {
+        return;
+    }
+
+    const uint64_t step = llm_mem_trace_get_step();
+    for (int i = 0; i < n_experts; ++i) {
+        const int expert = experts[i];
+        if (expert < 0) {
+            continue;
+        }
+        for (const ExpertTensorInfo & info : tensors) {
+            uintptr_t slice_addr = 0;
+            size_t slice_bytes = 0;
+            if (!expert_slice_range(info, expert, slice_addr, slice_bytes)) {
+                continue;
+            }
+            if (!os_hint_size_allowed(slice_bytes)) {
+                continue;
+            }
+            if (!expert_tensor_registry().mark_hinted(step, layer, expert, info.addr)) {
+                continue;
+            }
+#ifdef __linux__
+            apply_madvise_hint("expert_madvise_willneed", MADV_WILLNEED,
+                               reason ? reason : "expert_prefetch",
+                               info.name.c_str(), layer, expert, slice_addr, slice_bytes);
+#endif
+            if (os_hint_opt_enabled("LLM_MEM_TRACE_OPT_POSIX_FADVISE")) {
+                apply_posix_fadvise_hint("expert_posix_fadvise_willneed",
+                                         reason ? reason : "expert_prefetch",
+                                         info.name.c_str(), layer, expert, slice_addr, slice_bytes);
+            }
+        }
+    }
 }
