@@ -11,7 +11,7 @@ import argparse
 import json
 import os
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 
 import matplotlib
@@ -179,6 +179,14 @@ def residency_nonresident_bytes(records: list[dict]) -> int:
         missing_pages = max(0, r.get("page_count", 0) - r.get("resident_pages", 0))
         total += missing_pages * page_size
     return total
+
+
+def is_os_hint_syscall(record: dict) -> bool:
+    action = str(record.get("action", ""))
+    decision = str(record.get("decision", ""))
+    if decision in {"hit", "skip", "keep"} or action.startswith("expert_cache_"):
+        return False
+    return "madvise" in action or "fadvise" in action
 
 
 def env_int(name: str, default: int) -> int:
@@ -1032,6 +1040,33 @@ def collect_metrics(data: dict[str, list[dict]]) -> dict:
         metrics["tensor_load_resident_pct_weighted"] = residency_weighted_pct(load_residency)
         metrics["mmap_load_resident_pct_weighted"] = residency_weighted_pct(mmap_load_residency)
 
+    os_hints = [r for r in data["memory"] if r.get("event") == "OS_HINT"]
+    if os_hints:
+        os_hint_syscalls = [r for r in os_hints if is_os_hint_syscall(r)]
+        metrics["os_hint_records"] = len(os_hints)
+        metrics["os_hint_events"] = len(os_hint_syscalls)
+        metrics["os_hint_errors"] = sum(1 for r in os_hint_syscalls if r.get("result", 0) != 0)
+        metrics["os_hint_advised_mb"] = sum(r.get("advised_bytes", 0) for r in os_hint_syscalls) / (1024**2)
+        metrics["expert_cache_hits"] = sum(1 for r in os_hints if r.get("decision") == "hit" or r.get("cache_hit") is True)
+        metrics["expert_cache_prefetches"] = sum(1 for r in os_hints if r.get("decision") == "prefetch")
+        metrics["expert_cache_evictions"] = sum(1 for r in os_hints if r.get("decision") == "evict")
+        metrics["expert_cache_skips"] = sum(1 for r in os_hints if r.get("decision") == "skip")
+        cache_decisions = metrics["expert_cache_hits"] + metrics["expert_cache_prefetches"]
+        if cache_decisions > 0:
+            metrics["expert_cache_hit_rate_pct"] = metrics["expert_cache_hits"] / cache_decisions * 100
+        cache_bytes = [r.get("cache_bytes", 0) for r in os_hints if "cache_bytes" in r]
+        cache_capacity = [r.get("cache_capacity_bytes", 0) for r in os_hints if "cache_capacity_bytes" in r]
+        if cache_bytes:
+            metrics["expert_cache_peak_mb"] = max(cache_bytes) / (1024**2)
+        if cache_capacity:
+            metrics["expert_cache_capacity_mb"] = max(cache_capacity) / (1024**2)
+        for action, count in Counter(r.get("action", "unknown") for r in os_hints).items():
+            key = "os_hint_" + "".join(ch if ch.isalnum() else "_" for ch in action.lower()) + "_events"
+            metrics[key] = count
+        for policy, count in Counter(r.get("policy", "none") for r in os_hints if r.get("policy")).items():
+            key = "expert_cache_policy_" + "".join(ch if ch.isalnum() else "_" for ch in policy.lower()) + "_events"
+            metrics[key] = count
+
     return metrics
 
 
@@ -1094,6 +1129,26 @@ def generate_recommendations(metrics: dict, data: dict[str, list[dict]]) -> list
                 "可比较 madvise(MADV_WILLNEED)、posix_fadvise(POSIX_FADV_WILLNEED) 和按层/按 expert 预取。"
             ),
             "expected_benefit": "减少首次访问时的 page fault 突发，并降低 PREFILL 阶段尾部延迟。"
+        })
+
+    os_hint_events = metrics.get("os_hint_events", 0)
+    if os_hint_events > 0:
+        os_hint_errors = metrics.get("os_hint_errors", 0)
+        advised_mb = metrics.get("os_hint_advised_mb", 0)
+        os_hint_records = metrics.get("os_hint_records", os_hint_events)
+        recs.append({
+            "priority": "MEDIUM" if os_hint_errors == 0 else "HIGH",
+            "title": "对比 OS Hint 原型效果",
+            "finding": (
+                f"本次运行触发 {os_hint_events:,} 次实际 OS hint（原始决策记录 {os_hint_records:,} 条），"
+                f"累计 hint 范围约 {advised_mb:.1f} MiB，"
+                f"失败 {os_hint_errors:,} 次。"
+            ),
+            "recommendation": (
+                "将本次运行与未启用 OS hint 的基线比较，重点观察 major/minor fault delta、"
+                "first-touch 驻留率、PREFILL 延迟和 swap 峰值是否改善。"
+            ),
+            "expected_benefit": "验证 madvise、posix_fadvise、THP 和 expert-aware prefetch 是否能把观测结论转化为性能收益。"
         })
 
     # 3. Prefill vs Decode
@@ -1240,6 +1295,13 @@ def generate_html_report(
     ft_res_display = "N/A" if ft_res is None else f"{ft_res:.1f}%"
     pss_peak = metrics.get("pss_peak_gb")
     pss_peak_display = "N/A" if pss_peak is None else f"{pss_peak:.2f} GB"
+    os_hint_events = metrics.get("os_hint_events", 0)
+    os_hint_errors = metrics.get("os_hint_errors", 0)
+    os_hint_records = metrics.get("os_hint_records", os_hint_events)
+    cache_hit_rate = metrics.get("expert_cache_hit_rate_pct")
+    cache_hit_rate_display = "N/A" if cache_hit_rate is None else f"{cache_hit_rate:.1f}%"
+    cache_peak = metrics.get("expert_cache_peak_mb")
+    cache_peak_display = "N/A" if cache_peak is None else f"{cache_peak:.1f} MiB"
     metric_cards = f"""
     <div class="metric-card"><div class="metric-value">{_opt(metrics.get('rss_peak_gb'))} GB</div><div class="metric-label">峰值 RSS</div></div>
     <div class="metric-card"><div class="metric-value">{pss_peak_display}</div><div class="metric-label">峰值 PSS</div></div>
@@ -1253,6 +1315,11 @@ def generate_html_report(
     <div class="metric-card"><div class="metric-value">{metrics.get('expert_layers', 'N/A')}</div><div class="metric-label">MoE 层数</div></div>
     <div class="metric-card"><div class="metric-value">{_opt(metrics.get('first_touch_gb'))} GB</div><div class="metric-label">mmap 懒加载量</div></div>
     <div class="metric-card"><div class="metric-value">{ft_res_display}</div><div class="metric-label">First-touch 驻留率</div></div>
+    <div class="metric-card"><div class="metric-value">{os_hint_events:,}</div><div class="metric-label">OS Hint 系统调用</div></div>
+    <div class="metric-card"><div class="metric-value">{os_hint_records:,}</div><div class="metric-label">OS Hint 决策记录</div></div>
+    <div class="metric-card"><div class="metric-value">{os_hint_errors:,}</div><div class="metric-label">OS Hint 失败</div></div>
+    <div class="metric-card"><div class="metric-value">{cache_hit_rate_display}</div><div class="metric-label">Expert Cache 命中率</div></div>
+    <div class="metric-card"><div class="metric-value">{cache_peak_display}</div><div class="metric-label">Expert Cache 峰值</div></div>
     <div class="metric-card"><div class="metric-value">{metrics.get('mmap_count', 'N/A')}</div><div class="metric-label">mmap 区域数</div></div>
     """
 

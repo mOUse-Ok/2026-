@@ -174,7 +174,7 @@ extern "C" void llm_mem_trace_moe_weights(const ggml_tensor * t) {
             continue;
         }
 
-        llm_mem_trace_prefetch_expert_layer(layer, experts, (int) n_expert_used, "moe_route");
+        llm_mem_trace_prefetch_expert_layer(layer, experts, scores, (int) n_expert_used, "moe_route");
 
         line += ",\"top_k\":" + std::to_string(n_expert_used);
         line += ",\"experts\":[";

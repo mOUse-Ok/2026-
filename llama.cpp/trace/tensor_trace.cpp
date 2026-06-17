@@ -10,8 +10,10 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -314,6 +316,15 @@ bool page_aligned_range(uintptr_t addr, size_t nbytes, uintptr_t & start, size_t
 #endif
 }
 
+struct OsHintMeta {
+    const char * policy = nullptr;
+    const char * decision = nullptr;
+    uint64_t cache_bytes = 0;
+    uint64_t cache_capacity_bytes = 0;
+    bool cache_hit = false;
+    bool has_cache_hit = false;
+};
+
 void write_os_hint_event(
         const char * action,
         const char * trigger,
@@ -325,7 +336,8 @@ void write_os_hint_event(
         size_t advised_bytes,
         int result,
         int error_code,
-        uint64_t file_offset = 0) {
+        uint64_t file_offset = 0,
+        const OsHintMeta * meta = nullptr) {
     if (!llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_MEMORY)) {
         return;
     }
@@ -354,6 +366,21 @@ void write_os_hint_event(
     json_escape_append(line, addr_buf);
     line += ",\"size\":" + std::to_string(nbytes);
     line += ",\"advised_bytes\":" + std::to_string(advised_bytes);
+    if (meta && meta->policy && meta->policy[0]) {
+        line += ",\"policy\":";
+        json_escape_append(line, meta->policy);
+    }
+    if (meta && meta->decision && meta->decision[0]) {
+        line += ",\"decision\":";
+        json_escape_append(line, meta->decision);
+    }
+    if (meta) {
+        line += ",\"cache_bytes\":" + std::to_string(meta->cache_bytes);
+        line += ",\"cache_capacity_bytes\":" + std::to_string(meta->cache_capacity_bytes);
+        if (meta->has_cache_hit) {
+            line += ",\"cache_hit\":" + std::string(meta->cache_hit ? "true" : "false");
+        }
+    }
     if (file_offset != 0) {
         line += ",\"file_offset\":" + std::to_string(file_offset);
     }
@@ -372,7 +399,8 @@ void apply_madvise_hint(
         int layer,
         int expert,
         uintptr_t addr,
-        size_t nbytes) {
+        size_t nbytes,
+        const OsHintMeta * meta = nullptr) {
 #ifdef __linux__
     uintptr_t start = 0;
     size_t len = 0;
@@ -382,9 +410,9 @@ void apply_madvise_hint(
     errno = 0;
     const int rc = madvise(reinterpret_cast<void *>(start), len, advice);
     const int err = rc == 0 ? 0 : errno;
-    write_os_hint_event(action, trigger, tensor_name, layer, expert, addr, nbytes, len, rc, err);
+    write_os_hint_event(action, trigger, tensor_name, layer, expert, addr, nbytes, len, rc, err, 0, meta);
 #else
-    (void) action; (void) advice; (void) trigger; (void) tensor_name; (void) layer; (void) expert; (void) addr; (void) nbytes;
+    (void) action; (void) advice; (void) trigger; (void) tensor_name; (void) layer; (void) expert; (void) addr; (void) nbytes; (void) meta;
 #endif
 }
 
@@ -444,11 +472,12 @@ void apply_posix_fadvise_hint(
         int layer,
         int expert,
         uintptr_t addr,
-        size_t nbytes) {
+        size_t nbytes,
+        const OsHintMeta * meta = nullptr) {
 #ifdef __linux__
     FileMapping mapping;
     if (!find_file_mapping(addr, mapping)) {
-        write_os_hint_event(action, trigger, tensor_name, layer, expert, addr, nbytes, 0, -1, ENOENT);
+        write_os_hint_event(action, trigger, tensor_name, layer, expert, addr, nbytes, 0, -1, ENOENT, 0, meta);
         return;
     }
     if (addr >= mapping.end) {
@@ -459,14 +488,14 @@ void apply_posix_fadvise_hint(
     const size_t advise_len = std::min(nbytes, max_len);
     const int fd = open(mapping.path.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
-        write_os_hint_event(action, trigger, tensor_name, layer, expert, addr, nbytes, advise_len, -1, errno, file_offset);
+        write_os_hint_event(action, trigger, tensor_name, layer, expert, addr, nbytes, advise_len, -1, errno, file_offset, meta);
         return;
     }
     const int rc = posix_fadvise(fd, (off_t) file_offset, (off_t) advise_len, POSIX_FADV_WILLNEED);
     close(fd);
-    write_os_hint_event(action, trigger, tensor_name, layer, expert, addr, nbytes, advise_len, rc == 0 ? 0 : -1, rc, file_offset);
+    write_os_hint_event(action, trigger, tensor_name, layer, expert, addr, nbytes, advise_len, rc == 0 ? 0 : -1, rc, file_offset, meta);
 #else
-    (void) action; (void) trigger; (void) tensor_name; (void) layer; (void) expert; (void) addr; (void) nbytes;
+    (void) action; (void) trigger; (void) tensor_name; (void) layer; (void) expert; (void) addr; (void) nbytes; (void) meta;
 #endif
 }
 
@@ -631,6 +660,392 @@ bool expert_slice_range(const ExpertTensorInfo & info, int expert, uintptr_t & a
     addr = info.addr + offset;
     nbytes = std::min(info.expert_stride, info.nbytes - offset);
     return nbytes > 0;
+}
+
+enum class ExpertPolicy {
+    Route,
+    Lru,
+    Lfu,
+    WindowLfu,
+    LeastStale,
+};
+
+ExpertPolicy expert_policy() {
+    static const ExpertPolicy policy = [] {
+        const char * value = std::getenv("LLM_MEM_TRACE_OPT_EXPERT_POLICY");
+        if (!value || !value[0] || std::strcmp(value, "route") == 0) {
+            return ExpertPolicy::Route;
+        }
+        if (std::strcmp(value, "lru") == 0) {
+            return ExpertPolicy::Lru;
+        }
+        if (std::strcmp(value, "lfu") == 0) {
+            return ExpertPolicy::Lfu;
+        }
+        if (std::strcmp(value, "window_lfu") == 0) {
+            return ExpertPolicy::WindowLfu;
+        }
+        if (std::strcmp(value, "least_stale") == 0) {
+            return ExpertPolicy::LeastStale;
+        }
+        return ExpertPolicy::Route;
+    }();
+    return policy;
+}
+
+const char * expert_policy_name(ExpertPolicy policy) {
+    switch (policy) {
+        case ExpertPolicy::Route:      return "route";
+        case ExpertPolicy::Lru:        return "lru";
+        case ExpertPolicy::Lfu:        return "lfu";
+        case ExpertPolicy::WindowLfu:  return "window_lfu";
+        case ExpertPolicy::LeastStale: return "least_stale";
+    }
+    return "route";
+}
+
+enum class ExpertEvictAdvice {
+    None,
+    Cold,
+    DontNeed,
+    PageOut,
+};
+
+ExpertEvictAdvice expert_evict_advice() {
+    static const ExpertEvictAdvice advice = [] {
+        const char * value = std::getenv("LLM_MEM_TRACE_OPT_EXPERT_EVICT");
+        if (!value || !value[0] || std::strcmp(value, "cold") == 0) {
+            return ExpertEvictAdvice::Cold;
+        }
+        if (std::strcmp(value, "none") == 0) {
+            return ExpertEvictAdvice::None;
+        }
+        if (std::strcmp(value, "dontneed") == 0) {
+            return ExpertEvictAdvice::DontNeed;
+        }
+        if (std::strcmp(value, "pageout") == 0) {
+            return ExpertEvictAdvice::PageOut;
+        }
+        return ExpertEvictAdvice::Cold;
+    }();
+    return advice;
+}
+
+uint64_t expert_cache_capacity_bytes() {
+    const uint64_t mib = 1024ull * 1024ull;
+    const uint64_t mb = env_u64_or_default("LLM_MEM_TRACE_OPT_EXPERT_CACHE_MB", 512);
+    if (mb > std::numeric_limits<uint64_t>::max() / mib) {
+        return std::numeric_limits<uint64_t>::max();
+    }
+    return mb * mib;
+}
+
+uint64_t expert_ttl_steps() {
+    return env_u64_or_default("LLM_MEM_TRACE_OPT_EXPERT_TTL_STEPS", 4);
+}
+
+int expert_prefetch_topk() {
+    const uint64_t value = env_u64_or_default("LLM_MEM_TRACE_OPT_EXPERT_PREFETCH_TOPK", 0);
+    return value > (uint64_t) std::numeric_limits<int>::max() ? std::numeric_limits<int>::max() : (int) value;
+}
+
+std::string expert_slice_key(const ExpertTensorInfo & info, int expert) {
+    return std::to_string(info.layer) + ":" + std::to_string(expert) + ":" +
+           std::to_string((uint64_t) info.addr) + ":" + info.name;
+}
+
+void write_expert_cache_event(
+        const char * action,
+        const char * trigger,
+        const char * policy,
+        const char * decision,
+        bool cache_hit,
+        const char * tensor_name,
+        int layer,
+        int expert,
+        uintptr_t addr,
+        size_t nbytes,
+        uint64_t cache_bytes,
+        uint64_t cache_capacity_bytes) {
+    OsHintMeta meta;
+    meta.policy = policy;
+    meta.decision = decision;
+    meta.cache_bytes = cache_bytes;
+    meta.cache_capacity_bytes = cache_capacity_bytes;
+    meta.cache_hit = cache_hit;
+    meta.has_cache_hit = true;
+    write_os_hint_event(action, trigger, tensor_name, layer, expert, addr, nbytes, 0, 0, 0, 0, &meta);
+}
+
+void apply_expert_prefetch_hint(
+        const ExpertTensorInfo & info,
+        int expert,
+        uintptr_t addr,
+        size_t nbytes,
+        const char * reason,
+        const char * policy,
+        uint64_t cache_bytes,
+        uint64_t cache_capacity_bytes) {
+    OsHintMeta meta;
+    meta.policy = policy;
+    meta.decision = "prefetch";
+    meta.cache_bytes = cache_bytes;
+    meta.cache_capacity_bytes = cache_capacity_bytes;
+    meta.cache_hit = false;
+    meta.has_cache_hit = true;
+#ifdef __linux__
+    apply_madvise_hint("expert_madvise_willneed", MADV_WILLNEED,
+                       reason ? reason : "expert_prefetch",
+                       info.name.c_str(), info.layer, expert, addr, nbytes, &meta);
+#else
+    write_os_hint_event("expert_madvise_willneed", reason ? reason : "expert_prefetch",
+                        info.name.c_str(), info.layer, expert, addr, nbytes, 0, -1, ENOSYS, 0, &meta);
+#endif
+    if (os_hint_opt_enabled("LLM_MEM_TRACE_OPT_POSIX_FADVISE")) {
+        apply_posix_fadvise_hint("expert_posix_fadvise_willneed",
+                                 reason ? reason : "expert_prefetch",
+                                 info.name.c_str(), info.layer, expert, addr, nbytes, &meta);
+    }
+}
+
+struct ExpertCacheItem {
+    std::string key;
+    std::string tensor_name;
+    int layer = -1;
+    int expert = -1;
+    uintptr_t addr = 0;
+    size_t nbytes = 0;
+    uint64_t first_step = 0;
+    uint64_t last_step = 0;
+    uint64_t hit_count = 0;
+    uint64_t recent_hits = 0;
+    uint64_t recent_epoch = 0;
+    uint64_t avg_gap = 0;
+    double score = 0.0;
+    bool advised = false;
+    bool resident = false;
+};
+
+void apply_expert_evict_hint(
+        const ExpertCacheItem & item,
+        const char * reason,
+        const char * policy,
+        uint64_t cache_bytes,
+        uint64_t cache_capacity_bytes) {
+    OsHintMeta meta;
+    meta.policy = policy;
+    meta.decision = "evict";
+    meta.cache_bytes = cache_bytes;
+    meta.cache_capacity_bytes = cache_capacity_bytes;
+    meta.cache_hit = false;
+    meta.has_cache_hit = true;
+
+    switch (expert_evict_advice()) {
+        case ExpertEvictAdvice::None:
+            write_os_hint_event("expert_cache_evict", reason ? reason : "expert_cache",
+                                item.tensor_name.c_str(), item.layer, item.expert, item.addr, item.nbytes,
+                                0, 0, 0, 0, &meta);
+            return;
+        case ExpertEvictAdvice::Cold:
+#ifdef MADV_COLD
+            apply_madvise_hint("expert_madvise_cold", MADV_COLD, reason ? reason : "expert_cache",
+                               item.tensor_name.c_str(), item.layer, item.expert, item.addr, item.nbytes, &meta);
+#else
+            write_os_hint_event("expert_madvise_cold", reason ? reason : "expert_cache",
+                                item.tensor_name.c_str(), item.layer, item.expert, item.addr, item.nbytes,
+                                0, -1, ENOSYS, 0, &meta);
+#endif
+            return;
+        case ExpertEvictAdvice::DontNeed:
+#ifdef __linux__
+            apply_madvise_hint("expert_madvise_dontneed", MADV_DONTNEED, reason ? reason : "expert_cache",
+                               item.tensor_name.c_str(), item.layer, item.expert, item.addr, item.nbytes, &meta);
+#else
+            write_os_hint_event("expert_madvise_dontneed", reason ? reason : "expert_cache",
+                                item.tensor_name.c_str(), item.layer, item.expert, item.addr, item.nbytes,
+                                0, -1, ENOSYS, 0, &meta);
+#endif
+            return;
+        case ExpertEvictAdvice::PageOut:
+#ifdef MADV_PAGEOUT
+            apply_madvise_hint("expert_madvise_pageout", MADV_PAGEOUT, reason ? reason : "expert_cache",
+                               item.tensor_name.c_str(), item.layer, item.expert, item.addr, item.nbytes, &meta);
+#else
+            write_os_hint_event("expert_madvise_pageout", reason ? reason : "expert_cache",
+                                item.tensor_name.c_str(), item.layer, item.expert, item.addr, item.nbytes,
+                                0, -1, ENOSYS, 0, &meta);
+#endif
+            return;
+    }
+}
+
+struct ExpertSliceCache {
+    std::mutex mu;
+    std::unordered_map<std::string, ExpertCacheItem> items;
+    uint64_t bytes = 0;
+
+    void touch(
+            const ExpertTensorInfo & info,
+            int expert,
+            double score,
+            uintptr_t addr,
+            size_t nbytes,
+            uint64_t step,
+            const char * reason) {
+        const ExpertPolicy policy = expert_policy();
+        const char * policy_name = expert_policy_name(policy);
+        const uint64_t capacity = expert_cache_capacity_bytes();
+        if (capacity == 0 || nbytes > capacity) {
+            write_expert_cache_event("expert_cache_skip", reason ? reason : "expert_cache",
+                                     policy_name, "skip", false, info.name.c_str(), info.layer, expert,
+                                     addr, nbytes, bytes, capacity);
+            return;
+        }
+
+        const std::string key = expert_slice_key(info, expert);
+        std::lock_guard<std::mutex> lock(mu);
+
+        auto existing = items.find(key);
+        if (existing != items.end()) {
+            update_item(existing->second, step, score);
+            write_expert_cache_event("expert_cache_hit", reason ? reason : "expert_cache",
+                                     policy_name, "hit", true, info.name.c_str(), info.layer, expert,
+                                     addr, nbytes, bytes, capacity);
+            return;
+        }
+
+        ExpertCacheItem item;
+        item.key = key;
+        item.tensor_name = info.name;
+        item.layer = info.layer;
+        item.expert = expert;
+        item.addr = addr;
+        item.nbytes = nbytes;
+        item.first_step = step;
+        item.last_step = step;
+        item.hit_count = 1;
+        item.recent_hits = 1;
+        item.recent_epoch = step;
+        item.score = score;
+        item.advised = true;
+        item.resident = true;
+        items.emplace(key, item);
+        bytes += (uint64_t) nbytes;
+
+        apply_expert_prefetch_hint(info, expert, addr, nbytes, reason, policy_name, bytes, capacity);
+        evict_stale(step, key, reason, policy_name, capacity);
+        evict_until_within_budget(step, key, reason, policy_name, capacity);
+    }
+
+    void update_item(ExpertCacheItem & item, uint64_t step, double score) {
+        const uint64_t ttl = std::max<uint64_t>(1, expert_ttl_steps());
+        if (item.last_step != 0 && step > item.last_step) {
+            const uint64_t gap = step - item.last_step;
+            item.avg_gap = item.avg_gap == 0 ? gap : (item.avg_gap * 3 + gap + 2) / 4;
+        }
+        if (item.recent_epoch == 0) {
+            item.recent_epoch = step;
+        } else if (step > item.recent_epoch + ttl) {
+            const uint64_t windows = std::min<uint64_t>((step - item.recent_epoch) / ttl, 8);
+            item.recent_hits >>= windows;
+            item.recent_epoch = step;
+        }
+        item.last_step = step;
+        item.hit_count++;
+        item.recent_hits++;
+        item.score = score;
+        item.advised = true;
+        item.resident = true;
+    }
+
+    void evict_stale(uint64_t step, const std::string & protected_key, const char * reason, const char * policy, uint64_t capacity) {
+        const uint64_t ttl = expert_ttl_steps();
+        if (ttl == 0) {
+            return;
+        }
+
+        std::vector<std::string> stale;
+        stale.reserve(items.size());
+        for (const auto & kv : items) {
+            const ExpertCacheItem & item = kv.second;
+            if (item.key != protected_key && step > item.last_step && step - item.last_step > ttl) {
+                stale.push_back(item.key);
+            }
+        }
+
+        for (const std::string & key : stale) {
+            auto it = items.find(key);
+            if (it == items.end()) {
+                continue;
+            }
+            ExpertCacheItem item = it->second;
+            bytes -= std::min<uint64_t>(bytes, item.nbytes);
+            items.erase(it);
+            apply_expert_evict_hint(item, reason, policy, bytes, capacity);
+        }
+    }
+
+    void evict_until_within_budget(uint64_t step, const std::string & protected_key, const char * reason, const char * policy, uint64_t capacity) {
+        while (bytes > capacity && !items.empty()) {
+            auto victim = choose_victim(step, protected_key);
+            if (victim == items.end()) {
+                break;
+            }
+            ExpertCacheItem item = victim->second;
+            bytes -= std::min<uint64_t>(bytes, item.nbytes);
+            items.erase(victim);
+            apply_expert_evict_hint(item, reason, policy, bytes, capacity);
+        }
+    }
+
+    std::unordered_map<std::string, ExpertCacheItem>::iterator choose_victim(uint64_t step, const std::string & protected_key) {
+        auto best = items.end();
+        for (auto it = items.begin(); it != items.end(); ++it) {
+            if (it->first == protected_key && items.size() > 1) {
+                continue;
+            }
+            if (best == items.end() || is_better_victim(it->second, best->second, step)) {
+                best = it;
+            }
+        }
+        return best;
+    }
+
+    bool is_better_victim(const ExpertCacheItem & cur, const ExpertCacheItem & best, uint64_t step) const {
+        const ExpertPolicy policy = expert_policy();
+        switch (policy) {
+            case ExpertPolicy::Lru:
+                return cur.last_step < best.last_step ||
+                       (cur.last_step == best.last_step && cur.hit_count < best.hit_count);
+            case ExpertPolicy::Lfu:
+                return cur.hit_count < best.hit_count ||
+                       (cur.hit_count == best.hit_count && cur.last_step < best.last_step);
+            case ExpertPolicy::WindowLfu:
+                return cur.recent_hits < best.recent_hits ||
+                       (cur.recent_hits == best.recent_hits && cur.last_step < best.last_step);
+            case ExpertPolicy::LeastStale:
+                return least_stale_victim_score(cur, step) > least_stale_victim_score(best, step) ||
+                       (least_stale_victim_score(cur, step) == least_stale_victim_score(best, step) &&
+                        cur.hit_count < best.hit_count);
+            case ExpertPolicy::Route:
+                return cur.last_step < best.last_step;
+        }
+        return false;
+    }
+
+    int64_t least_stale_victim_score(const ExpertCacheItem & item, uint64_t step) const {
+        const uint64_t gap = item.avg_gap > 0 ? item.avg_gap : std::max<uint64_t>(1, expert_ttl_steps());
+        const uint64_t predicted_next = item.last_step + gap;
+        if (predicted_next <= step) {
+            return (int64_t) (1000000000ull + step - predicted_next);
+        }
+        return (int64_t) (predicted_next - step);
+    }
+};
+
+ExpertSliceCache & expert_slice_cache() {
+    static ExpertSliceCache cache;
+    return cache;
 }
 
 void log_tensor_event(const ggml_tensor * t, const char * access_kind) {
@@ -890,7 +1305,7 @@ extern "C" void llm_mem_trace_tensor_loaded(const ggml_tensor * t, const char * 
     llm_mem_trace_write(LLM_MEM_TRACE_SINK_TENSOR, line.c_str(), line.size());
 }
 
-extern "C" void llm_mem_trace_prefetch_expert_layer(int layer, const int * experts, int n_experts, const char * reason) {
+extern "C" void llm_mem_trace_prefetch_expert_layer(int layer, const int * experts, const float * scores, int n_experts, const char * reason) {
     if (!os_hints_enabled() || !os_hint_opt_enabled("LLM_MEM_TRACE_OPT_EXPERT_PREFETCH") ||
             layer < 0 || !experts || n_experts <= 0) {
         return;
@@ -902,11 +1317,17 @@ extern "C" void llm_mem_trace_prefetch_expert_layer(int layer, const int * exper
     }
 
     const uint64_t step = llm_mem_trace_get_step();
-    for (int i = 0; i < n_experts; ++i) {
+    const int topk = expert_prefetch_topk();
+    const int limit = topk > 0 ? std::min(n_experts, topk) : n_experts;
+    const ExpertPolicy policy = expert_policy();
+    const char * policy_name = expert_policy_name(policy);
+
+    for (int i = 0; i < limit; ++i) {
         const int expert = experts[i];
         if (expert < 0) {
             continue;
         }
+        const double score = scores ? (double) scores[i] : 0.0;
         for (const ExpertTensorInfo & info : tensors) {
             uintptr_t slice_addr = 0;
             size_t slice_bytes = 0;
@@ -916,18 +1337,32 @@ extern "C" void llm_mem_trace_prefetch_expert_layer(int layer, const int * exper
             if (!os_hint_size_allowed(slice_bytes)) {
                 continue;
             }
+
+            if (policy != ExpertPolicy::Route) {
+                expert_slice_cache().touch(info, expert, score, slice_addr, slice_bytes, step, reason);
+                continue;
+            }
+
             if (!expert_tensor_registry().mark_hinted(step, layer, expert, info.addr)) {
                 continue;
             }
+
+            OsHintMeta meta;
+            meta.policy = policy_name;
+            meta.decision = "prefetch";
+            meta.cache_bytes = 0;
+            meta.cache_capacity_bytes = 0;
+            meta.cache_hit = false;
+            meta.has_cache_hit = true;
 #ifdef __linux__
             apply_madvise_hint("expert_madvise_willneed", MADV_WILLNEED,
                                reason ? reason : "expert_prefetch",
-                               info.name.c_str(), layer, expert, slice_addr, slice_bytes);
+                               info.name.c_str(), layer, expert, slice_addr, slice_bytes, &meta);
 #endif
             if (os_hint_opt_enabled("LLM_MEM_TRACE_OPT_POSIX_FADVISE")) {
                 apply_posix_fadvise_hint("expert_posix_fadvise_willneed",
                                          reason ? reason : "expert_prefetch",
-                                         info.name.c_str(), layer, expert, slice_addr, slice_bytes);
+                                         info.name.c_str(), layer, expert, slice_addr, slice_bytes, &meta);
             }
         }
     }

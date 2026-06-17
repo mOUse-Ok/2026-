@@ -44,7 +44,7 @@ void llm_mem_trace_token_end(int token_idx);
 void llm_mem_trace_tensor_begin(const struct ggml_tensor * t);
 void llm_mem_trace_tensor_end(const struct ggml_tensor * t);
 void llm_mem_trace_tensor_loaded(const struct ggml_tensor * t, const char * stage);
-void llm_mem_trace_prefetch_expert_layer(int layer, const int * experts, int n_experts, const char * reason);
+void llm_mem_trace_prefetch_expert_layer(int layer, const int * experts, const float * scores, int n_experts, const char * reason);
 
 void llm_mem_trace_kv_set_rows(const struct ggml_tensor * t);
 void llm_mem_trace_kv_reuse(uint32_t n_tokens, uint32_t reused);
@@ -75,8 +75,8 @@ static inline void llm_mem_trace_token_end(int token_idx) { (void) token_idx; }
 static inline void llm_mem_trace_tensor_begin(const struct ggml_tensor * t) { (void) t; }
 static inline void llm_mem_trace_tensor_end(const struct ggml_tensor * t) { (void) t; }
 static inline void llm_mem_trace_tensor_loaded(const struct ggml_tensor * t, const char * stage) { (void) t; (void) stage; }
-static inline void llm_mem_trace_prefetch_expert_layer(int layer, const int * experts, int n_experts, const char * reason) {
-    (void) layer; (void) experts; (void) n_experts; (void) reason;
+static inline void llm_mem_trace_prefetch_expert_layer(int layer, const int * experts, const float * scores, int n_experts, const char * reason) {
+    (void) layer; (void) experts; (void) scores; (void) n_experts; (void) reason;
 }
 
 static inline void llm_mem_trace_kv_set_rows(const struct ggml_tensor * t) { (void) t; }
