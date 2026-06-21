@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import heapq
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -73,6 +74,8 @@ class SimResult:
     budget_mb: int
     accesses: int = 0
     hits: int = 0
+    same_step_hits: int = 0
+    cache_hits: int = 0
     misses: int = 0
     skips: int = 0
     prefetch_events: int = 0
@@ -111,14 +114,20 @@ class PolicyCache:
         self.bytes = 0
         self.result = SimResult(policy=policy, budget_mb=budget_mb)
         self.route_seen: set[tuple[int, str]] = set()
+        self.last_access_step_by_key: dict[str, int] = {}
         self.last_prune_step = -1
+        self.stale_heap: list[tuple[int, str]] = []
+        self.victim_heap: list[tuple[tuple[int, ...], str]] = []
 
     def access(self, access: Access) -> None:
         self.result.accesses += 1
+        same_step = self.last_access_step_by_key.get(access.key) == access.step
+        self.last_access_step_by_key[access.key] = access.step
         if self.policy == "route":
             step_key = (access.step, access.key)
             if step_key in self.route_seen:
                 self.result.hits += 1
+                self.result.same_step_hits += 1
                 return
             self.route_seen.add(step_key)
             self.result.misses += 1
@@ -133,7 +142,12 @@ class PolicyCache:
         item = self.items.get(access.key)
         if item is not None:
             self.result.hits += 1
+            if same_step:
+                self.result.same_step_hits += 1
+            else:
+                self.result.cache_hits += 1
             self._update_item(item, access.step, access.score)
+            self._push_heaps(item, access.step)
             return
 
         self.result.misses += 1
@@ -148,6 +162,7 @@ class PolicyCache:
             score=access.score,
         )
         self.bytes += access.size
+        self._push_heaps(self.items[access.key], access.step)
         self.result.peak_cache_bytes = max(self.result.peak_cache_bytes, self.bytes)
         if self.last_prune_step != access.step:
             self._evict_stale(access.step, protected_key=access.key)
@@ -168,13 +183,21 @@ class PolicyCache:
         item.score = score
 
     def _evict_stale(self, step: int, protected_key: str) -> None:
-        stale = [
-            key
-            for key, item in self.items.items()
-            if key != protected_key and step > item.last_step and step - item.last_step > self.ttl_steps
-        ]
-        for key in stale:
+        protected_seen = False
+        while self.stale_heap:
+            last_step, key = heapq.heappop(self.stale_heap)
+            item = self.items.get(key)
+            if item is None or item.last_step != last_step:
+                continue
+            if step <= item.last_step or step - item.last_step <= self.ttl_steps:
+                heapq.heappush(self.stale_heap, (item.last_step, key))
+                break
+            if key == protected_key and len(self.items) > 1:
+                protected_seen = True
+                continue
             self._evict_key(key)
+        if protected_seen and protected_key in self.items:
+            heapq.heappush(self.stale_heap, (self.items[protected_key].last_step, protected_key))
 
     def _evict_to_budget(self, step: int, protected_key: str) -> None:
         while self.bytes > self.capacity and self.items:
@@ -190,25 +213,40 @@ class PolicyCache:
         self.result.evict_bytes += item.size
 
     def _victim_key(self, step: int, protected_key: str) -> str | None:
-        candidates = [item for key, item in self.items.items() if key != protected_key or len(self.items) == 1]
-        if not candidates:
-            return None
-        if self.policy == "lru":
-            return min(candidates, key=lambda item: (item.last_step, item.hits)).key
-        if self.policy == "lfu":
-            return min(candidates, key=lambda item: (item.hits, item.last_step)).key
-        if self.policy == "window_lfu":
-            return min(candidates, key=lambda item: (item.recent_hits, item.last_step)).key
-        if self.policy == "least_stale":
-            return max(candidates, key=lambda item: (self._least_stale_score(item, step), -item.hits)).key
-        return min(candidates, key=lambda item: item.last_step).key
+        skipped: list[tuple[tuple[int, ...], str]] = []
+        while self.victim_heap:
+            sort_key, key = heapq.heappop(self.victim_heap)
+            item = self.items.get(key)
+            if item is None or sort_key != self._victim_sort_key(item, step):
+                continue
+            if key == protected_key and len(self.items) > 1:
+                skipped.append((sort_key, key))
+                continue
+            for entry in skipped:
+                heapq.heappush(self.victim_heap, entry)
+            return key
+        for entry in skipped:
+            heapq.heappush(self.victim_heap, entry)
+        return protected_key if protected_key in self.items and len(self.items) == 1 else None
 
-    def _least_stale_score(self, item: CacheItem, step: int) -> int:
+    def _push_heaps(self, item: CacheItem, step: int) -> None:
+        heapq.heappush(self.stale_heap, (item.last_step, item.key))
+        heapq.heappush(self.victim_heap, (self._victim_sort_key(item, step), item.key))
+
+    def _victim_sort_key(self, item: CacheItem, step: int) -> tuple[int, ...]:
+        if self.policy == "lru":
+            return (item.last_step, item.hits)
+        if self.policy == "lfu":
+            return (item.hits, item.last_step)
+        if self.policy == "window_lfu":
+            return (item.recent_hits, item.last_step)
+        if self.policy == "least_stale":
+            return (-self._predicted_next_step(item), item.hits)
+        return (item.last_step,)
+
+    def _predicted_next_step(self, item: CacheItem) -> int:
         gap = item.avg_gap if item.avg_gap > 0 else self.ttl_steps
-        predicted_next = item.last_step + gap
-        if predicted_next <= step:
-            return 1_000_000_000 + step - predicted_next
-        return predicted_next - step
+        return item.last_step + gap
 
 
 def iter_jsonl(path: Path, required_text: str):
@@ -342,6 +380,8 @@ def write_csv(results: list[SimResult], out_dir: Path) -> Path:
                 "budget_mb",
                 "accesses",
                 "hits",
+                "same_step_hits",
+                "cache_hits",
                 "misses",
                 "hit_rate_pct",
                 "prefetch_events",
@@ -360,6 +400,8 @@ def write_csv(results: list[SimResult], out_dir: Path) -> Path:
                     r.budget_mb,
                     r.accesses,
                     r.hits,
+                    r.same_step_hits,
+                    r.cache_hits,
                     r.misses,
                     f"{r.hit_rate_pct:.4f}",
                     r.prefetch_events,
@@ -430,10 +472,17 @@ def pareto_front(results: list[SimResult]) -> list[SimResult]:
 
 def write_summary(results: list[SimResult], out_dir: Path) -> Path:
     front = pareto_front(results)
-    candidates = sorted(
+    route_rows = [r for r in results if r.policy == "route"]
+    route_hit_floor = max((r.hit_rate_pct for r in route_rows), default=0.0) * 0.5
+    route_hint_ceiling = min((r.estimated_hint_events for r in route_rows), default=0) * 1.5
+    non_route = sorted(
         [r for r in results if r.policy != "route"],
         key=lambda r: (-r.hit_rate_pct, r.estimated_hint_events, r.evict_bytes, r.budget_mb),
-    )[:2]
+    )
+    candidates = [
+        r for r in non_route
+        if (not route_rows or (r.hit_rate_pct >= route_hit_floor and r.estimated_hint_events <= route_hint_ceiling))
+    ][:2]
     lines = [
         "# Expert Cache Policy Simulation",
         "",
@@ -446,15 +495,26 @@ def write_summary(results: list[SimResult], out_dir: Path) -> Path:
         for r in candidates:
             lines.append(
                 f"- `{r.policy}_{r.budget_mb}mb`: hit_rate={r.hit_rate_pct:.2f}%, "
+                f"same_step_hits={r.same_step_hits:,}, cache_hits={r.cache_hits:,}, "
                 f"estimated_hint_events={r.estimated_hint_events:,}, miss={r.miss_gib:.2f} GiB, "
                 f"evict={r.evict_gib:.2f} GiB."
             )
     else:
-        lines.append("- No cache-policy candidate found; check trace inputs.")
+        lines.append("- No non-route cache-policy candidate is close enough to the route baseline on both hit rate and hint count.")
+    if non_route:
+        lines.extend(["", "## Best Non-Route References", ""])
+        for r in non_route[:2]:
+            lines.append(
+                f"- `{r.policy}_{r.budget_mb}mb`: hit_rate={r.hit_rate_pct:.2f}%, "
+                f"same_step_hits={r.same_step_hits:,}, cache_hits={r.cache_hits:,}, "
+                f"estimated_hint_events={r.estimated_hint_events:,}, miss={r.miss_gib:.2f} GiB, "
+                f"evict={r.evict_gib:.2f} GiB."
+            )
     lines.extend(["", "## Pareto Front", ""])
     for r in sorted(front, key=lambda x: (x.policy, x.budget_mb)):
         lines.append(
             f"- `{r.policy}` budget={r.budget_mb} MiB, hit_rate={r.hit_rate_pct:.2f}%, "
+            f"same_step_hits={r.same_step_hits:,}, cache_hits={r.cache_hits:,}, "
             f"hints={r.estimated_hint_events:,}, peak_cache={r.peak_cache_mb:.1f} MiB."
         )
     path = out_dir / "simulation_summary.md"

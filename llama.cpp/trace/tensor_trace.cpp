@@ -7,12 +7,15 @@
 #include <atomic>
 #include <cerrno>
 #include <cctype>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <limits>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -323,6 +326,9 @@ struct OsHintMeta {
     uint64_t cache_capacity_bytes = 0;
     bool cache_hit = false;
     bool has_cache_hit = false;
+    bool has_trace_context = false;
+    int phase = LLM_MEM_TRACE_PHASE_UNKNOWN;
+    uint64_t step = 0;
 };
 
 void write_os_hint_event(
@@ -347,9 +353,11 @@ void write_os_hint_event(
 
     std::string line;
     line.reserve(256);
+    const int phase = meta && meta->has_trace_context ? meta->phase : llm_mem_trace_get_phase();
+    const uint64_t step = meta && meta->has_trace_context ? meta->step : llm_mem_trace_get_step();
     line += "{\"event\":\"OS_HINT\",\"ts_ns\":" + std::to_string(llm_mem_trace_time_ns());
-    line += ",\"phase\":\"" + std::string(phase_name(llm_mem_trace_get_phase())) + "\"";
-    line += ",\"step\":" + std::to_string(llm_mem_trace_get_step());
+    line += ",\"phase\":\"" + std::string(phase_name(phase)) + "\"";
+    line += ",\"step\":" + std::to_string(step);
     line += ",\"action\":";
     json_escape_append(line, action ? action : "");
     line += ",\"trigger\":";
@@ -749,6 +757,31 @@ int expert_prefetch_topk() {
     return value > (uint64_t) std::numeric_limits<int>::max() ? std::numeric_limits<int>::max() : (int) value;
 }
 
+bool expert_prefetch_coalesce_enabled() {
+    static const bool enabled = os_hint_opt_enabled("LLM_MEM_TRACE_OPT_EXPERT_COALESCE");
+    return enabled;
+}
+
+bool expert_prefetch_async_enabled() {
+    static const bool enabled = os_hint_opt_enabled("LLM_MEM_TRACE_OPT_EXPERT_ASYNC");
+    return enabled;
+}
+
+size_t expert_prefetch_async_queue_capacity() {
+    static const size_t value = env_size_or_default("LLM_MEM_TRACE_OPT_EXPERT_ASYNC_QUEUE", 65536);
+    return value;
+}
+
+size_t expert_prefetch_async_workers() {
+    static const size_t value = env_size_or_default("LLM_MEM_TRACE_OPT_EXPERT_ASYNC_WORKERS", 1);
+    return std::max<size_t>(1, value);
+}
+
+uint64_t expert_prefetch_coalesce_max_gap_bytes() {
+    static const uint64_t value = env_u64_or_default("LLM_MEM_TRACE_OPT_EXPERT_COALESCE_MAX_GAP_BYTES", 0);
+    return value;
+}
+
 std::string expert_slice_key(const ExpertTensorInfo & info, int expert) {
     return std::to_string(info.layer) + ":" + std::to_string(expert) + ":" +
            std::to_string((uint64_t) info.addr) + ":" + info.name;
@@ -806,6 +839,300 @@ void apply_expert_prefetch_hint(
                                  reason ? reason : "expert_prefetch",
                                  info.name.c_str(), info.layer, expert, addr, nbytes, &meta);
     }
+}
+
+struct ExpertHintTask {
+    std::string action;
+    std::string fadvise_action;
+    std::string trigger;
+    std::string tensor_name;
+    std::string policy;
+    int layer = -1;
+    int expert = -1;
+    uintptr_t addr = 0;
+    size_t nbytes = 0;
+    uint64_t cache_bytes = 0;
+    uint64_t cache_capacity_bytes = 0;
+    int phase = LLM_MEM_TRACE_PHASE_UNKNOWN;
+    uint64_t step = 0;
+    bool use_fadvise = false;
+};
+
+void issue_expert_hint_task(const ExpertHintTask & task) {
+    OsHintMeta meta;
+    meta.policy = task.policy.c_str();
+    meta.decision = "prefetch";
+    meta.cache_bytes = task.cache_bytes;
+    meta.cache_capacity_bytes = task.cache_capacity_bytes;
+    meta.cache_hit = false;
+    meta.has_cache_hit = true;
+    meta.has_trace_context = true;
+    meta.phase = task.phase;
+    meta.step = task.step;
+#ifdef __linux__
+    apply_madvise_hint(task.action.c_str(), MADV_WILLNEED, task.trigger.c_str(),
+                       task.tensor_name.c_str(), task.layer, task.expert, task.addr, task.nbytes, &meta);
+#else
+    write_os_hint_event(task.action.c_str(), task.trigger.c_str(), task.tensor_name.c_str(),
+                        task.layer, task.expert, task.addr, task.nbytes, 0, -1, ENOSYS, 0, &meta);
+#endif
+    if (task.use_fadvise) {
+        apply_posix_fadvise_hint(task.fadvise_action.c_str(), task.trigger.c_str(),
+                                 task.tensor_name.c_str(), task.layer, task.expert, task.addr, task.nbytes, &meta);
+    }
+}
+
+struct ExpertHintQueue {
+    std::mutex mu;
+    std::condition_variable cv;
+    std::deque<ExpertHintTask> tasks;
+    std::vector<std::thread> workers;
+    bool started = false;
+    bool stopping = false;
+    size_t capacity = 0;
+
+    ~ExpertHintQueue() {
+        shutdown();
+    }
+
+    bool enqueue(ExpertHintTask && task) {
+        if (!ensure_started()) {
+            return false;
+        }
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            if (tasks.size() >= capacity) {
+                return false;
+            }
+            tasks.emplace_back(std::move(task));
+        }
+        cv.notify_one();
+        return true;
+    }
+
+    bool ensure_started() {
+        std::lock_guard<std::mutex> lock(mu);
+        if (started) {
+            return true;
+        }
+        capacity = std::max<size_t>(1, expert_prefetch_async_queue_capacity());
+        stopping = false;
+        const size_t n_workers = std::min<size_t>(expert_prefetch_async_workers(), 16);
+        try {
+            workers.reserve(n_workers);
+            for (size_t i = 0; i < n_workers; ++i) {
+                workers.emplace_back([this] { run(); });
+            }
+        } catch (...) {
+            stopping = true;
+            cv.notify_all();
+            for (std::thread & worker : workers) {
+                if (worker.joinable()) {
+                    worker.join();
+                }
+            }
+            workers.clear();
+            stopping = false;
+            started = false;
+            return false;
+        }
+        started = true;
+        return true;
+    }
+
+    void shutdown() {
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            if (!started) {
+                return;
+            }
+            stopping = true;
+        }
+        cv.notify_all();
+        for (std::thread & worker : workers) {
+            if (worker.joinable()) {
+                worker.join();
+            }
+        }
+        workers.clear();
+        std::lock_guard<std::mutex> lock(mu);
+        started = false;
+        stopping = false;
+    }
+
+    void run() {
+        for (;;) {
+            ExpertHintTask task;
+            {
+                std::unique_lock<std::mutex> lock(mu);
+                cv.wait(lock, [&] { return stopping || !tasks.empty(); });
+                if (tasks.empty()) {
+                    if (stopping) {
+                        break;
+                    }
+                    continue;
+                }
+                task = std::move(tasks.front());
+                tasks.pop_front();
+            }
+            issue_expert_hint_task(task);
+        }
+    }
+};
+
+ExpertHintQueue & expert_hint_queue() {
+    static ExpertHintQueue queue;
+    return queue;
+}
+
+void shutdown_expert_hint_queue() {
+    expert_hint_queue().shutdown();
+}
+
+bool submit_expert_hint_task(ExpertHintTask && task) {
+    if (expert_prefetch_async_enabled()) {
+        static const bool registered = [] {
+            std::atexit(shutdown_expert_hint_queue);
+            return true;
+        }();
+        (void) registered;
+        if (expert_hint_queue().enqueue(std::move(task))) {
+            return true;
+        }
+        task.action += "_fallback";
+        task.fadvise_action += "_fallback";
+    }
+    issue_expert_hint_task(task);
+    return false;
+}
+
+ExpertHintTask make_expert_hint_task(
+        const char * action,
+        const char * fadvise_action,
+        const char * reason,
+        const char * policy,
+        const char * tensor_name,
+        int layer,
+        int expert,
+        uintptr_t addr,
+        size_t nbytes,
+        uint64_t cache_bytes,
+        uint64_t cache_capacity_bytes) {
+    ExpertHintTask task;
+    task.action = action ? action : "expert_madvise_willneed";
+    task.fadvise_action = fadvise_action ? fadvise_action : "expert_posix_fadvise_willneed";
+    task.trigger = reason ? reason : "expert_prefetch";
+    task.tensor_name = tensor_name ? tensor_name : "";
+    task.policy = policy ? policy : "";
+    task.layer = layer;
+    task.expert = expert;
+    task.addr = addr;
+    task.nbytes = nbytes;
+    task.cache_bytes = cache_bytes;
+    task.cache_capacity_bytes = cache_capacity_bytes;
+    task.phase = llm_mem_trace_get_phase();
+    task.step = llm_mem_trace_get_step();
+    task.use_fadvise = os_hint_opt_enabled("LLM_MEM_TRACE_OPT_POSIX_FADVISE");
+    return task;
+}
+
+struct PendingExpertPrefetch {
+    const ExpertTensorInfo * info = nullptr;
+    uintptr_t addr = 0;
+    size_t nbytes = 0;
+    int expert = -1;
+};
+
+uintptr_t saturated_range_end(uintptr_t addr, size_t nbytes) {
+    const uintptr_t max_addr = std::numeric_limits<uintptr_t>::max();
+    if (nbytes > max_addr - addr) {
+        return max_addr;
+    }
+    return addr + nbytes;
+}
+
+void apply_route_coalesced_prefetch_hints(
+        std::vector<PendingExpertPrefetch> & pending,
+        const char * reason,
+        const char * policy) {
+    if (pending.empty()) {
+        return;
+    }
+
+    std::sort(pending.begin(), pending.end(), [](const PendingExpertPrefetch & a, const PendingExpertPrefetch & b) {
+        const uintptr_t a_tensor = a.info ? a.info->addr : 0;
+        const uintptr_t b_tensor = b.info ? b.info->addr : 0;
+        if (a_tensor != b_tensor) {
+            return a_tensor < b_tensor;
+        }
+        if (a.addr != b.addr) {
+            return a.addr < b.addr;
+        }
+        return a.expert < b.expert;
+    });
+
+    struct MergedRange {
+        const ExpertTensorInfo * info = nullptr;
+        uintptr_t start = 0;
+        uintptr_t end = 0;
+        int expert = -1;
+        int count = 0;
+    };
+
+    auto flush = [&](const MergedRange & range) {
+        if (!range.info || range.start == 0 || range.end <= range.start) {
+            return;
+        }
+        const size_t nbytes = (size_t) (range.end - range.start);
+        const int expert = range.count == 1 ? range.expert : -1;
+        submit_expert_hint_task(make_expert_hint_task(
+                "expert_madvise_willneed_coalesced",
+                "expert_posix_fadvise_willneed_coalesced",
+                reason,
+                policy,
+                range.info->name.c_str(),
+                range.info->layer,
+                expert,
+                range.start,
+                nbytes,
+                0,
+                0));
+    };
+
+    MergedRange current;
+    const uint64_t max_gap_bytes = expert_prefetch_coalesce_max_gap_bytes();
+    for (const PendingExpertPrefetch & entry : pending) {
+        if (!entry.info) {
+            continue;
+        }
+        uintptr_t start = 0;
+        size_t len = 0;
+        if (!page_aligned_range(entry.addr, entry.nbytes, start, len)) {
+            continue;
+        }
+        const uintptr_t end = saturated_range_end(start, len);
+        if (end <= start) {
+            continue;
+        }
+
+        const uintptr_t merge_limit = saturated_range_end(current.end, (size_t) std::min<uint64_t>(max_gap_bytes, (uint64_t) std::numeric_limits<size_t>::max()));
+        if (current.info == entry.info && start <= merge_limit) {
+            current.end = std::max(current.end, end);
+            current.count++;
+            if (current.expert != entry.expert) {
+                current.expert = -1;
+            }
+            continue;
+        }
+
+        flush(current);
+        current.info = entry.info;
+        current.start = start;
+        current.end = end;
+        current.expert = entry.expert;
+        current.count = 1;
+    }
+    flush(current);
 }
 
 struct ExpertCacheItem {
@@ -1321,6 +1648,11 @@ extern "C" void llm_mem_trace_prefetch_expert_layer(int layer, const int * exper
     const int limit = topk > 0 ? std::min(n_experts, topk) : n_experts;
     const ExpertPolicy policy = expert_policy();
     const char * policy_name = expert_policy_name(policy);
+    const bool coalesce_route = policy == ExpertPolicy::Route && expert_prefetch_coalesce_enabled();
+    std::vector<PendingExpertPrefetch> pending_coalesced;
+    if (coalesce_route) {
+        pending_coalesced.reserve((size_t) limit * tensors.size());
+    }
 
     for (int i = 0; i < limit; ++i) {
         const int expert = experts[i];
@@ -1347,23 +1679,27 @@ extern "C" void llm_mem_trace_prefetch_expert_layer(int layer, const int * exper
                 continue;
             }
 
-            OsHintMeta meta;
-            meta.policy = policy_name;
-            meta.decision = "prefetch";
-            meta.cache_bytes = 0;
-            meta.cache_capacity_bytes = 0;
-            meta.cache_hit = false;
-            meta.has_cache_hit = true;
-#ifdef __linux__
-            apply_madvise_hint("expert_madvise_willneed", MADV_WILLNEED,
-                               reason ? reason : "expert_prefetch",
-                               info.name.c_str(), layer, expert, slice_addr, slice_bytes, &meta);
-#endif
-            if (os_hint_opt_enabled("LLM_MEM_TRACE_OPT_POSIX_FADVISE")) {
-                apply_posix_fadvise_hint("expert_posix_fadvise_willneed",
-                                         reason ? reason : "expert_prefetch",
-                                         info.name.c_str(), layer, expert, slice_addr, slice_bytes, &meta);
+            if (coalesce_route) {
+                pending_coalesced.push_back({&info, slice_addr, slice_bytes, expert});
+                continue;
             }
+
+            submit_expert_hint_task(make_expert_hint_task(
+                    "expert_madvise_willneed",
+                    "expert_posix_fadvise_willneed",
+                    reason,
+                    policy_name,
+                    info.name.c_str(),
+                    layer,
+                    expert,
+                    slice_addr,
+                    slice_bytes,
+                    0,
+                    0));
         }
+    }
+
+    if (coalesce_route) {
+        apply_route_coalesced_prefetch_hints(pending_coalesced, reason, policy_name);
     }
 }
