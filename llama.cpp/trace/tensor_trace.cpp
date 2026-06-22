@@ -613,6 +613,13 @@ struct ExpertTensorRegistry {
     std::mutex mu;
     std::vector<ExpertTensorInfo> tensors;
     std::unordered_set<std::string> hinted;
+    std::unordered_map<std::string, uint64_t> recent_hints;
+    uint64_t route_hint_ttl_steps_config = 0;
+    uint64_t route_hint_candidates = 0;
+    uint64_t route_hint_issued = 0;
+    uint64_t route_hint_skipped = 0;
+    uint64_t route_hint_duplicate_skipped = 0;
+    uint64_t route_hint_ttl_skipped = 0;
 
     void add(const ggml_tensor * t, const char * name, int layer, uintptr_t addr, size_t nbytes) {
         if (!t || layer < 0 || addr == 0 || nbytes == 0 || !is_expert_weight_tensor_name(name)) {
@@ -644,11 +651,72 @@ struct ExpertTensorRegistry {
         return out;
     }
 
-    bool mark_hinted(uint64_t step, int layer, int expert, uintptr_t addr) {
-        std::string key = std::to_string(step) + ":" + std::to_string(layer) + ":" +
-                          std::to_string(expert) + ":" + std::to_string((uint64_t) addr);
+    bool mark_hinted(uint64_t step, int layer, int expert, uintptr_t addr, uint64_t ttl_steps) {
+        const std::string slice_key = std::to_string(layer) + ":" + std::to_string(expert) + ":" +
+                                      std::to_string((uint64_t) addr);
         std::lock_guard<std::mutex> lock(mu);
-        return hinted.insert(std::move(key)).second;
+        route_hint_ttl_steps_config = std::max(route_hint_ttl_steps_config, ttl_steps);
+        route_hint_candidates++;
+        if (ttl_steps > 0) {
+            auto it = recent_hints.find(slice_key);
+            if (it != recent_hints.end() && step >= it->second && step - it->second <= ttl_steps) {
+                route_hint_skipped++;
+                if (step == it->second) {
+                    route_hint_duplicate_skipped++;
+                } else {
+                    route_hint_ttl_skipped++;
+                }
+                return false;
+            }
+            recent_hints[slice_key] = step;
+            route_hint_issued++;
+            return true;
+        }
+        std::string key = std::to_string(step) + ":" + slice_key;
+        const bool inserted = hinted.insert(std::move(key)).second;
+        if (inserted) {
+            route_hint_issued++;
+        } else {
+            route_hint_skipped++;
+            route_hint_duplicate_skipped++;
+        }
+        return inserted;
+    }
+
+    void write_route_hint_summary() {
+        if (!llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_MEMORY)) {
+            return;
+        }
+        uint64_t ttl_steps = 0;
+        uint64_t candidates = 0;
+        uint64_t issued = 0;
+        uint64_t skipped = 0;
+        uint64_t duplicate_skipped = 0;
+        uint64_t ttl_skipped = 0;
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            candidates = route_hint_candidates;
+            if (candidates == 0) {
+                return;
+            }
+            ttl_steps = route_hint_ttl_steps_config;
+            issued = route_hint_issued;
+            skipped = route_hint_skipped;
+            duplicate_skipped = route_hint_duplicate_skipped;
+            ttl_skipped = route_hint_ttl_skipped;
+        }
+
+        std::string line;
+        line.reserve(256);
+        line += "{\"event\":\"EXPERT_ROUTE_HINT_SUMMARY\",\"ts_ns\":" + std::to_string(llm_mem_trace_time_ns());
+        line += ",\"ttl_steps\":" + std::to_string(ttl_steps);
+        line += ",\"candidates\":" + std::to_string(candidates);
+        line += ",\"issued\":" + std::to_string(issued);
+        line += ",\"skipped\":" + std::to_string(skipped);
+        line += ",\"duplicate_skipped\":" + std::to_string(duplicate_skipped);
+        line += ",\"ttl_skipped\":" + std::to_string(ttl_skipped);
+        line += "}";
+        llm_mem_trace_write(LLM_MEM_TRACE_SINK_MEMORY, line.c_str(), line.size());
     }
 };
 
@@ -752,9 +820,59 @@ uint64_t expert_ttl_steps() {
     return env_u64_or_default("LLM_MEM_TRACE_OPT_EXPERT_TTL_STEPS", 4);
 }
 
+uint64_t expert_route_hint_ttl_steps() {
+    return env_u64_or_default("LLM_MEM_TRACE_OPT_EXPERT_ROUTE_HINT_TTL_STEPS", 0);
+}
+
+uint64_t env_u64_or_inherit(const char * key, uint64_t def_value) {
+    const char * value = std::getenv(key);
+    if (!value || !value[0]) {
+        return def_value;
+    }
+    char * end = nullptr;
+    const unsigned long long parsed = std::strtoull(value, &end, 10);
+    return end && *end == '\0' ? (uint64_t) parsed : def_value;
+}
+
+uint64_t expert_route_hint_ttl_steps_for_phase(int phase) {
+    const uint64_t global_ttl = expert_route_hint_ttl_steps();
+    if (phase == LLM_MEM_TRACE_PHASE_PREFILL) {
+        return env_u64_or_inherit("LLM_MEM_TRACE_OPT_EXPERT_ROUTE_HINT_TTL_PREFILL_STEPS", global_ttl);
+    }
+    if (phase == LLM_MEM_TRACE_PHASE_DECODE) {
+        return env_u64_or_inherit("LLM_MEM_TRACE_OPT_EXPERT_ROUTE_HINT_TTL_DECODE_STEPS", global_ttl);
+    }
+    return global_ttl;
+}
+
 int expert_prefetch_topk() {
     const uint64_t value = env_u64_or_default("LLM_MEM_TRACE_OPT_EXPERT_PREFETCH_TOPK", 0);
     return value > (uint64_t) std::numeric_limits<int>::max() ? std::numeric_limits<int>::max() : (int) value;
+}
+
+int env_topk_or_default(const char * key, int def_value) {
+    const char * value = std::getenv(key);
+    if (!value || !value[0]) {
+        return def_value;
+    }
+    char * end = nullptr;
+    const unsigned long long parsed = std::strtoull(value, &end, 10);
+    if (!end || *end != '\0') {
+        return def_value;
+    }
+    return parsed > (unsigned long long) std::numeric_limits<int>::max() ?
+            std::numeric_limits<int>::max() : (int) parsed;
+}
+
+int expert_prefetch_topk_for_phase(int phase) {
+    const int global_topk = expert_prefetch_topk();
+    if (phase == LLM_MEM_TRACE_PHASE_PREFILL) {
+        return env_topk_or_default("LLM_MEM_TRACE_OPT_EXPERT_PREFETCH_PREFILL_TOPK", global_topk);
+    }
+    if (phase == LLM_MEM_TRACE_PHASE_DECODE) {
+        return env_topk_or_default("LLM_MEM_TRACE_OPT_EXPERT_PREFETCH_DECODE_TOPK", global_topk);
+    }
+    return global_topk;
 }
 
 bool expert_prefetch_coalesce_enabled() {
@@ -775,6 +893,48 @@ size_t expert_prefetch_async_queue_capacity() {
 size_t expert_prefetch_async_workers() {
     static const size_t value = env_size_or_default("LLM_MEM_TRACE_OPT_EXPERT_ASYNC_WORKERS", 1);
     return std::max<size_t>(1, value);
+}
+
+bool expert_prefetch_async_priority_enabled() {
+    static const bool enabled = os_hint_opt_enabled("LLM_MEM_TRACE_OPT_EXPERT_ASYNC_PRIORITY");
+    return enabled;
+}
+
+bool expert_prefetch_async_priority_heap_enabled() {
+    static const bool enabled = os_hint_opt_enabled("LLM_MEM_TRACE_OPT_EXPERT_ASYNC_PRIORITY_HEAP");
+    return enabled;
+}
+
+enum class ExpertAsyncPriorityMode {
+    Score,
+    Deadline,
+    DeadlineScore,
+};
+
+ExpertAsyncPriorityMode expert_prefetch_async_priority_mode() {
+    static const ExpertAsyncPriorityMode mode = [] {
+        const char * value = std::getenv("LLM_MEM_TRACE_OPT_EXPERT_ASYNC_PRIORITY_MODE");
+        if (!value || !value[0] || std::strcmp(value, "score") == 0) {
+            return ExpertAsyncPriorityMode::Score;
+        }
+        if (std::strcmp(value, "deadline") == 0) {
+            return ExpertAsyncPriorityMode::Deadline;
+        }
+        if (std::strcmp(value, "deadline_score") == 0) {
+            return ExpertAsyncPriorityMode::DeadlineScore;
+        }
+        return ExpertAsyncPriorityMode::Score;
+    }();
+    return mode;
+}
+
+const char * expert_prefetch_async_priority_mode_name(ExpertAsyncPriorityMode mode) {
+    switch (mode) {
+        case ExpertAsyncPriorityMode::Score:         return "score";
+        case ExpertAsyncPriorityMode::Deadline:      return "deadline";
+        case ExpertAsyncPriorityMode::DeadlineScore: return "deadline_score";
+    }
+    return "score";
 }
 
 uint64_t expert_prefetch_coalesce_max_gap_bytes() {
@@ -855,6 +1015,8 @@ struct ExpertHintTask {
     uint64_t cache_capacity_bytes = 0;
     int phase = LLM_MEM_TRACE_PHASE_UNKNOWN;
     uint64_t step = 0;
+    uint64_t sequence = 0;
+    double route_score = 0.0;
     bool use_fadvise = false;
 };
 
@@ -886,10 +1048,24 @@ struct ExpertHintQueue {
     std::mutex mu;
     std::condition_variable cv;
     std::deque<ExpertHintTask> tasks;
+    std::vector<ExpertHintTask> priority_heap;
     std::vector<std::thread> workers;
     bool started = false;
     bool stopping = false;
     size_t capacity = 0;
+    size_t worker_count = 0;
+    bool priority_enabled = false;
+    bool priority_heap_enabled = false;
+    ExpertAsyncPriorityMode priority_mode = ExpertAsyncPriorityMode::Score;
+    uint64_t next_sequence = 0;
+    uint64_t enqueued_tasks = 0;
+    uint64_t issued_tasks = 0;
+    uint64_t priority_pops = 0;
+    uint64_t priority_heap_pops = 0;
+    uint64_t fallback_tasks = 0;
+    uint64_t queue_full_fallbacks = 0;
+    uint64_t start_fail_fallbacks = 0;
+    uint64_t max_queue_depth = 0;
 
     ~ExpertHintQueue() {
         shutdown();
@@ -901,10 +1077,22 @@ struct ExpertHintQueue {
         }
         {
             std::lock_guard<std::mutex> lock(mu);
-            if (tasks.size() >= capacity) {
+            if (queue_depth_unlocked() >= capacity) {
+                queue_full_fallbacks++;
                 return false;
             }
-            tasks.emplace_back(std::move(task));
+            task.sequence = next_sequence++;
+            if (priority_enabled && priority_heap_enabled) {
+                priority_heap.emplace_back(std::move(task));
+                auto cmp = [this](const ExpertHintTask & a, const ExpertHintTask & b) {
+                    return is_higher_priority(b, a);
+                };
+                std::push_heap(priority_heap.begin(), priority_heap.end(), cmp);
+            } else {
+                tasks.emplace_back(std::move(task));
+            }
+            enqueued_tasks++;
+            max_queue_depth = std::max<uint64_t>(max_queue_depth, (uint64_t) queue_depth_unlocked());
         }
         cv.notify_one();
         return true;
@@ -916,14 +1104,19 @@ struct ExpertHintQueue {
             return true;
         }
         capacity = std::max<size_t>(1, expert_prefetch_async_queue_capacity());
+        priority_enabled = expert_prefetch_async_priority_enabled();
+        priority_heap_enabled = priority_enabled && expert_prefetch_async_priority_heap_enabled();
+        priority_mode = expert_prefetch_async_priority_mode();
         stopping = false;
         const size_t n_workers = std::min<size_t>(expert_prefetch_async_workers(), 16);
+        worker_count = n_workers;
         try {
             workers.reserve(n_workers);
             for (size_t i = 0; i < n_workers; ++i) {
                 workers.emplace_back([this] { run(); });
             }
         } catch (...) {
+            start_fail_fallbacks++;
             stopping = true;
             cv.notify_all();
             for (std::thread & worker : workers) {
@@ -933,6 +1126,10 @@ struct ExpertHintQueue {
             }
             workers.clear();
             stopping = false;
+            worker_count = 0;
+            priority_enabled = false;
+            priority_heap_enabled = false;
+            priority_mode = ExpertAsyncPriorityMode::Score;
             started = false;
             return false;
         }
@@ -955,9 +1152,18 @@ struct ExpertHintQueue {
             }
         }
         workers.clear();
-        std::lock_guard<std::mutex> lock(mu);
-        started = false;
-        stopping = false;
+        write_summary();
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            started = false;
+            stopping = false;
+            tasks.clear();
+            priority_heap.clear();
+            worker_count = 0;
+            priority_enabled = false;
+            priority_heap_enabled = false;
+            priority_mode = ExpertAsyncPriorityMode::Score;
+        }
     }
 
     void run() {
@@ -965,18 +1171,146 @@ struct ExpertHintQueue {
             ExpertHintTask task;
             {
                 std::unique_lock<std::mutex> lock(mu);
-                cv.wait(lock, [&] { return stopping || !tasks.empty(); });
-                if (tasks.empty()) {
+                cv.wait(lock, [&] { return stopping || !queue_empty_unlocked(); });
+                if (queue_empty_unlocked()) {
                     if (stopping) {
                         break;
                     }
                     continue;
                 }
-                task = std::move(tasks.front());
-                tasks.pop_front();
+                if (priority_enabled && priority_heap_enabled) {
+                    auto cmp = [this](const ExpertHintTask & a, const ExpertHintTask & b) {
+                        return is_higher_priority(b, a);
+                    };
+                    std::pop_heap(priority_heap.begin(), priority_heap.end(), cmp);
+                    task = std::move(priority_heap.back());
+                    priority_heap.pop_back();
+                    priority_pops++;
+                    priority_heap_pops++;
+                } else if (priority_enabled) {
+                    auto best = tasks.begin();
+                    for (auto it = tasks.begin(); it != tasks.end(); ++it) {
+                        if (is_higher_priority(*it, *best)) {
+                            best = it;
+                        }
+                    }
+                    task = std::move(*best);
+                    tasks.erase(best);
+                    priority_pops++;
+                } else {
+                    task = std::move(tasks.front());
+                    tasks.pop_front();
+                }
             }
             issue_expert_hint_task(task);
+            {
+                std::lock_guard<std::mutex> lock(mu);
+                issued_tasks++;
+            }
         }
+    }
+
+    void record_fallback() {
+        std::lock_guard<std::mutex> lock(mu);
+        fallback_tasks++;
+    }
+
+    void write_summary() {
+        if (!llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_MEMORY)) {
+            return;
+        }
+        uint64_t enqueued = 0;
+        uint64_t issued = 0;
+        uint64_t priority = 0;
+        uint64_t heap_pops = 0;
+        uint64_t fallback = 0;
+        uint64_t queue_full = 0;
+        uint64_t start_fail = 0;
+        uint64_t high_water = 0;
+        size_t cap = 0;
+        size_t workers_started = 0;
+        bool priority_on = false;
+        bool heap_on = false;
+        ExpertAsyncPriorityMode mode = ExpertAsyncPriorityMode::Score;
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            enqueued = enqueued_tasks;
+            issued = issued_tasks;
+            priority = priority_pops;
+            heap_pops = priority_heap_pops;
+            fallback = fallback_tasks;
+            queue_full = queue_full_fallbacks;
+            start_fail = start_fail_fallbacks;
+            high_water = max_queue_depth;
+            cap = capacity;
+            workers_started = worker_count;
+            priority_on = priority_enabled;
+            heap_on = priority_heap_enabled;
+            mode = priority_mode;
+        }
+
+        std::string line;
+        line.reserve(256);
+        line += "{\"event\":\"EXPERT_ASYNC_SUMMARY\",\"ts_ns\":" + std::to_string(llm_mem_trace_time_ns());
+        line += ",\"enqueued\":" + std::to_string(enqueued);
+        line += ",\"issued\":" + std::to_string(issued);
+        line += ",\"priority_enabled\":" + std::string(priority_on ? "true" : "false");
+        line += ",\"priority_heap_enabled\":" + std::string(heap_on ? "true" : "false");
+        line += ",\"priority_mode\":";
+        json_escape_append(line, expert_prefetch_async_priority_mode_name(mode));
+        line += ",\"priority_pops\":" + std::to_string(priority);
+        line += ",\"priority_heap_pops\":" + std::to_string(heap_pops);
+        line += ",\"fallback\":" + std::to_string(fallback);
+        line += ",\"queue_full_fallbacks\":" + std::to_string(queue_full);
+        line += ",\"start_fail_fallbacks\":" + std::to_string(start_fail);
+        line += ",\"max_queue_depth\":" + std::to_string(high_water);
+        line += ",\"queue_capacity\":" + std::to_string(cap);
+        line += ",\"workers\":" + std::to_string(workers_started);
+        line += "}";
+        llm_mem_trace_write(LLM_MEM_TRACE_SINK_MEMORY, line.c_str(), line.size());
+    }
+
+    size_t queue_depth_unlocked() const {
+        return priority_enabled && priority_heap_enabled ? priority_heap.size() : tasks.size();
+    }
+
+    bool queue_empty_unlocked() const {
+        return queue_depth_unlocked() == 0;
+    }
+
+    bool is_higher_priority(const ExpertHintTask & a, const ExpertHintTask & b) const {
+        switch (priority_mode) {
+            case ExpertAsyncPriorityMode::Deadline:
+                return compare_deadline(a, b);
+            case ExpertAsyncPriorityMode::DeadlineScore:
+                if (a.step != b.step) {
+                    return a.step < b.step;
+                }
+                if (a.layer != b.layer) {
+                    return a.layer < b.layer;
+                }
+                return compare_score(a, b);
+            case ExpertAsyncPriorityMode::Score:
+                return compare_score(a, b);
+        }
+        return compare_score(a, b);
+    }
+
+    static bool compare_score(const ExpertHintTask & a, const ExpertHintTask & b) {
+        if (a.route_score != b.route_score) {
+            return a.route_score > b.route_score;
+        }
+        return a.sequence < b.sequence;
+    }
+
+    static bool compare_deadline(const ExpertHintTask & a, const ExpertHintTask & b) {
+        if (a.step != b.step) {
+            return a.step < b.step;
+        }
+        if (a.layer != b.layer) {
+            return a.layer < b.layer;
+        }
+        return a.sequence < b.sequence;
     }
 };
 
@@ -989,6 +1323,10 @@ void shutdown_expert_hint_queue() {
     expert_hint_queue().shutdown();
 }
 
+void write_expert_route_hint_summary() {
+    expert_tensor_registry().write_route_hint_summary();
+}
+
 bool submit_expert_hint_task(ExpertHintTask && task) {
     if (expert_prefetch_async_enabled()) {
         static const bool registered = [] {
@@ -999,6 +1337,7 @@ bool submit_expert_hint_task(ExpertHintTask && task) {
         if (expert_hint_queue().enqueue(std::move(task))) {
             return true;
         }
+        expert_hint_queue().record_fallback();
         task.action += "_fallback";
         task.fadvise_action += "_fallback";
     }
@@ -1017,7 +1356,8 @@ ExpertHintTask make_expert_hint_task(
         uintptr_t addr,
         size_t nbytes,
         uint64_t cache_bytes,
-        uint64_t cache_capacity_bytes) {
+        uint64_t cache_capacity_bytes,
+        double route_score = 0.0) {
     ExpertHintTask task;
     task.action = action ? action : "expert_madvise_willneed";
     task.fadvise_action = fadvise_action ? fadvise_action : "expert_posix_fadvise_willneed";
@@ -1030,6 +1370,7 @@ ExpertHintTask make_expert_hint_task(
     task.nbytes = nbytes;
     task.cache_bytes = cache_bytes;
     task.cache_capacity_bytes = cache_capacity_bytes;
+    task.route_score = route_score == route_score ? route_score : 0.0;
     task.phase = llm_mem_trace_get_phase();
     task.step = llm_mem_trace_get_step();
     task.use_fadvise = os_hint_opt_enabled("LLM_MEM_TRACE_OPT_POSIX_FADVISE");
@@ -1041,6 +1382,7 @@ struct PendingExpertPrefetch {
     uintptr_t addr = 0;
     size_t nbytes = 0;
     int expert = -1;
+    double score = 0.0;
 };
 
 uintptr_t saturated_range_end(uintptr_t addr, size_t nbytes) {
@@ -1077,6 +1419,7 @@ void apply_route_coalesced_prefetch_hints(
         uintptr_t end = 0;
         int expert = -1;
         int count = 0;
+        double score = 0.0;
     };
 
     auto flush = [&](const MergedRange & range) {
@@ -1096,7 +1439,8 @@ void apply_route_coalesced_prefetch_hints(
                 range.start,
                 nbytes,
                 0,
-                0));
+                0,
+                range.score));
     };
 
     MergedRange current;
@@ -1119,6 +1463,7 @@ void apply_route_coalesced_prefetch_hints(
         if (current.info == entry.info && start <= merge_limit) {
             current.end = std::max(current.end, end);
             current.count++;
+            current.score = std::max(current.score, entry.score);
             if (current.expert != entry.expert) {
                 current.expert = -1;
             }
@@ -1131,6 +1476,7 @@ void apply_route_coalesced_prefetch_hints(
         current.end = end;
         current.expert = entry.expert;
         current.count = 1;
+        current.score = entry.score;
     }
     flush(current);
 }
@@ -1644,11 +1990,20 @@ extern "C" void llm_mem_trace_prefetch_expert_layer(int layer, const int * exper
     }
 
     const uint64_t step = llm_mem_trace_get_step();
-    const int topk = expert_prefetch_topk();
+    const int phase = llm_mem_trace_get_phase();
+    const uint64_t route_hint_ttl = expert_route_hint_ttl_steps_for_phase(phase);
+    const int topk = expert_prefetch_topk_for_phase(phase);
     const int limit = topk > 0 ? std::min(n_experts, topk) : n_experts;
     const ExpertPolicy policy = expert_policy();
     const char * policy_name = expert_policy_name(policy);
     const bool coalesce_route = policy == ExpertPolicy::Route && expert_prefetch_coalesce_enabled();
+    if (policy == ExpertPolicy::Route) {
+        static const bool registered = [] {
+            std::atexit(write_expert_route_hint_summary);
+            return true;
+        }();
+        (void) registered;
+    }
     std::vector<PendingExpertPrefetch> pending_coalesced;
     if (coalesce_route) {
         pending_coalesced.reserve((size_t) limit * tensors.size());
@@ -1675,12 +2030,12 @@ extern "C" void llm_mem_trace_prefetch_expert_layer(int layer, const int * exper
                 continue;
             }
 
-            if (!expert_tensor_registry().mark_hinted(step, layer, expert, info.addr)) {
+            if (!expert_tensor_registry().mark_hinted(step, layer, expert, info.addr, route_hint_ttl)) {
                 continue;
             }
 
             if (coalesce_route) {
-                pending_coalesced.push_back({&info, slice_addr, slice_bytes, expert});
+                pending_coalesced.push_back({&info, slice_addr, slice_bytes, expert, score});
                 continue;
             }
 
@@ -1695,7 +2050,8 @@ extern "C" void llm_mem_trace_prefetch_expert_layer(int layer, const int * exper
                     slice_addr,
                     slice_bytes,
                     0,
-                    0));
+                    0,
+                    score));
         }
     }
 

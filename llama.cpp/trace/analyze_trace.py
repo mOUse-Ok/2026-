@@ -973,13 +973,57 @@ def collect_metrics(data: dict[str, list[dict]]) -> dict:
     kv_appends = [r for r in data["kv"] if r.get("event") == "KV_APPEND"]
     if kv_appends:
         kv_unique = dedupe_kv_appends(kv_appends)
+        kv_bytes_total = sum(r.get("kv_bytes", 0) for r in kv_unique)
         metrics["kv_event_bytes_mb"] = sum(r.get("kv_bytes", 0) for r in kv_appends) / (1024**2)
-        metrics["kv_total_mb"] = sum(r.get("kv_bytes", 0) for r in kv_unique) / (1024**2)
+        metrics["kv_total_mb"] = kv_bytes_total / (1024**2)
         metrics["kv_append_events"] = len(kv_appends)
         metrics["kv_append_events_unique"] = len(kv_unique)
         metrics["kv_append_duplicate_events"] = len(kv_appends) - len(kv_unique)
         kv_layers = set(r.get("layer", -1) for r in kv_unique)
         metrics["kv_layers"] = len(kv_layers)
+        metrics["kv_ctx_len_capacity"] = max(r.get("ctx_len", 0) for r in kv_unique)
+
+        kv_by_kind: dict[str, int] = defaultdict(int)
+        kv_by_phase: dict[str, int] = defaultdict(int)
+        kv_by_layer: dict[int, int] = defaultdict(int)
+        tokens_by_step: dict[tuple[str, int], int] = defaultdict(int)
+        decode_tokens_by_step: dict[tuple[str, int], int] = defaultdict(int)
+        for r in kv_unique:
+            kv_bytes = int(r.get("kv_bytes", 0))
+            kind = str(r.get("kind", "unknown")).lower()
+            phase = str(r.get("phase", "UNKNOWN"))
+            layer = int(r.get("layer", -1))
+            step = int(r.get("step", 0))
+            n_tokens = int(r.get("n_tokens", 0))
+            kv_by_kind[kind] += kv_bytes
+            kv_by_phase[phase] += kv_bytes
+            if layer >= 0:
+                kv_by_layer[layer] += kv_bytes
+            tokens_by_step[(phase, step)] = max(tokens_by_step[(phase, step)], n_tokens)
+            if phase == "DECODE":
+                decode_tokens_by_step[(phase, step)] = max(decode_tokens_by_step[(phase, step)], n_tokens)
+
+        metrics["kv_k_mb"] = kv_by_kind.get("k", 0) / (1024**2)
+        metrics["kv_v_mb"] = kv_by_kind.get("v", 0) / (1024**2)
+        metrics["kv_prefill_mb"] = kv_by_phase.get("PREFILL", 0) / (1024**2)
+        metrics["kv_decode_mb"] = kv_by_phase.get("DECODE", 0) / (1024**2)
+        tokens_appended = sum(tokens_by_step.values())
+        decode_tokens_appended = sum(decode_tokens_by_step.values())
+        metrics["kv_tokens_appended_est"] = tokens_appended
+        if tokens_appended > 0:
+            bytes_per_token = kv_bytes_total / tokens_appended
+            metrics["kv_bytes_per_token_est"] = bytes_per_token
+            metrics["kv_mb_per_1k_tokens_est"] = bytes_per_token * 1000 / (1024**2)
+            for ctx in (2048, 4096, 8192):
+                metrics[f"kv_projected_{ctx}_mb"] = bytes_per_token * ctx / (1024**2)
+        if decode_tokens_appended > 0:
+            metrics["kv_decode_bytes_per_token_est"] = kv_by_phase.get("DECODE", 0) / decode_tokens_appended
+        if kv_by_layer:
+            layer_values = list(kv_by_layer.values())
+            metrics["kv_layer_avg_mb"] = float(np.mean(layer_values)) / (1024**2)
+            metrics["kv_layer_min_mb"] = min(layer_values) / (1024**2)
+            metrics["kv_layer_max_mb"] = max(layer_values) / (1024**2)
+            metrics["kv_layer_imbalance_ratio"] = max(layer_values) / max(1, min(layer_values))
 
     kv_reuses = [r for r in data["kv"] if r.get("event") == "KV_REUSE"]
     if kv_reuses:
@@ -1066,6 +1110,35 @@ def collect_metrics(data: dict[str, list[dict]]) -> dict:
         for policy, count in Counter(r.get("policy", "none") for r in os_hints if r.get("policy")).items():
             key = "expert_cache_policy_" + "".join(ch if ch.isalnum() else "_" for ch in policy.lower()) + "_events"
             metrics[key] = count
+
+    async_summaries = [r for r in data["memory"] if r.get("event") == "EXPERT_ASYNC_SUMMARY"]
+    if async_summaries:
+        metrics["expert_async_summary_events"] = len(async_summaries)
+        metrics["expert_async_enqueued"] = sum(int(r.get("enqueued", 0)) for r in async_summaries)
+        metrics["expert_async_issued"] = sum(int(r.get("issued", 0)) for r in async_summaries)
+        metrics["expert_async_priority_enabled"] = 1 if any(r.get("priority_enabled") is True for r in async_summaries) else 0
+        metrics["expert_async_priority_heap_enabled"] = 1 if any(r.get("priority_heap_enabled") is True for r in async_summaries) else 0
+        priority_modes = sorted({str(r.get("priority_mode", "")) for r in async_summaries if r.get("priority_mode")})
+        if priority_modes:
+            metrics["expert_async_priority_mode"] = ",".join(priority_modes)
+        metrics["expert_async_priority_pops"] = sum(int(r.get("priority_pops", 0)) for r in async_summaries)
+        metrics["expert_async_priority_heap_pops"] = sum(int(r.get("priority_heap_pops", 0)) for r in async_summaries)
+        metrics["expert_async_fallback"] = sum(int(r.get("fallback", 0)) for r in async_summaries)
+        metrics["expert_async_queue_full_fallbacks"] = sum(int(r.get("queue_full_fallbacks", 0)) for r in async_summaries)
+        metrics["expert_async_start_fail_fallbacks"] = sum(int(r.get("start_fail_fallbacks", 0)) for r in async_summaries)
+        metrics["expert_async_max_queue_depth"] = max(int(r.get("max_queue_depth", 0)) for r in async_summaries)
+        metrics["expert_async_queue_capacity"] = max(int(r.get("queue_capacity", 0)) for r in async_summaries)
+        metrics["expert_async_workers"] = max(int(r.get("workers", 0)) for r in async_summaries)
+
+    route_hint_summaries = [r for r in data["memory"] if r.get("event") == "EXPERT_ROUTE_HINT_SUMMARY"]
+    if route_hint_summaries:
+        metrics["expert_route_hint_summary_events"] = len(route_hint_summaries)
+        metrics["expert_route_hint_ttl_steps"] = max(int(r.get("ttl_steps", 0)) for r in route_hint_summaries)
+        metrics["expert_route_hint_candidates"] = sum(int(r.get("candidates", 0)) for r in route_hint_summaries)
+        metrics["expert_route_hint_issued"] = sum(int(r.get("issued", 0)) for r in route_hint_summaries)
+        metrics["expert_route_hint_skipped"] = sum(int(r.get("skipped", 0)) for r in route_hint_summaries)
+        metrics["expert_route_hint_duplicate_skipped"] = sum(int(r.get("duplicate_skipped", 0)) for r in route_hint_summaries)
+        metrics["expert_route_hint_ttl_skipped"] = sum(int(r.get("ttl_skipped", 0)) for r in route_hint_summaries)
 
     return metrics
 
@@ -1174,11 +1247,17 @@ def generate_recommendations(metrics: dict, data: dict[str, list[dict]]) -> list
     kv_mb = metrics.get("kv_total_mb", 0)
     reuse = metrics.get("kv_reuse_rate_pct", 0)
     if kv_mb > 0:
+        kv_tokens = metrics.get("kv_tokens_appended_est", 0)
+        kv_per_1k = metrics.get("kv_mb_per_1k_tokens_est", 0)
+        kv_proj_4k = metrics.get("kv_projected_4096_mb", 0)
+        kv_proj_8k = metrics.get("kv_projected_8192_mb", 0)
         recs.append({
             "priority": "HIGH",
             "title": "KV Cache 内存管理",
             "finding": (
-                f"KV cache 在 {metrics.get('kv_layers', 0)} 个层上增长到 {kv_mb:.1f} MB。"
+                f"KV cache 在 {metrics.get('kv_layers', 0)} 个层上增长到 {kv_mb:.1f} MB，"
+                f"估算追加 token 数为 {kv_tokens:,}，约 {kv_per_1k:.1f} MB/1k tokens。"
+                f"按当前增长率，4k/8k 上下文约为 {kv_proj_4k:.1f}/{kv_proj_8k:.1f} MB。"
                 f"KV reuse rate 为 {reuse:.1f}%；这里表示旧 KV slot 复用情况，"
                 f"{'当前复用情况较好' if reuse > 30 else '这次运行主要是在追加新 KV'}。"
             ),

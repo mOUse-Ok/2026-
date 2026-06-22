@@ -1,0 +1,149 @@
+#!/bin/bash
+# ============================================================================
+# Reproduce finalist repeat-run matrix for LLM memory trace experiments.
+#
+# Default mode is dry-run: commands are printed but not executed.
+# Set RUN_REPEAT_MATRIX_EXECUTE=1 to run the full matrix.
+# ============================================================================
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+TRACE_BASE_DIR="${TRACE_BASE_DIR:-$PROJECT_DIR/trace_output}"
+RUN_PREFIX="${RUN_PREFIX:-contest_finalist}"
+REPEAT_COUNT="${REPEAT_COUNT:-3}"
+NUM_TOKENS_PREDICT="${NUM_TOKENS_PREDICT:-80}"
+OUTPUT_DIR="${OUTPUT_DIR:-$TRACE_BASE_DIR/contest_runs/repeat_summary}"
+EXECUTE="${RUN_REPEAT_MATRIX_EXECUTE:-0}"
+
+if ! [[ "$REPEAT_COUNT" =~ ^[0-9]+$ ]] || [ "$REPEAT_COUNT" -le 0 ]; then
+    echo "ERROR: REPEAT_COUNT must be a positive integer" >&2
+    exit 1
+fi
+
+join_runs() {
+    local group="$1"
+    local out=""
+    local i
+    for i in $(seq 1 "$REPEAT_COUNT"); do
+        if [ -n "$out" ]; then
+            out+=","
+        fi
+        out+="${RUN_PREFIX}_${group}_r${i}"
+    done
+    echo "$out"
+}
+
+run_case() {
+    local group="$1"
+    local idx="$2"
+    shift 2
+    local run_name="${RUN_PREFIX}_${group}_r${idx}"
+    local cmd=(
+        env
+        "TRACE_BASE_DIR=$TRACE_BASE_DIR"
+        "RUN_NAME=$run_name"
+        "NUM_TOKENS_PREDICT=$NUM_TOKENS_PREDICT"
+        "$@"
+        bash "$SCRIPT_DIR/run_trace_pipeline.sh"
+    )
+
+    printf '[RUN] %s\n' "$run_name"
+    printf '      '
+    printf '%q ' "${cmd[@]}"
+    printf '\n'
+
+    if [ "$EXECUTE" = "1" ]; then
+        "${cmd[@]}"
+    fi
+}
+
+summarize_matrix() {
+    local cmd=(
+        python3 "$SCRIPT_DIR/summarize_repeat_runs.py"
+        --base-dir "$TRACE_BASE_DIR"
+        --baseline-group baseline
+        --group "baseline=$(join_runs baseline)"
+        --group "expert_prefetch=$(join_runs expert_prefetch)"
+        --group "deadline_score=$(join_runs deadline_score)"
+        --group "decode_ttl1=$(join_runs decode_ttl1)"
+        --output-dir "$OUTPUT_DIR"
+    )
+
+    printf '[SUMMARY]\n'
+    printf '      '
+    printf '%q ' "${cmd[@]}"
+    printf '\n'
+
+    if [ "$EXECUTE" = "1" ]; then
+        "${cmd[@]}"
+    fi
+}
+
+echo "=============================================="
+echo "  Finalist Repeat Matrix"
+echo "=============================================="
+echo "Mode: $([ "$EXECUTE" = "1" ] && echo execute || echo dry-run)"
+echo "Run prefix: $RUN_PREFIX"
+echo "Repeat count: $REPEAT_COUNT"
+echo "Trace base: $TRACE_BASE_DIR"
+echo ""
+
+for i in $(seq 1 "$REPEAT_COUNT"); do
+    run_case baseline "$i" \
+        LLM_MEM_TRACE_OS_HINTS=0 \
+        LLM_MEM_TRACE_OPT_EXPERT_PREFETCH=0 \
+        LLM_MEM_TRACE_OPT_EXPERT_ASYNC=0 \
+        LLM_MEM_TRACE_OPT_EXPERT_ASYNC_PRIORITY=0 \
+        LLM_MEM_TRACE_OPT_EXPERT_ASYNC_PRIORITY_HEAP=0 \
+        LLM_MEM_TRACE_OPT_EXPERT_COALESCE=0 \
+        LLM_MEM_TRACE_OPT_EXPERT_ROUTE_HINT_TTL_STEPS=0
+
+    run_case expert_prefetch "$i" \
+        LLM_MEM_TRACE_OS_HINTS=1 \
+        LLM_MEM_TRACE_OPT_EXPERT_PREFETCH=1 \
+        LLM_MEM_TRACE_OPT_EXPERT_POLICY=route \
+        LLM_MEM_TRACE_OPT_EXPERT_PREFETCH_TOPK=0 \
+        LLM_MEM_TRACE_OPT_EXPERT_ASYNC=0 \
+        LLM_MEM_TRACE_OPT_EXPERT_ASYNC_PRIORITY=0 \
+        LLM_MEM_TRACE_OPT_EXPERT_ASYNC_PRIORITY_HEAP=0 \
+        LLM_MEM_TRACE_OPT_EXPERT_COALESCE=0 \
+        LLM_MEM_TRACE_OPT_EXPERT_ROUTE_HINT_TTL_STEPS=0
+
+    run_case deadline_score "$i" \
+        LLM_MEM_TRACE_OS_HINTS=1 \
+        LLM_MEM_TRACE_OPT_EXPERT_PREFETCH=1 \
+        LLM_MEM_TRACE_OPT_EXPERT_POLICY=route \
+        LLM_MEM_TRACE_OPT_EXPERT_PREFETCH_TOPK=0 \
+        LLM_MEM_TRACE_OPT_EXPERT_ASYNC=1 \
+        LLM_MEM_TRACE_OPT_EXPERT_ASYNC_QUEUE=131072 \
+        LLM_MEM_TRACE_OPT_EXPERT_ASYNC_WORKERS=4 \
+        LLM_MEM_TRACE_OPT_EXPERT_ASYNC_PRIORITY=1 \
+        LLM_MEM_TRACE_OPT_EXPERT_ASYNC_PRIORITY_MODE=deadline_score \
+        LLM_MEM_TRACE_OPT_EXPERT_ASYNC_PRIORITY_HEAP=0 \
+        LLM_MEM_TRACE_OPT_EXPERT_COALESCE=0 \
+        LLM_MEM_TRACE_OPT_EXPERT_ROUTE_HINT_TTL_STEPS=0
+
+    run_case decode_ttl1 "$i" \
+        LLM_MEM_TRACE_OS_HINTS=1 \
+        LLM_MEM_TRACE_OPT_EXPERT_PREFETCH=1 \
+        LLM_MEM_TRACE_OPT_EXPERT_POLICY=route \
+        LLM_MEM_TRACE_OPT_EXPERT_PREFETCH_TOPK=0 \
+        LLM_MEM_TRACE_OPT_EXPERT_ROUTE_HINT_TTL_STEPS=0 \
+        LLM_MEM_TRACE_OPT_EXPERT_ROUTE_HINT_TTL_PREFILL_STEPS=0 \
+        LLM_MEM_TRACE_OPT_EXPERT_ROUTE_HINT_TTL_DECODE_STEPS=1 \
+        LLM_MEM_TRACE_OPT_EXPERT_ASYNC=1 \
+        LLM_MEM_TRACE_OPT_EXPERT_ASYNC_QUEUE=131072 \
+        LLM_MEM_TRACE_OPT_EXPERT_ASYNC_WORKERS=4 \
+        LLM_MEM_TRACE_OPT_EXPERT_ASYNC_PRIORITY=1 \
+        LLM_MEM_TRACE_OPT_EXPERT_ASYNC_PRIORITY_MODE=deadline_score \
+        LLM_MEM_TRACE_OPT_EXPERT_ASYNC_PRIORITY_HEAP=0 \
+        LLM_MEM_TRACE_OPT_EXPERT_COALESCE=0
+done
+
+summarize_matrix
+
+if [ "$EXECUTE" != "1" ]; then
+    echo ""
+    echo "Dry-run complete. Set RUN_REPEAT_MATRIX_EXECUTE=1 to run these commands."
+fi
