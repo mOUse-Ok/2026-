@@ -4,10 +4,11 @@
 
 ## 项目信息
 
-- 赛题编号：待填写
-- 赛题名称：LLM 推理物理内存优化与虚拟内存/预取机制实验
-- 队伍名称：待填写
-- 队员信息：待填写
+- 赛题编号：proj59
+- 赛题中文名称：内存受限环境的大语言模型推理优化文
+- 赛题英文名称：Runtime Optimization of LLM Inference for the Memory Constraint System
+- 队伍名称：法尔孔
+- 队员信息：李子恒（队长）、邓晓川、蔡梓涵
 - 项目名称：LLM 推理内存管理优化系统
 - 开源协议：本队新增代码和文档采用 Apache-2.0；第三方 `llama.cpp` 代码保留其原始 MIT License。
 

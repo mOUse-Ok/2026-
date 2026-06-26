@@ -44,7 +44,7 @@
 - 工程侵入小：默认关闭，不改变 baseline。
 - 可复现：提供 pipeline、matrix、analysis 和 summary 脚本。
 - 指标完整：同时比较 latency、faults、RSS、swap、hint events。
-- 结果诚实：没有强行宣称某个策略单方面最优，而是给出 Pareto 权衡。
+- 结果诚实：给出了一个Pareto权衡策略。
 
 ## 当前不足
 
