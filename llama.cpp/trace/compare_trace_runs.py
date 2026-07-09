@@ -216,9 +216,34 @@ def write_csv(rows: list[dict[str, Any]], out_dir: Path) -> Path:
     return path
 
 
+def compact_run_label(label: str) -> str:
+    """Keep multi-panel plots readable when run names encode full settings."""
+    value = str(label)
+    for prefix in ("os_hint_compare/", "contest_"):
+        if value.startswith(prefix):
+            value = value[len(prefix):]
+    for token in ("route_", "_cold"):
+        value = value.replace(token, "")
+
+    replacements = {
+        "baseline": "baseline",
+        "expert_prefetch": "expert",
+        "all_async4": "async4_all",
+        "async4_priority": "priority",
+        "async4_deadline": "deadline",
+        "async4_deadline_score": "deadline_score",
+        "async4_deadline_heap": "deadline_heap",
+        "decode_ttl1": "ttl1",
+        "all_async4_coalesced": "async4_coalesce",
+        "all_coalesced": "coalesce",
+    }
+    return replacements.get(value, value)
+
+
 def plot_overview(rows: list[dict[str, Any]], out_dir: Path) -> Path:
-    labels = [row["label"] for row in rows]
-    fig, axes = plt.subplots(2, 3, figsize=(17, 9))
+    labels = [compact_run_label(row["label"]) for row in rows]
+    y_pos = np.arange(len(labels))
+    fig, axes = plt.subplots(2, 3, figsize=(17, 10.5))
     fig.suptitle("OS Hint Optimization Comparison", fontsize=15, fontweight="bold")
 
     plots = [
@@ -232,12 +257,17 @@ def plot_overview(rows: list[dict[str, Any]], out_dir: Path) -> Path:
     colors = ["#78909C", "#42A5F5", "#66BB6A", "#AB47BC", "#FFA726", "#26A69A", "#EC407A", "#5C6BC0"]
 
     for ax, (key, title, ylabel, higher_better) in zip(axes.ravel(), plots):
-        vals = [row.get(key, 0) for row in rows]
-        ax.bar(labels, vals, color=[colors[i % len(colors)] for i in range(len(labels))], alpha=0.85)
+        vals = [float(row.get(key, 0) or 0) for row in rows]
+        ax.barh(y_pos, vals, color=[colors[i % len(colors)] for i in range(len(labels))], alpha=0.85)
         ax.set_title(title)
-        ax.set_ylabel(ylabel)
-        ax.tick_params(axis="x", rotation=20)
-        ax.grid(True, axis="y", alpha=0.25)
+        ax.set_xlabel(ylabel)
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels(labels, fontsize=8)
+        ax.invert_yaxis()
+        ax.grid(True, axis="x", alpha=0.25)
+        xmax = max(vals) if vals else 1.0
+        xmax = xmax if xmax > 0 else 1.0
+        ax.set_xlim(0, xmax * 1.28)
         baseline = vals[0] if vals else 0
         for i, v in enumerate(vals):
             if i == 0 or baseline == 0:
@@ -246,11 +276,11 @@ def plot_overview(rows: list[dict[str, Any]], out_dir: Path) -> Path:
                 change = pct_change(float(v), float(baseline))
                 sign = "+" if change >= 0 else ""
                 text = f"{fmt_num(v)}\n({sign}{change:.1f}%)"
-            ax.text(i, v, text, ha="center", va="bottom", fontsize=8)
+            ax.text(v + xmax * 0.015, i, text, ha="left", va="center", fontsize=7)
         if higher_better:
             ax.text(0.02, 0.92, "higher is better", transform=ax.transAxes, fontsize=8, color="#2E7D32")
 
-    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    fig.tight_layout(rect=(0, 0, 1, 0.96), w_pad=2.0, h_pad=2.0)
     path = out_dir / "01_os_hint_overview.png"
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)

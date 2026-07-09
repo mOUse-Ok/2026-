@@ -25,10 +25,12 @@
 - `llama.cpp/trace/tensor_trace.cpp`：OS hint、expert slice cache、异步 expert prefetch、priority queue、route TTL 等核心实现。
 - `llama.cpp/trace/analyze_trace.py`：trace 分析、指标聚合和报告生成。
 - `llama.cpp/trace/simulate_expert_cache.py`：trace-driven expert cache 替换策略模拟。
+- `llama.cpp/trace/simulate_kv_cache_policy.py`：trace-driven KV cache 页面、窗口、预算和量化策略模拟。
 - `llama.cpp/trace/compare_trace_runs.py`：多次运行指标对比和 Pareto 分析。
 - `llama.cpp/trace/summarize_repeat_runs.py`：重复实验均值、标准差和变异系数聚合。
 - `llama.cpp/trace/run_trace_pipeline.sh`：单次 trace pipeline 运行入口。
 - `llama.cpp/trace/run_finalist_repeat_matrix.sh`：最终候选策略重复实验入口。
+- `llama.cpp/trace/run_cgroup_memory_matrix.sh`：Linux cgroup v2 受限物理内存实验矩阵入口，默认 dry-run。
 
 ## 构建
 
@@ -91,16 +93,37 @@ python3 -m py_compile \
   llama.cpp/trace/analyze_trace.py \
   llama.cpp/trace/compare_trace_runs.py \
   llama.cpp/trace/simulate_expert_cache.py \
+  llama.cpp/trace/simulate_kv_cache_policy.py \
   llama.cpp/trace/summarize_repeat_runs.py
 
 bash -n llama.cpp/trace/run_trace_pipeline.sh
 bash -n llama.cpp/trace/run_finalist_repeat_matrix.sh
+bash -n llama.cpp/trace/run_cgroup_memory_matrix.sh
 ```
 
 最终矩阵 dry-run：
 
 ```bash
 REPEAT_COUNT=1 RUN_PREFIX=dryrun_check bash llama.cpp/trace/run_finalist_repeat_matrix.sh
+```
+
+cgroup v2 受限内存矩阵 dry-run：
+
+```bash
+MEMORY_LIMITS_MB=4096,5120 \
+RUN_GROUPS=baseline,deadline_score \
+REPEAT_COUNT=1 \
+bash llama.cpp/trace/run_cgroup_memory_matrix.sh
+```
+
+如需真实运行，先确认当前用户拥有可写的 cgroup v2 delegated parent，然后设置：
+
+```bash
+RUN_MEMORY_PRESSURE_EXECUTE=1 \
+CGROUP_PARENT=/sys/fs/cgroup/<delegated-parent> \
+MEMORY_LIMITS_MB=4096,5120 \
+RUN_GROUPS=baseline,deadline_score \
+bash llama.cpp/trace/run_cgroup_memory_matrix.sh
 ```
 
 执行最终 N 次重复实验：

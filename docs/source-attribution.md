@@ -28,10 +28,12 @@
 - `llama.cpp/trace/trace_event.h`
 - `llama.cpp/trace/analyze_trace.py`
 - `llama.cpp/trace/simulate_expert_cache.py`
+- `llama.cpp/trace/simulate_kv_cache_policy.py`
 - `llama.cpp/trace/compare_trace_runs.py`
 - `llama.cpp/trace/summarize_repeat_runs.py`
 - `llama.cpp/trace/run_trace_pipeline.sh`
 - `llama.cpp/trace/run_finalist_repeat_matrix.sh`
+- `llama.cpp/trace/run_cgroup_memory_matrix.sh`
 
 ## 参考方向
 
@@ -42,6 +44,27 @@
 - ST-MoE：MoE expert 跨 token/跨层可预测性分析方向。
 - PagedAttention/vAttention：KV cache 虚拟内存式管理方向。
 - Linux MGLRU/DAMON/madvise：页面回收、冷热页和用户态 hint 机制。
+- Linux cgroup v2：受限内存实验和 memory controller 指标采集机制。
+- StreamingLLM：attention sink 与 recent window 的长上下文 KV 保留方向。
+- H2O：heavy-hitter KV cache token 保留方向；当前项目仅在文档和模拟脚本中标记其需要 attention score 埋点，未实现该算法。
+- KIVI：KV cache 量化方向；当前项目仅做 trace-driven 内存预算估算，未复制其量化实现。
+
+主要公开来源：
+
+- PagedAttention / vLLM：<https://arxiv.org/abs/2309.06180>，<https://github.com/vllm-project/vllm>
+- vAttention：<https://arxiv.org/abs/2405.04437>
+- FlashAttention：<https://arxiv.org/abs/2205.14135>，<https://github.com/Dao-AILab/flash-attention>
+- SmoothQuant：<https://arxiv.org/abs/2211.10438>，<https://github.com/mit-han-lab/smoothquant>
+- AWQ：<https://arxiv.org/abs/2306.00978>，<https://github.com/mit-han-lab/llm-awq>
+- StreamingLLM：<https://arxiv.org/abs/2309.17453>，<https://github.com/mit-han-lab/streaming-llm>
+- H2O：<https://arxiv.org/abs/2306.14048>，<https://github.com/FMInference/H2O>
+- KIVI：<https://arxiv.org/abs/2402.02750>，<https://github.com/jy-yuan/KIVI>
+- DuoAttention：<https://arxiv.org/abs/2410.10819>，<https://github.com/mit-han-lab/duo-attention>
+- MoE-Infinity：<https://arxiv.org/abs/2401.14361>，<https://github.com/TorchMoE/MoE-Infinity>
+- SpecMD：<https://arxiv.org/abs/2602.03921>
+- ST-MoE：<https://arxiv.org/abs/2606.15453>
+- Tutel：<https://arxiv.org/abs/2206.03382>，<https://github.com/microsoft/tutel>
+- Linux cgroup v2：<https://docs.kernel.org/admin-guide/cgroup-v2.html>
 
 说明：上述内容作为算法和系统设计参考，本项目没有直接复制论文代码。
 

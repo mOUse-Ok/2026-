@@ -1,0 +1,680 @@
+% !TeX program = xelatex
+% Overleaf: Menu -> Compiler -> XeLaTeX
+\documentclass[a4paper]{article}
+
+\usepackage[left=2cm, right=2cm, top=2cm, bottom=2cm]{geometry}
+\usepackage{iftex}
+\ifPDFTeX
+    \errmessage{This document must be compiled with XeLaTeX or LuaLaTeX. Please switch the Overleaf compiler to XeLaTeX.}
+\fi
+\usepackage{fontspec}
+\usepackage[UTF8,fontset=none]{ctex}
+\setmainfont{TeX Gyre Termes}
+\setsansfont{TeX Gyre Heros}
+\setmonofont{TeX Gyre Cursor}
+\setCJKmainfont{Noto Serif CJK SC}
+\setCJKsansfont{Noto Sans CJK SC}
+\setCJKmonofont{Noto Sans CJK SC}
+\setCJKfamilyfont{zhkai}{Noto Serif CJK SC}
+\providecommand{\kaishu}{}
+\renewcommand{\kaishu}{\CJKfamily{zhkai}}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{amsthm}
+\usepackage{array}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{xcolor}
+\usepackage{colortbl}
+\usepackage{graphicx}
+\usepackage{float}
+\usepackage{listings}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{enumitem}
+\usepackage[section]{placeins}
+\usepackage{hyperref}
+
+\graphicspath{{figures/}}
+
+\definecolor{AcademicBlue}{HTML}{2F5F8F}
+\definecolor{AcademicGreen}{HTML}{3B7D5C}
+\definecolor{AcademicOrange}{HTML}{C9792B}
+\definecolor{AcademicRed}{HTML}{B04A4A}
+\definecolor{LightBlue}{HTML}{E8F1FA}
+\definecolor{LightGreen}{HTML}{E7F3EC}
+\definecolor{LightOrange}{HTML}{F8EFE4}
+\definecolor{LightGray}{HTML}{F4F6F8}
+\definecolor{DarkText}{HTML}{263238}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=AcademicBlue,
+    urlcolor=AcademicBlue,
+    citecolor=AcademicBlue,
+    unicode=true
+}
+
+\captionsetup{font=small, labelfont=bf, labelsep=quad, justification=centering}
+\captionsetup[table]{position=top, skip=0.35em}
+\captionsetup[figure]{position=bottom, skip=0.35em}
+\captionsetup[subfigure]{font=small, labelfont=bf, justification=centering}
+\captionsetup[subtable]{font=small, labelfont=bf, justification=centering}
+\setlength{\parindent}{2em}
+\setlength{\parskip}{0.35em}
+\setlength{\textfloatsep}{0.9em plus 0.2em minus 0.2em}
+\setlength{\floatsep}{0.75em plus 0.2em minus 0.2em}
+\setlength{\intextsep}{0.85em plus 0.2em minus 0.2em}
+\setlength{\abovecaptionskip}{0.35em}
+\setlength{\belowcaptionskip}{0.15em}
+\renewcommand{\topfraction}{0.88}
+\renewcommand{\bottomfraction}{0.78}
+\renewcommand{\textfraction}{0.12}
+\renewcommand{\floatpagefraction}{0.88}
+\renewcommand{\dblfloatpagefraction}{0.88}
+\setlist[itemize]{itemsep=0.15em, topsep=0.25em}
+\setlist[enumerate]{itemsep=0.15em, topsep=0.25em}
+\renewcommand{\arraystretch}{1.18}
+\sloppy
+\raggedbottom
+\emergencystretch=2em
+
+\newcolumntype{L}[1]{>{\raggedright\arraybackslash}p{#1}}
+\newcolumntype{R}[1]{>{\raggedleft\arraybackslash}p{#1}}
+\newcolumntype{Y}{>{\raggedright\arraybackslash}X}
+\newcommand{\figwide}[2][0.94\textwidth]{\includegraphics[width=#1,height=0.48\textheight,keepaspectratio]{#2}}
+\newcommand{\figmedium}[2][0.78\textwidth]{\includegraphics[width=#1,height=0.34\textheight,keepaspectratio]{#2}}
+
+\lstdefinelanguage{bash}{
+    morekeywords={if,then,else,fi,for,do,done,case,esac,export,bash,env},
+    sensitive=true,
+    morecomment=[l]{\#},
+    morestring=[b]"
+}
+
+\lstset{
+    basicstyle=\small\ttfamily,
+    numbers=left,
+    numberstyle=\tiny,
+    breaklines=true,
+    frame=single,
+    showstringspaces=false,
+    commentstyle=\color{gray},
+    keywordstyle=\color{AcademicBlue}\bfseries
+}
+
+\newtheorem{lemma}{引理}
+\newtheorem{definition}{定义}
+\newtheorem{corollary}{推论}
+
+\newcommand{\coverlogo}{\includegraphics[width=0.8\textwidth]{NKU.png}}
+
+\newcommand{\good}{\textcolor{AcademicGreen}{\textbf{改善}}}
+\newcommand{\cost}{\textcolor{AcademicOrange}{\textbf{代价}}}
+\newcommand{\risk}{\textcolor{AcademicRed}{\textbf{限制}}}
+
+\begin{document}
+\renewcommand{\contentsname}{目\ 录}
+\renewcommand{\appendixname}{附录}
+\renewcommand{\refname}{参考文献}
+\renewcommand{\figurename}{图}
+\renewcommand{\tablename}{表}
+\renewcommand{\today}{\number\year 年 \number\month 月 \number\day 日}
+
+%-------------------------封面----------------
+\begin{titlepage}
+    \begin{center}
+    \coverlogo\\[1cm]
+    \vspace{20mm}
+        \textbf{\huge{\kaishu{操作系统功能挑战赛}}}\\[2.3cm]
+        {\fontsize{34pt}{42pt}\selectfont\textbf{\kaishu{LLM推理内存管理优化系统}}}\\[0.9cm]
+        {\LARGE\kaishu{访存行为分析与内存管理优化报告}}\\[1.5cm]
+
+        \vspace{\fill}
+
+    \centering
+    \textsc{\LARGE \kaishu{姓名\ :\ 李子恒}}\\[0.5cm]
+    \textsc{\LARGE \kaishu{学号\ :\ 2312114}}\\[0.5cm]
+    \textsc{\LARGE \kaishu{专业\ :\ 密码科学与技术}}\\[0.5cm]
+
+    \vfill
+    {\Large \today}
+    \end{center}
+\end{titlepage}
+
+\begin{center}
+\tableofcontents\label{c}
+\end{center}
+\newpage
+
+\section{概述与分工}
+
+\subsection{赛题重述}
+
+本赛题面向嵌入式设备和边缘计算设备上的大语言模型部署问题。随着大语言模型参数规模不断增大，推理过程中不仅需要加载大量模型权重，还会持续产生 KV cache，并在 MoE 模型中动态访问不同 Expert 权重。这些数据共同带来了较高的运行时内存需求，使得物理内存受限的设备难以直接部署大模型。
+
+赛题关注的核心问题是在资源受限条件下，理解并优化大语言模型推理过程中的访存行为。由于 LLM 推理具有较强的阶段性和重复性，例如参数按层访问、KV cache 随 token 增长、MoE Expert 激活数量相对有限，因此可以通过虚拟内存、按需加载、数据换出、预取等系统技术，减少物理内存占用，并尽可能掩盖 I/O 延迟，从而提升推理过程的可运行性和整体性能。
+
+围绕赛题要求，本项目将工作拆解为三个层次：
+
+\begin{enumerate}
+    \item 首先分析 LLM 推理过程中的访存行为，包括模型参数加载、KV cache 使用、MoE Expert 激活以及 page fault、RSS、swap 等运行时状态，建立从模型执行阶段到操作系统内存行为的观测链路。
+    \item 其次结合虚拟内存相关机制，探索在有限物理内存条件下的大模型运行方式，通过按需加载、页缓存利用、数据换出与内存驻留控制，降低推理过程对物理内存容量的依赖。
+    \item 最后引入预取机制，对具有可预测性的权重页和 Expert 访问进行提前 hint，尽量将 I/O 开销从 decode 关键路径中移出，从而缓解 page fault 和文件页加载造成的推理阻塞。
+\end{enumerate}
+
+本项目的重点在于形成一套完整、可复现、可演示的系统方案，而不是只针对单一指标进行局部优化。因此，后续设计将围绕 trace 捕获、问题定位、策略实现和实验验证展开，将观测到的访存瓶颈分别转化为 expert-aware prefetch、异步 hint 队列、deadline-aware priority、TTL 去重和受限物理内存实验等具体机制，并从延迟、缺页次数、RSS、swap 等多个维度评估其效果。
+\subsection{项目与分工情况}
+
+本项目基于 \path{llama.cpp} 扩展，新增代码主要位于 \path{llama.cpp/trace/}。表\ref{tab:repo_modules} 给出了报告中会反复引用的核心模块。
+
+\begin{table}[!ht]
+\centering
+\small
+\caption{项目核心模块与作用}
+\label{tab:repo_modules}
+\begin{tabularx}{\textwidth}{@{}L{0.27\textwidth}Y@{}}
+\toprule
+文件或脚本 & 作用 \\
+\midrule
+\path{tensor_trace.cpp} & 捕获 tensor 加载、访问、页驻留率，并实现 OS hint、expert slice 预取、异步队列、priority、TTL 等优化逻辑。 \\
+\path{kv_trace.cpp} & 捕获 KV cache append 和 slot reuse，用于判断短上下文和长上下文下 KV 内存压力。 \\
+\path{expert_trace.cpp} & 捕获 MoE 路由结果，记录每层激活的 expert id 和 score。 \\
+\path{os_trace.cpp} & 读取 \path{/proc/self/stat}、\path{/proc/self/smaps_rollup} 等 OS 内存统计。 \\
+\path{analyze_trace.py} & 聚合 JSONL trace，生成 \path{metrics.json}、摘要文本、HTML 报告和分析图。 \\
+\path{simulate_expert_cache.py} & 基于 trace 离线模拟 route、LRU、LFU、window-LFU、least-stale 等 expert cache 策略。 \\
+\path{run_trace_pipeline.sh} & 单次 trace 实验入口，负责运行推理、收集 trace 并生成分析结果。 \\
+\path{run_finalist_repeat_matrix.sh} & 最终候选策略重复实验入口，默认 dry-run，开启后执行 N 次矩阵。 \\
+\path{run_cgroup_memory_matrix.sh} & cgroup v2 受限物理内存实验入口，默认 dry-run。 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+本项目核心设计与实现\textbf{完全}由\textbf{李子恒}完成。在核心代码编写完毕后，\textbf{邓晓川}进行了\textbf{复现实验}，并完成了复现报告的编写。蔡梓涵主要负责前期论文调研。
+
+\begin{figure}[!ht]
+\centering
+\figwide[0.86\textwidth]{system_architecture.png}
+\caption{系统整体架构：从推理语义事件到内存管理优化的闭环}
+\label{fig:system_arch}
+\end{figure}
+
+
+\section{内存访存分析}
+LLM 推理的内存问题很容易被概括成“模型太大”或“内存不够”，但这样的描述无法直接指导实现。操作系统能看到的是虚拟地址、文件映射和 page fault；模型运行时知道的是 layer、tensor、KV cache 和 expert routing。项目的第一步就是把这两种视角连接起来。
+
+本项目没有选择指令级 load/store 追踪，因为它开销高，反而很难准确量化各种行为的开销，且很难回到 LLM 语义对象。因此我们采用“语义层插桩 + OS 统计采样”：在推理框架内部记录结构化事件，在 token 边界采样 OS 内存状态，然后离线分析二者之间的关系。
+
+\begin{table}[!ht]
+\centering
+\small
+\caption{Trace 事件与回答的问题}
+\label{tab:trace_events}
+\begin{tabularx}{\textwidth}{@{}L{0.20\textwidth}L{0.24\textwidth}Y@{}}
+\toprule
+事件文件 & 关键事件 & 主要回答的问题 \\
+\midrule
+\path{tensor_trace.jsonl} & \texttt{TENSOR\_LOAD}、\texttt{TENSOR\_ACCESS}、\texttt{OS\_HINT} & 哪些权重或中间 tensor 被访问，是否 mmap，首次访问时页面是否驻留，OS hint 是否发出。 \\
+\path{kv_trace.jsonl} & \texttt{KV\_APPEND}、\texttt{KV\_REUSE} & KV cache 是否持续增长，是否出现 slot 复用，当前上下文长度下 KV 是否构成主要内存压力。 \\
+\path{expert_trace.jsonl} & \texttt{EXPERT\_ROUTE} & MoE 每层选择哪些 expert，全局是否集中，层内是否存在热点。 \\
+\path{memory_trace.jsonl} & \texttt{TOKEN\_BEGIN}、\texttt{TOKEN\_END}、OS memory stat & token 延迟、RSS、PSS、swap、minor/major fault 是否在同一阶段出现突发。 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+图\ref{fig:trace_pipeline} 展示了事件采集链路。在进行访存行为分析时，我意识到如果写一个测试脚本，并直接产出量化图表，对于后续优化策略的比较应该会有较大帮助，因此我将整个测试打包成了一个pipeline。
+
+\begin{figure}[!ht]
+\centering
+\figwide[1\textwidth]{trace_pipeline.png}
+\caption{访存行为捕获链路}
+\label{fig:trace_pipeline}
+\end{figure}
+
+\subsection{Baseline 实验设置}
+
+Baseline 使用本地 GGUF 模型 \path{Qwen3.5-35B-A3B-Q3_K_M.gguf}，CPU-only 推理，默认生成 80 个 token。
+
+单次访存分析事件规模如表\ref{tab:event_scale}。这个规模说明采集链路已经覆盖了推理阶段、tensor 访问、KV cache、MoE 路由和 OS 内存状态；同一轮 baseline 的 OS 内存摘要见表\ref{tab:baseline_os}。
+
+\begin{table}[!ht]
+\centering
+\caption{单次 baseline 访存与 OS 内存摘要}
+\begin{subtable}[t]{0.56\textwidth}
+\centering
+\small
+\caption{访存分析事件规模}
+\label{tab:event_scale}
+\begin{tabularx}{\linewidth}{@{}L{0.43\linewidth}rY@{}}
+\toprule
+事件类型 & 数量 & 说明 \\
+\midrule
+Tensor access sample & 400,182 & ggml 计算图节点级 tensor 访问样本 \\
+Tensor load / key tensor event & 721 & 权重加载或关键 tensor 事件 \\
+Tensor residency event & 3,325 & \texttt{mincore} 驻留率观测事件 \\
+KV event & 1,802 & KV append / reuse 事件 \\
+Expert route event & 20,820 & MoE 路由事件 \\
+Memory event & 8,134 & token 边界与 OS 内存采样事件 \\
+\bottomrule
+\end{tabularx}
+\end{subtable}\hfill
+\begin{subtable}[t]{0.38\textwidth}
+\centering
+\small
+\caption{OS 内存行为摘要}
+\label{tab:baseline_os}
+\begin{tabular}{@{}lr@{}}
+\toprule
+指标 & 数值 \\
+\midrule
+RSS 峰值 & 6.17 GiB \\
+RSS 平均值 & 5.82 GiB \\
+PSS 峰值 & 6.17 GiB \\
+Swap 峰值 & 218.80 MiB \\
+Mmap 区域数 & 118 \\
+Minor fault delta 总数 & 489,491 \\
+Major fault delta 总数 & 739,757 \\
+最大 major fault 突发 & 354,539 \\
+\bottomrule
+\end{tabular}
+\end{subtable}
+\end{table}
+
+\subsection{OS 内存行为：问题集中在缺页突发}
+
+表\ref{tab:baseline_os} 显示，运行过程中已经出现明显的 page fault 和 swap。RSS 峰值约 6.17 GiB，swap 峰值约 218.80 MiB，major fault delta 总数为 739,757。最明显的两个缺页突发都发生在 PREFILL 阶段附近，其中最大突发出现在约 24.26 s。
+
+\begin{figure}[!ht]
+\centering
+\figwide[0.90\textwidth]{latest_memory_timeline.png}
+\caption{Baseline 运行过程中的 RSS、Swap 与 Page Fault 时间线}
+\label{fig:memory_timeline}
+\end{figure}
+
+通过这组结果，我们可以得到最直接的判断是：当前最先需要处理的不是 KV cache 增长，而是 mmap 权重页首次访问带来的缺页等待。PREFILL 阶段会集中触碰大量权重页，因此一旦页面尚未驻留，就会形成显著的 major fault 峰值。
+
+\subsection{Tensor 驻留率：mmap 权重页是优化重点}
+
+为了避免把 \texttt{first\_touch} 误解成真实物理页首次缺页，项目在 tensor 加载和首次访问时引入 \texttt{mincore} 采样。它主要回答\textbf{“采样时这个 tensor 有多少页面已经在物理内存中”}这个问题。
+
+\begin{figure}[!ht]
+\centering
+\begin{subfigure}[t]{0.48\textwidth}
+    \centering
+    \figmedium[0.96\linewidth]{fault_bursts.png}
+    \caption{Baseline 缺页突发分布}
+    \label{fig:fault_bursts}
+\end{subfigure}\hfill
+\begin{subfigure}[t]{0.48\textwidth}
+    \centering
+    \figmedium[0.96\linewidth]{residency_by_tensor_type.png}
+    \caption{不同 tensor 类别的页驻留率}
+    \label{fig:residency}
+\end{subfigure}
+\caption{缺页突发与 tensor 页驻留率对比}
+\label{fig:fault_residency_pair}
+\end{figure}
+
+\begin{figure}[!ht]
+\centering
+\figwide[0.96\textwidth]{latest_page_residency.png}
+\caption{页面驻留率与进程内存拆解}
+\label{fig:page_residency_original}
+\end{figure}
+
+\begin{figure}[!ht]
+\centering
+\figwide[0.96\textwidth]{latest_tensor_access.png}
+\caption{Tensor first-touch 与访问分布}
+\label{fig:tensor_access_original}
+\end{figure}
+
+图\ref{fig:residency} 的含义很明确：普通 CPU tensor 的页驻留率接近 94.65\%，而 \texttt{CPU\_Mapped} tensor 只有 36.48\%。这说明优化对象不应该泛化成“所有内存”，而应该优先指向 mmap 映射的模型权重页。然后我们看 first-touch 的未驻留页面估算量约 10.24 GiB，未驻留最多的对象包括 \texttt{token\_embd.weight}、\texttt{output.weight} 和 \texttt{blk.*.ffn\_down\_exps.weight}。
+
+其中 \texttt{ffn\_down\_exps.weight} 属于 MoE expert 权重，这个发现直接启示了我们后面的 expert-aware prefetch：既然低驻留率集中在被路由选择的 expert slice 上，就没有必要提前触碰整个模型，而应该根据路由结果提示真正即将访问的 expert slice。
+
+\subsection{KV Cache 行为：当前实验不是主要瓶颈}
+
+KV cache 追踪的结果相对温和。单次实验中 KV append 总量约 22.22 MiB，K cache 与 V cache 各约 11 MiB，slot 复用率为 0.0\%。但这并不表示 attention 没有读取历史 KV，而是表示这次短生成实验主要在追加新 KV，没有出现旧 slot 复用。
+
+\begin{figure}[!ht]
+\centering
+\figwide[0.92\textwidth]{latest_kv_cache.png}
+\caption{KV cache 增长与复用情况}
+\label{fig:kv_cache_original}
+\end{figure}
+
+这个结论对优化同样重要：在当前 prompt 和 80 token 生成条件下，KV cache 不适合作为主要优化对象。若要评估 KV 分页、KV 量化或窗口保留策略，需要增加上下文长度和生成 token 数。因此，本项目的优化主线先聚焦 mmap 权重页和 MoE expert 预取。
+
+\begin{table}[!ht]
+\centering
+\small
+\caption{KV cache 行为摘要}
+\label{tab:kv_behavior}
+\begin{tabular}{@{}lr@{}}
+\toprule
+指标 & 数值 \\
+\midrule
+KV append 总量 & 22.22 MiB \\
+KV append event & 1,638 \\
+KV append duplicate & 0 \\
+K cache & 约 11.11 MiB \\
+V cache & 约 11.09 MiB \\
+KV slot 复用率 & 0.0\% \\
+记录到 KV 的层数 & 10 \\
+\bottomrule
+\end{tabular}
+\end{table}
+\subsection{MoE Expert 路由：全局不集中，层内有热点}
+
+MoE 路由分析显示，全局 expert 并没有高度集中。全局 top 5 expert 占比约 4.77\%，top 20 占比约 15.46\%。如果只按全局 expert id 做常驻，很容易把预算浪费在不同层语义不一致的 expert 上。
+
+更有价值的是层内热点。表\ref{tab:moe_hotspots} 给出了一些典型热点，它们都落在 \((layer, expert)\) 粒度上。
+
+\begin{table}[!ht]
+\centering
+\small
+\caption{典型 MoE 层内热点}
+\label{tab:moe_hotspots}
+\begin{tabularx}{0.96\textwidth}{@{}L{0.30\textwidth}R{0.16\textwidth}Y@{}}
+\toprule
+层与 expert & 层内占比 & 优化含义 \\
+\midrule
+layer 37, expert 103 & 9.56\% & 层内复用概率高，可作为预取和局部常驻候选 \\
+layer 20, expert 53 & 9.35\% & 适合按层维护 expert slice 元数据 \\
+layer 15, expert 206 & 9.20\% & 不宜只看全局 expert id \\
+layer 35, expert 254 & 8.94\% & 可与 route score 共同决定调度优先级 \\
+layer 13, expert 40 & 8.89\% & 可用于设计 TTL 或缓存预算策略 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{figure}[!ht]
+\centering
+\figwide[0.92\textwidth]{latest_expert_activation.png}
+\caption{MoE expert 激活分布}
+\label{fig:expert_activation_original}
+\end{figure}
+
+这部分分析直接决定了优化粒度：expert-aware prefetch 的 key 采用 \((layer, expert)\)，而不是单独的 expert id。这样做是为了避免把不同层的 expert 误合并，也能更好地服务 deadline-aware priority 调度。
+
+\subsection{访存分析结论}
+
+综合 baseline 结果，我们得到了四个对后续工作有直接指导作用的结论：
+
+\begin{enumerate}
+    \item \textbf{优先对象是 mmap 权重页。} \texttt{CPU\_Mapped} 驻留率远低于普通 CPU tensor，first-touch 未驻留估算量达到 10.24 GiB。
+    \item \textbf{优先阶段是 PREFILL 和早期 DECODE。} 最大缺页出现在 PREFILL，它会影响后续 decode 的缓存状态和等待时间。
+    \item \textbf{MoE 优化应按 \((layer, expert)\) 设计。} 全局 expert 不集中，但在层内存在访问热点。
+    \item \textbf{短生成情景下 KV cache 不是主要压力源。} 这次实验 KV 总量小，因此 KV 管理可能是后续长上下文实验的方向。
+\end{enumerate}
+
+这些结论使后续优化有了明确边界：先做低侵入的 OS hint 和 expert slice 预取，再用重复实验判断收益和副作用。
+
+\section{内存管理优化}
+本项目的优化实现遵循三个原则。
+
+第一，默认不改变 baseline 行为。所有 OS hint、expert prefetch、异步队列、TTL、coalescing 和策略模拟相关能力都通过环境变量开启。不开启时，推理路径保持原样。
+
+第二，优先选择低侵入方法。项目没有直接修改 Linux 内核，也没有在当前阶段实现激进的 \texttt{MADV\_DONTNEED} 或强制 pageout 作为默认策略，而是先用 \texttt{madvise}、\texttt{posix\_fadvise} 和用户态调度验证方向。
+
+第三，同时看性能和内存。降低 major faults 如果带来过高 RSS 或 swap，并不一定是好策略；减少 hint calls 如果导致 coverage 降低，也可能让延迟变差。因此最终比较使用 decode latency、major faults、RSS、swap 和 hint calls 的组合指标。
+
+\subsection{OS Hint 与 Expert-aware Prefetch}
+
+OS hint 原型包括：
+
+\begin{itemize}
+    \item \texttt{madvise(MADV\_WILLNEED)}：提示内核即将访问某段 mmap 权重页。
+    \item \texttt{madvise(MADV\_SEQUENTIAL)}：提示访问模式更接近顺序扫描。
+    \item \texttt{posix\_fadvise(POSIX\_FADV\_WILLNEED)}：从文件映射角度提示即将访问的文件范围。
+    \item THP 相关 hint：尝试降低大权重范围的页表和 TLB 压力。
+    \item expert-aware prefetch：根据 MoE 路由结果，对当前 token 实际选择的 expert slice 发出预取提示。
+\end{itemize}
+
+这些策略并不是越多越好。早期消融实验已经显示，加载期大范围 hint 和全策略叠加可能增加额外工作，最终延迟不一定改善。效果最明确的是 expert-aware prefetch，因为它直接对应了上一节发现的 MoE expert 权重低驻留率问题。
+
+\begin{figure}[!ht]
+\centering
+\figwide[0.95\textwidth]{os_hint_priority_overview.png}
+\caption{OS hint 与异步 priority 候选策略对比}
+\label{fig:os_hint_priority_overview}
+\end{figure}
+
+\subsection{异步队列与 Deadline-aware Priority}
+
+同步 expert prefetch 的问题是 hint call 数量接近 10 万，容易干扰 decode 关键路径。为了解决这个问题，我们实现了用户态异步 hint queue。推理线程只负责把任务入队，worker 线程负责执行 \texttt{madvise} 或 \texttt{posix\_fadvise}。
+
+但是单纯 FIFO 仍然不够。某些 expert slice 很快就会被当前 step 或近邻 layer 用到，某些则距离使用点较远。所以我们还比较实现了如下 priority mode：
+
+\begin{itemize}
+    \item \texttt{score}：主要按 route score 排序。
+    \item \texttt{deadline}：主要按 step 和 layer 的紧迫程度排序。
+    \item \texttt{deadline\_score}：先看使用 deadline，再用 route score 打破并列。
+\end{itemize}
+
+最终我们发现效果最好的策略是 \texttt{deadline\_score}。它不是 major fault 最低的策略，但在 decode latency、RSS、swap 和 major faults 上的综合表现最好。
+
+\begin{figure}[!ht]
+\centering
+\figwide[1.1\textwidth]{async_prefetch.png}
+\caption{异步 expert prefetch 的运行机制}
+\label{fig:async_prefetch}
+\end{figure}
+
+\subsection{TTL、Coalescing 与 Top-k 的取舍}
+
+项目也尝试过降低 hint 数量的几条路径。
+
+\begin{itemize}
+    \item \textbf{Top-k 截断}：只预取 route score 最高的若干 expert。它确实减少 hint calls，但 coverage 下降后 major faults 回升，因此不能作为主策略。
+    \item \textbf{Coalescing}：合并地址相邻的 expert slice，减少系统调用次数。实际收益受 expert slice 地址连续性限制，不能稳定解决 hint 过多的问题。
+    \item \textbf{Route TTL}：对最近 step 已经提示过的 expert slice 做跳过。它能降低 hint calls，\texttt{decode\_ttl1} 平均 hint calls 约 82,711，低于 \texttt{deadline\_score} 的 98,893，但延迟和内存指标不如主策略。
+\end{itemize}
+
+这说明“减少系统调用”不能孤立看。若减少 hint 的同时破坏预取覆盖，最终会让 major faults 和 decode latency 变差。当前更合理的折中是：保留 route coverage，把系统调用从关键路径迁出，再用 priority 提高执行时效。
+
+\subsection{Expert Cache 替换策略模拟}
+
+项目实现了 trace-driven expert cache 模拟，用来在真实运行前筛掉明显不合适的策略。模拟对象包括 \texttt{route}、\texttt{lru}、\texttt{lfu}、\texttt{window\_lfu} 和 \texttt{least\_stale}，预算覆盖 128/256/512/768/1024 MiB。
+
+完整矩阵给出的结论比较直接：在当前 trace 下，非 route 类缓存策略没有接近 route baseline 的候选。最好的非 route 参考如 \texttt{lru\_1024mb}，hit rate 约 15.07\%，估计 hint events 约 878,092；而 route 对照的 hit rate 约 80.28\%，hint events 约 102,222。这个差距说明，朴素 LRU/LFU 类替换在当前 MoE 访问模式下无法直接替代 route-aware prefetch。
+
+\begin{figure}[!ht]
+\centering
+\figmedium[0.86\textwidth]{expert_cache_hit_rate.png}
+\caption{Expert cache 替换策略离线模拟命中率}
+\label{fig:expert_cache_hit_rate}
+\end{figure}
+
+\begin{table}[!ht]
+\centering
+\small
+\caption{内存管理策略设计与取舍}
+\label{tab:strategy_matrix}
+\begin{tabularx}{\textwidth}{@{}L{0.17\textwidth}L{0.24\textwidth}L{0.22\textwidth}Y@{}}
+\toprule
+策略 & 解决的问题 & 主要收益 & 主要代价或限制 \\
+\midrule
+Expert prefetch & MoE expert 权重 first-touch 低驻留 & 大幅降低 major faults & RSS 上升，hint calls 多 \\
+Async queue & 同步 hint 干扰 decode & 降低关键路径系统调用影响 & 需要队列容量和 worker 参数 \\
+\texttt{deadline\_score} & FIFO 无法区分紧迫度 & Decode latency 最低，swap 最低 & Major faults 不如同步 prefetch 最低 \\
+TTL 去重 & 重复 route hint 过多 & hint calls 降低 & 延迟和内存折中不如主策略 \\
+Top-k & hint calls 过多 & 系统调用减少明显 & coverage 下降，faults 回升 \\
+LRU/LFU 模拟 & 尝试有限预算缓存 & 可快速筛选候选 & 当前 trace 下 miss 和 eviction 过高 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\section{实验结果与分析}
+
+\subsection{N=3 重复实验设置}
+
+最终候选策略使用同一模型、同一 prompt、同一 trace pipeline 重复 3 次，并由 \path{summarize_repeat_runs.py} 聚合均值、标准差和相对 baseline 改善。比较对象包括：
+
+\begin{itemize}
+    \item \texttt{baseline}：不开启 OS hint 和 expert prefetch。
+    \item \texttt{expert\_prefetch}：同步 route expert prefetch。
+    \item \texttt{deadline\_score}：异步 4 worker，按 deadline 和 route score 排序。
+    \item \texttt{decode\_ttl1}：在 \texttt{deadline\_score} 基础上，对 DECODE 阶段最近 1 step 内重复 route hint 做 TTL 去重。
+\end{itemize}
+
+\begin{table}[!ht]
+\centering
+\small
+\caption{最终候选策略 N=3 重复实验摘要}
+\label{tab:repeat_summary}
+\begin{tabular}{@{}lrrrrr@{}}
+\toprule
+方案 & Decode 均值/us & Major faults & RSS/GiB & Swap/MiB & Hint calls \\
+\midrule
+baseline & 376,069 & 757,052 & 6.228 & 217.86 & 0 \\
+expert\_prefetch & 214,724 & 49,613 & 6.486 & 157.44 & 99,907 \\
+deadline\_score & 194,971 & 71,060 & 6.433 & 123.67 & 98,893 \\
+decode\_ttl1 & 216,819 & 69,406 & 6.501 & 174.25 & 82,711 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Decode 延迟对比}
+
+\begin{figure}[!ht]
+\centering
+\begin{subfigure}[t]{0.48\textwidth}
+    \centering
+    \figmedium[0.96\linewidth]{repeat_decode_latency.png}
+    \caption{Decode latency 均值}
+    \label{fig:decode_latency}
+\end{subfigure}\hfill
+\begin{subfigure}[t]{0.48\textwidth}
+    \centering
+    \figmedium[0.96\linewidth]{repeat_major_faults.png}
+    \caption{Major faults 均值}
+    \label{fig:major_faults}
+\end{subfigure}
+\caption{N=3 重复实验中 decode latency 与 major faults 对比}
+\label{fig:latency_fault_pair}
+\end{figure}
+
+\texttt{deadline\_score} 的 decode latency 均值最低，为 194,971 us，相比 baseline 改善约 48.16\%。同步 \texttt{expert\_prefetch} 已经能明显降低延迟，但由于 hint call 仍在关键路径附近发生，最终不如异步 priority 调度稳定。
+
+\subsection{Major Faults 对比}
+
+如果只看 major faults，\texttt{expert\_prefetch} 最强，平均 major faults 约 49,613，相比 baseline 改善约 93.45\%。但它的 decode latency、RSS 和 swap 都不是最优。这个结果说明：降低缺页异常是必要条件，但不是最终目标；优化还需要看内存占用和端到端延迟。
+
+\subsection{RSS 与 Swap 的折中}
+
+\begin{figure}[!ht]
+\centering
+\figmedium[0.76\textwidth]{repeat_memory_tradeoff.png}
+\caption{RSS 与 swap 的相对变化}
+\label{fig:memory_tradeoff}
+\end{figure}
+
+图\ref{fig:memory_tradeoff} 展示了预取类策略的典型代价：RSS 峰值都会比 baseline 上升，原因是更多页面被提前带入物理内存。但是 \texttt{deadline\_score} 的 RSS 代价最小，约为 3.29\%，同时 swap 峰值改善最大，约 43.24\%。这也是它被选为主推荐策略的原因。
+
+\subsection{结果解释}
+
+最终实验可以概括为三点：
+
+\begin{enumerate}
+    \item \textbf{\texttt{deadline\_score} 是当前主推荐。} 它的 decode latency 最低，RSS 上升最小，swap 降低最多，同时 major faults 仍比 baseline 降低约 90.61\%。
+    \item \textbf{\texttt{expert\_prefetch} 是最佳 major fault 策略。} 它把 major faults 降到最低，但同步 hint 和较高 RSS 使它的综合表现不如 \texttt{deadline\_score}。
+    \item \textbf{\texttt{decode\_ttl1} 是低 syscall 备选。} 它能把 hint calls 降到约 82,711，但 decode latency、RSS 和 swap 都不占优，说明 TTL 需要更细的阶段或对象粒度。
+\end{enumerate}
+
+这些结果也反过来验证了访存分析的价值。项目不是盲目尝试 OS hint，而是先定位到 mmap expert 权重低驻留率和 MoE 层内热点，再把 route 信息用于精确预取。最终 major faults 和 decode latency 同时改善，说明分析结果确实转化成了有效优化。
+
+\section{工程实现与复现性}
+
+\subsection{默认关闭的实验开关}
+
+优化项均通过环境变量控制。主推荐策略的关键开关如下：
+
+\begin{lstlisting}[language=bash]
+LLM_MEM_TRACE_OS_HINTS=1
+LLM_MEM_TRACE_OPT_EXPERT_PREFETCH=1
+LLM_MEM_TRACE_OPT_EXPERT_POLICY=route
+LLM_MEM_TRACE_OPT_EXPERT_PREFETCH_TOPK=0
+LLM_MEM_TRACE_OPT_EXPERT_ASYNC=1
+LLM_MEM_TRACE_OPT_EXPERT_ASYNC_QUEUE=131072
+LLM_MEM_TRACE_OPT_EXPERT_ASYNC_WORKERS=4
+LLM_MEM_TRACE_OPT_EXPERT_ASYNC_PRIORITY=1
+LLM_MEM_TRACE_OPT_EXPERT_ASYNC_PRIORITY_MODE=deadline_score
+\end{lstlisting}
+
+这种设计保证了两点：一方面 baseline 可以不受影响地复现；另一方面所有优化都可以独立打开，用于消融实验和对照实验。
+
+\subsection{复现实验入口}
+
+单次实验入口为：
+
+\begin{lstlisting}[language=bash]
+MODEL_FILE=/path/to/model.gguf \
+RUN_NAME=deadline_score \
+NUM_TOKENS_PREDICT=80 \
+bash llama.cpp/trace/run_trace_pipeline.sh
+\end{lstlisting}
+
+重复实验入口为：
+
+\begin{lstlisting}[language=bash]
+RUN_REPEAT_MATRIX_EXECUTE=1 \
+RUN_PREFIX=contest_finalist \
+REPEAT_COUNT=3 \
+MODEL_FILE=/path/to/model.gguf \
+bash llama.cpp/trace/run_finalist_repeat_matrix.sh
+\end{lstlisting}
+
+受限物理内存实验入口为：
+
+\begin{lstlisting}[language=bash]
+RUN_MEMORY_PRESSURE_EXECUTE=1 \
+CGROUP_PARENT=/sys/fs/cgroup/<delegated-parent> \
+MEMORY_LIMITS_MB=4096,5120 \
+RUN_GROUPS=baseline,deadline_score \
+bash llama.cpp/trace/run_cgroup_memory_matrix.sh
+\end{lstlisting}
+
+\subsection{分析产物}
+
+\path{analyze_trace.py} 会为每次运行生成 \path{metrics.json}、\path{summary.txt}、\path{analysis_report.html} 和多张 PNG 图。本文已经将适合写入报告的图片集中到 \path{figures/} 目录：一部分直接来自本项目分析器输出，另一部分是根据报告表格数据生成的论文风格柱状图和框架图。上传到 Overleaf 时，需要保持 \path{figures/} 文件夹及其文件名不变。
+
+\begin{itemize}
+    \item 项目原始图：\path{latest_memory_timeline.png}、\path{latest_kv_cache.png}、\path{latest_expert_activation.png}、\path{latest_tensor_access.png}、\path{latest_page_residency.png}、\path{os_hint_priority_overview.png}、\path{expert_cache_hit_rate.png}。
+    \item 报告生成图：\path{system_architecture.png}、\path{trace_pipeline.png}、\path{analysis_to_optimization.png}、\path{async_prefetch.png}、\path{fault_bursts.png}、\path{residency_by_tensor_type.png}、\path{repeat_decode_latency.png}、\path{repeat_major_faults.png}、\path{repeat_memory_tradeoff.png}。
+\end{itemize}
+
+\section{当前不足与后续计划}
+
+\subsection{当前不足}
+
+目前结果已经能支持主推荐策略，但仍有边界条件需要说明。
+
+\begin{enumerate}
+    \item \textbf{Trace 不是指令级追踪。} 项目捕获的是 llama.cpp/ggml 语义层事件，不能精确到每条 load/store 指令。
+    \item \textbf{\texttt{mincore} 是采样观测。} 大 tensor 可能只查询部分页面，因此驻留率是趋势判断，不是逐页完整审计。
+    \item \textbf{当前 KV 实验较短。} 22.22 MiB KV append 不能代表长上下文瓶颈，后续需要用更长 prompt 和更大生成长度验证 KV 管理策略。
+    \item \textbf{结果来自当前本地环境。} WSL2、CPU-only、文件缓存状态和 swap 行为都会影响绝对数值，目标部署环境需要重新跑重复实验。
+    \item \textbf{LRU/LFU 类真实推理矩阵尚未完全收敛。} 离线模拟已经显示它们不适合作为当前主候选，但若后续访问模式变化，仍需复测。
+\end{enumerate}
+
+\subsection{后续计划}
+
+后续工作可以沿三条线推进：
+
+\begin{itemize}
+    \item \textbf{降低 hint 开销。} 继续研究 range batching、按层聚合、score 阈值和更细粒度 TTL，在不破坏 coverage 的前提下降低系统调用量。
+    \item \textbf{扩展场景。} 增加长上下文、不同模型、不同生成长度、冷/热缓存对照和 cgroup 受限物理内存矩阵。
+    \item \textbf{增强定位能力。} 在必要时引入 perf、eBPF 或 pagemap，把 page fault 与文件页、tensor slice 和调度时刻关联得更精确。
+\end{itemize}
+
+\section{总结}
+
+本项目完成了一条从 LLM 访存行为捕获到内存管理优化验证的闭环。第一阶段通过 token、tensor、KV cache、MoE expert 和 OS 内存统计的统一 trace，发现当前主要压力来自 mmap 权重页 first-touch，尤其是 MoE expert 权重在 PREFILL 和早期 DECODE 阶段带来的缺页等待。KV cache 在当前短生成实验中不是主要瓶颈，后续更适合放到长上下文实验中验证。
+
+第二阶段把这些发现转化为优化策略。expert-aware prefetch 解决的是低驻留率 expert slice 的提前准备问题；异步队列解决的是同步 hint 对 decode 关键路径的干扰问题；\texttt{deadline\_score} priority 解决的是异步任务时效性问题；TTL 和缓存策略模拟则用于探索降低 hint 开销的边界。
+
+基于 N=3 重复实验，当前主推荐是 \texttt{deadline\_score}：相对 baseline，decode latency 均值改善约 48.16\%，major faults 改善约 90.61\%，swap 峰值改善约 43.24\%，RSS 峰值代价约 3.29\%。这个结果说明，访存行为分析不仅能解释瓶颈，也能指导可验证的内存管理优化。
+
+\end{document}
