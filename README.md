@@ -145,9 +145,9 @@ bash llama.cpp/trace/run_finalist_repeat_matrix.sh
 - [测试报告](docs/test-report.md)
 - [与类似项目对比](docs/comparison.md)
 - [外部来源说明](docs/source-attribution.md)
-- [AI 使用说明模板](docs/AI_USAGE.md)
+- [AI 使用说明](docs/AI_USAGE.md)
 - [复现说明](docs/reproduce.md)
-- [初赛提交检查清单](docs/submission-checklist.md)
+
 
 ## 提交前检查清单
 
