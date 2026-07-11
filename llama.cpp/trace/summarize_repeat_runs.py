@@ -18,7 +18,11 @@ from typing import Any
 
 
 DEFAULT_METRICS = [
+    "process_wall_time_s",
     "decode_avg_latency_us",
+    "decode_p95_latency_us",
+    "decode_p99_latency_us",
+    "decode_throughput_tokens_per_s",
     "prefill_avg_latency_us",
     "total_major_faults",
     "total_minor_faults",
@@ -37,7 +41,10 @@ DEFAULT_METRICS = [
 
 
 LOWER_IS_BETTER = {
+    "process_wall_time_s",
     "decode_avg_latency_us",
+    "decode_p95_latency_us",
+    "decode_p99_latency_us",
     "prefill_avg_latency_us",
     "total_major_faults",
     "total_minor_faults",
@@ -82,6 +89,121 @@ def load_metrics(base_dir: Path, run: str) -> dict[str, Any]:
         metrics.setdefault(key, 0)
     metrics["_run"] = run
     return metrics
+
+
+def load_json(path: Path) -> dict[str, Any]:
+    with path.open("r", encoding="utf-8") as f:
+        value = json.load(f)
+    if not isinstance(value, dict):
+        raise ValueError(f"expected JSON object: {path}")
+    return value
+
+
+def validate_runs(base_dir: Path, runs: list[str]) -> dict[str, Any]:
+    required = (
+        "run_manifest.json",
+        "cache_preparation.json",
+        "process_metrics.json",
+        "summary.json",
+        "output.sha256",
+        "analysis/metrics.json",
+    )
+    validations: list[dict[str, Any]] = []
+    fingerprints: set[str] = set()
+    output_hashes: set[str] = set()
+
+    for run in runs:
+        run_dir = base_dir / run
+        missing = [name for name in required if not (run_dir / name).is_file()]
+        if missing:
+            raise ValueError(f"{run}: missing required artifacts: {', '.join(missing)}")
+
+        manifest = load_json(run_dir / "run_manifest.json")
+        cache = load_json(run_dir / "cache_preparation.json")
+        process = load_json(run_dir / "process_metrics.json")
+        summary = load_json(run_dir / "summary.json")
+        metrics = load_json(run_dir / "analysis" / "metrics.json")
+        output_hash = (run_dir / "output.sha256").read_text(encoding="ascii").strip()
+        if len(output_hash) != 64 or any(ch not in "0123456789abcdefABCDEF" for ch in output_hash):
+            raise ValueError(f"{run}: invalid output.sha256")
+        output_hashes.add(output_hash.lower())
+
+        if manifest.get("git_dirty"):
+            raise ValueError(f"{run}: manifest records a dirty repository")
+        if int(process.get("exit_code", 1)) != 0:
+            raise ValueError(f"{run}: process exit code is not zero")
+        if metrics.get("fault_metric_source") != "gnu_time_process":
+            raise ValueError(f"{run}: whole-process fault metrics are missing")
+        if metrics.get("latency_metric_source") != "step_end":
+            raise ValueError(f"{run}: STEP_END latency metrics are missing")
+        if int(metrics.get("decode_steps", 0)) <= 0:
+            raise ValueError(f"{run}: decode STEP_END samples are missing")
+
+        sinks = summary.get("sinks")
+        if not isinstance(sinks, dict) or not sinks:
+            raise ValueError(f"{run}: trace sink accounting is missing")
+        for sink, counts in sinks.items():
+            if not isinstance(counts, dict) or not counts.get("enabled"):
+                continue
+            if int(counts.get("dropped", 0)) != 0:
+                raise ValueError(f"{run}: {sink} trace dropped events")
+            if int(counts.get("enqueued", 0)) != int(counts.get("written", 0)):
+                raise ValueError(f"{run}: {sink} trace write count mismatch")
+
+        model = manifest.get("model", {})
+        prompt = manifest.get("prompt", {})
+        binary = manifest.get("binary", {})
+        experiment = manifest.get("experiment", {})
+        environment = manifest.get("environment", {})
+        cgroup = experiment.get("cgroup", {})
+        if cache.get("mode") != experiment.get("cache_mode"):
+            raise ValueError(f"{run}: cache preparation and manifest disagree")
+        identity = {
+            "git_commit": manifest.get("git_commit"),
+            "model_sha256": model.get("sha256"),
+            "model_size_bytes": model.get("size_bytes"),
+            "model_mtime_ns": model.get("mtime_ns") if not model.get("sha256") else None,
+            "prompt_sha256": prompt.get("sha256"),
+            "binary_sha256": binary.get("sha256"),
+            "host": manifest.get("host"),
+            "trace_profile": experiment.get("trace_profile"),
+            "cache_mode": experiment.get("cache_mode"),
+            "requested_memory_max": experiment.get("requested_memory_max"),
+            "requested_memory_swap_max": experiment.get("requested_memory_swap_max"),
+            "actual_cgroup_memory_max": cgroup.get("memory.max"),
+            "actual_cgroup_memory_swap_max": cgroup.get("memory.swap.max"),
+            "workload": {
+                key: environment.get(key)
+                for key in (
+                    "NUM_TOKENS_PREDICT",
+                    "NUM_THREADS",
+                    "BATCH_SIZE",
+                    "CTX_SIZE",
+                    "TEMP",
+                    "SEED",
+                    "GPU_LAYERS",
+                )
+            },
+        }
+        fingerprints.add(json.dumps(identity, sort_keys=True, ensure_ascii=False))
+        validations.append({
+            "run": run,
+            "repeat_index": experiment.get("repeat_index"),
+            "order_position": experiment.get("order_position"),
+            "output_sha256": output_hash.lower(),
+            "identity": identity,
+        })
+
+    if len(fingerprints) != 1:
+        raise ValueError("run manifests disagree on code, model, binary, host, cache, cgroup, or workload")
+    if len(output_hashes) != 1:
+        raise ValueError("deterministic output hashes disagree across runs/groups")
+    return {
+        "valid": True,
+        "run_count": len(runs),
+        "output_sha256": next(iter(output_hashes)),
+        "runs": validations,
+    }
 
 
 def numeric_values(records: list[dict[str, Any]], key: str) -> list[float]:
@@ -247,6 +369,9 @@ def main() -> int:
     metrics = args.metric if args.metric else DEFAULT_METRICS
     groups: list[tuple[str, list[str]]] = args.group
 
+    all_runs = [run for _, runs in groups for run in runs]
+    validation = validate_runs(args.base_dir, all_runs)
+
     group_records: dict[str, list[dict[str, Any]]] = {}
     for group_name, runs in groups:
         group_records[group_name] = [load_metrics(args.base_dir, run) for run in runs]
@@ -254,8 +379,13 @@ def main() -> int:
     rows = build_summary_rows(groups, group_records, metrics, args.baseline_group)
     write_csv(args.output_dir / "repeat_summary.csv", rows)
     write_markdown(args.output_dir / "repeat_summary.md", rows, metrics)
+    (args.output_dir / "experiment_validation.json").write_text(
+        json.dumps(validation, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
     print(f"[OK] {args.output_dir / 'repeat_summary.csv'}")
     print(f"[OK] {args.output_dir / 'repeat_summary.md'}")
+    print(f"[OK] {args.output_dir / 'experiment_validation.json'}")
     return 0
 
 

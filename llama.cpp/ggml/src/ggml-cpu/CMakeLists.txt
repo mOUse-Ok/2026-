@@ -55,10 +55,13 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         )
 
     target_compile_features(${GGML_CPU_NAME} PRIVATE c_std_11 cxx_std_17)
-    target_include_directories(${GGML_CPU_NAME} PRIVATE . ggml-cpu)
+    target_include_directories(${GGML_CPU_NAME} PRIVATE
+        .
+        ggml-cpu
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../trace
+    )
     if (LLAMA_MEM_TRACE)
         target_include_directories(${GGML_CPU_NAME} PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/../../trace
             ${CMAKE_CURRENT_SOURCE_DIR}/../../src
             ${CMAKE_CURRENT_SOURCE_DIR}/../../include
         )

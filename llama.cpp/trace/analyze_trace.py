@@ -11,8 +11,11 @@ import argparse
 import json
 import os
 import sys
+import tempfile
 from collections import Counter, defaultdict
 from pathlib import Path
+
+os.environ.setdefault("MPLCONFIGDIR", os.path.join(tempfile.gettempdir(), "llmop-matplotlib"))
 
 import matplotlib
 matplotlib.use("Agg")
@@ -20,6 +23,8 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 import numpy as np
 import pandas as pd
+
+from trace_metrics import collect_core_metrics, inference_latency_records
 
 
 # ─────────────────────────────────────────────
@@ -620,28 +625,28 @@ def plot_tensor_access(tensor_records: list[dict], out_dir: str):
 # ─────────────────────────────────────────────
 
 def plot_token_latency(memory_records: list[dict], out_dir: str):
-    token_ends = [r for r in memory_records if r.get("event") == "TOKEN_END" and "latency_ns" in r]
-    if not token_ends:
-        print("  [SKIP] No token latency data")
+    latency_records, latency_source = inference_latency_records(memory_records)
+    if not latency_records:
+        print("  [SKIP] No inference latency data")
         return None
 
-    token_ends = add_relative_time(token_ends)
+    latency_records = add_relative_time(latency_records)
 
-    prefill_tokens = [r for r in token_ends if r.get("phase") == "PREFILL"]
-    decode_tokens = [r for r in token_ends if r.get("phase") == "DECODE"]
+    prefill_tokens = [r for r in latency_records if r.get("phase") == "PREFILL"]
+    decode_tokens = [r for r in latency_records if r.get("phase") == "DECODE"]
 
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-    fig.suptitle("Token Processing Latency Analysis", fontsize=14, fontweight="bold")
+    fig.suptitle(f"Inference Step Latency Analysis ({latency_source})", fontsize=14, fontweight="bold")
 
     # --- Latency timeline ---
     ax = axes[0]
-    df = pd.DataFrame(token_ends)
+    df = pd.DataFrame(latency_records)
     latency_ms = df["latency_ns"] / 1e6
     colors = [phase_color(p) for p in df.get("phase", [])]
     ax.scatter(df["t_ms"], latency_ms, c=colors, s=15, alpha=0.6, edgecolors="none")
     ax.set_xlabel("Time (ms)")
     ax.set_ylabel("Latency (ms)")
-    ax.set_title("Per-Token Latency Timeline")
+    ax.set_title("Per-Ubatch Latency Timeline")
     ax.grid(True, alpha=0.3)
     from matplotlib.lines import Line2D
     ax.legend(handles=[
@@ -670,13 +675,13 @@ def plot_token_latency(memory_records: list[dict], out_dir: str):
             patch.set_alpha(0.6)
 
     ax.set_ylabel("Latency (μs)")
-    ax.set_title("Token Latency: Prefill vs Decode")
+    ax.set_title("Ubatch Latency: Prefill vs Decode")
     ax.grid(True, alpha=0.3, axis="y")
 
     # --- Token latency by position ---
     ax = axes[2]
     pos_lat = defaultdict(list)
-    for r in token_ends:
+    for r in latency_records:
         pos = r.get("pos")
         if pos is not None:
             pos_lat[pos].append(r["latency_ns"] / 1e3)  # us
@@ -686,7 +691,7 @@ def plot_token_latency(memory_records: list[dict], out_dir: str):
         avg_lat = [np.mean(pos_lat[p]) for p in positions]
         colors_pos = ["#2196F3" if p < positions[len(positions) // 2] else "#FF9800" for p in positions]
         ax.bar(positions[:50], avg_lat[:50], color=colors_pos[:50], alpha=0.7)
-        ax.set_xlabel("Token Position")
+        ax.set_xlabel("Position (legacy traces only)")
         ax.set_ylabel("Avg Latency (μs)")
         ax.set_title("Latency by Token Position")
         ax.grid(True, alpha=0.3, axis="y")
@@ -713,7 +718,7 @@ def plot_summary_dashboard(data: dict[str, list[dict]], out_dir: str):
     kv_appends = dedupe_kv_appends([r for r in data["kv"] if r.get("event") == "KV_APPEND"])
     expert_routes = [r for r in data["expert"] if r.get("event") == "EXPERT_ROUTE"]
     tensor_accesses = [r for r in data["tensor"] if r.get("event") == "TENSOR_ACCESS"]
-    token_ends = [r for r in data["memory"] if r.get("event") == "TOKEN_END" and "latency_ns" in r]
+    latency_records, latency_source = inference_latency_records(data["memory"])
     first_touches = [r for r in tensor_accesses if r.get("first_touch") is True]
 
     fig, axes = plt.subplots(2, 3, figsize=(18, 10))
@@ -786,10 +791,10 @@ def plot_summary_dashboard(data: dict[str, list[dict]], out_dir: str):
     ax.set_ylabel("Cumulative Size (GB)")
     ax.grid(True, alpha=0.3)
 
-    # 6. Token latency summary
+    # 6. Inference step latency summary
     ax = axes[1][2]
-    prefill_lat = [t["latency_ns"] / 1e3 for t in token_ends if t.get("phase") == "PREFILL"]
-    decode_lat = [t["latency_ns"] / 1e3 for t in token_ends if t.get("phase") == "DECODE"]
+    prefill_lat = [t["latency_ns"] / 1e3 for t in latency_records if t.get("phase") == "PREFILL"]
+    decode_lat = [t["latency_ns"] / 1e3 for t in latency_records if t.get("phase") == "DECODE"]
     labels = []
     values = []
     colors = []
@@ -808,7 +813,7 @@ def plot_summary_dashboard(data: dict[str, list[dict]], out_dir: str):
             ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + max(values) * 0.02,
                     f"{val:.0f}μs", ha="center", fontsize=10, fontweight="bold")
     ax.set_ylabel("Avg Latency (μs)")
-    ax.set_title("Token Latency: Prefill vs Decode")
+    ax.set_title(f"Ubatch Latency: Prefill vs Decode ({latency_source})")
     ax.grid(True, alpha=0.3, axis="y")
 
     plt.tight_layout()
@@ -937,37 +942,7 @@ def plot_page_residency(data: dict[str, list[dict]], out_dir: str):
 
 def collect_metrics(data: dict[str, list[dict]]) -> dict:
     """Extract key numeric metrics for the report."""
-    metrics = {}
-
-    # Memory
-    mem_events = [r for r in data["memory"] if r.get("event") == "MEMORY_STAT" and "rss_bytes" in r]
-    if mem_events:
-        rss_values = [r["rss_bytes"] for r in mem_events]
-        metrics["rss_peak_gb"] = max(rss_values) / (1024**3)
-        metrics["rss_avg_gb"] = np.mean(rss_values) / (1024**3)
-        metrics["total_minor_faults"] = sum(max(0, r.get("minor_faults_delta", 0)) for r in mem_events)
-        metrics["total_major_faults"] = sum(max(0, r.get("major_faults_delta", 0)) for r in mem_events)
-        metrics["minor_faults_cumulative_final"] = mem_events[-1].get("minor_faults", 0)
-        metrics["major_faults_cumulative_final"] = mem_events[-1].get("major_faults", 0)
-        metrics["mmap_count"] = mem_events[-1].get("mmap_count", 0)
-
-        smaps_events = [r for r in mem_events if "pss_bytes" in r]
-        if smaps_events:
-            metrics["pss_peak_gb"] = max(r.get("pss_bytes", 0) for r in smaps_events) / (1024**3)
-            metrics["pss_avg_gb"] = np.mean([r.get("pss_bytes", 0) for r in smaps_events]) / (1024**3)
-            metrics["shared_clean_peak_gb"] = max(r.get("shared_clean_bytes", 0) for r in smaps_events) / (1024**3)
-            metrics["private_dirty_peak_gb"] = max(r.get("private_dirty_bytes", 0) for r in smaps_events) / (1024**3)
-            metrics["swap_peak_mb"] = max(r.get("swap_bytes", 0) for r in smaps_events) / (1024**2)
-
-    # Token latency
-    token_ends = [r for r in data["memory"] if r.get("event") == "TOKEN_END" and "latency_ns" in r]
-    if token_ends:
-        prefill = [t for t in token_ends if t.get("phase") == "PREFILL"]
-        decode = [t for t in token_ends if t.get("phase") == "DECODE"]
-        metrics["prefill_tokens"] = len(prefill)
-        metrics["decode_tokens"] = len(decode)
-        metrics["prefill_avg_latency_us"] = np.mean([t["latency_ns"] / 1e3 for t in prefill]) if prefill else 0
-        metrics["decode_avg_latency_us"] = np.mean([t["latency_ns"] / 1e3 for t in decode]) if decode else 0
+    metrics = collect_core_metrics(data["memory"])
 
     # KV Cache
     kv_appends = [r for r in data["kv"] if r.get("event") == "KV_APPEND"]
@@ -1586,6 +1561,26 @@ def main():
     # Collect metrics
     print("\n[2/7] Computing key metrics...")
     metrics = collect_metrics(data)
+
+    process_metrics_path = os.path.join(trace_dir, "process_metrics.json")
+    if os.path.exists(process_metrics_path):
+        with open(process_metrics_path, "r", encoding="utf-8") as f:
+            process_metrics = json.load(f)
+        metrics["process_wall_time_s"] = float(process_metrics.get("wall_time_s", 0))
+        metrics["process_user_time_s"] = float(process_metrics.get("user_time_s", 0))
+        metrics["process_system_time_s"] = float(process_metrics.get("system_time_s", 0))
+        metrics["process_max_rss_gb"] = float(process_metrics.get("max_rss_kb", 0)) / (1024**2)
+        metrics["process_major_faults"] = int(process_metrics.get("major_faults", 0))
+        metrics["process_minor_faults"] = int(process_metrics.get("minor_faults", 0))
+        metrics["process_file_inputs"] = int(process_metrics.get("file_inputs", 0))
+        metrics["process_file_outputs"] = int(process_metrics.get("file_outputs", 0))
+        metrics["process_exit_code"] = int(process_metrics.get("exit_code", 0))
+        metrics["total_major_faults"] = metrics["process_major_faults"]
+        metrics["total_minor_faults"] = metrics["process_minor_faults"]
+        metrics["fault_metric_source"] = "gnu_time_process"
+        if metrics["process_max_rss_gb"] > 0:
+            metrics["rss_peak_gb_trace"] = metrics.get("rss_peak_gb", 0)
+            metrics["rss_peak_gb"] = metrics["process_max_rss_gb"]
     for k, v in metrics.items():
         if isinstance(v, float):
             print(f"      {k}: {v:.2f}")

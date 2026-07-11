@@ -37,6 +37,8 @@ void llm_mem_trace_clear_ubatch(void);
 const struct llama_ubatch * llm_mem_trace_get_ubatch(void);
 int  llm_mem_trace_get_phase(void);
 uint64_t llm_mem_trace_get_step(void);
+void llm_mem_trace_step_begin(void);
+void llm_mem_trace_step_end(void);
 
 void llm_mem_trace_token_begin(int token_idx);
 void llm_mem_trace_token_end(int token_idx);
@@ -68,6 +70,8 @@ static inline void llm_mem_trace_clear_ubatch(void) {}
 static inline const struct llama_ubatch * llm_mem_trace_get_ubatch(void) { return NULL; }
 static inline int  llm_mem_trace_get_phase(void) { return LLM_MEM_TRACE_PHASE_UNKNOWN; }
 static inline uint64_t llm_mem_trace_get_step(void) { return 0; }
+static inline void llm_mem_trace_step_begin(void) {}
+static inline void llm_mem_trace_step_end(void) {}
 
 static inline void llm_mem_trace_token_begin(int token_idx) { (void) token_idx; }
 static inline void llm_mem_trace_token_end(int token_idx) { (void) token_idx; }

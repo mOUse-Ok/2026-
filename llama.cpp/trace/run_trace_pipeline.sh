@@ -10,6 +10,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+REPO_DIR="$(dirname "$PROJECT_DIR")"
 BUILD_DIR="$PROJECT_DIR/build"
 MODEL_DIR="$PROJECT_DIR/../models"
 TRACE_BASE_DIR="${TRACE_BASE_DIR:-$PROJECT_DIR/trace_output}"
@@ -18,6 +19,8 @@ TRACE_OUT_DIR="${TRACE_OUT_DIR:-$TRACE_BASE_DIR/$RUN_NAME}"
 MODEL_FILE="${MODEL_FILE:-$MODEL_DIR/Qwen3.5-35B-A3B-Q3_K_M.gguf}"
 ANALYSIS_SCRIPT="$SCRIPT_DIR/analyze_trace.py"
 LLAMA_CLI="${LLAMA_CLI:-$BUILD_DIR/bin/llama-cli}"
+TIME_BIN="${TIME_BIN:-/usr/bin/time}"
+export MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/llm_mem_trace_matplotlib}"
 
 # ------------------------------------------------------------------
 # Test Case Design
@@ -54,6 +57,51 @@ NUM_THREADS="${NUM_THREADS:-8}"                 # CPU threads
 BATCH_SIZE="${BATCH_SIZE:-512}"                 # Batch size for prefill
 CTX_SIZE="${CTX_SIZE:-2048}"                    # Context window size
 TEMP="${TEMP:-0.0}"                             # Deterministic output for reproducibility
+SEED="${SEED:-1234}"                            # Fix sampler RNG
+GPU_LAYERS="${GPU_LAYERS:-0}"                  # Route tracing requires CPU-resident experts
+CACHE_MODE="${CACHE_MODE:-cold}"                # cold, warm, or as-is
+TRACE_PROFILE="${TRACE_PROFILE:-evidence}"      # evidence, benchmark, or custom
+ALLOW_DROPPED_EVENTS="${ALLOW_DROPPED_EVENTS:-0}"
+ALLOW_DIRTY_REPO="${ALLOW_DIRTY_REPO:-0}"
+
+case "$TRACE_PROFILE" in
+    evidence)
+        PROFILE_TENSOR=1
+        PROFILE_KV=1
+        PROFILE_EXPERT=1
+        PROFILE_MEMORY=1
+        PROFILE_RESIDENCY=1
+        PROFILE_SMAPS=1
+        ;;
+    benchmark)
+        PROFILE_TENSOR=0
+        PROFILE_KV=0
+        PROFILE_EXPERT=1
+        PROFILE_MEMORY=1
+        PROFILE_RESIDENCY=0
+        PROFILE_SMAPS=0
+        ;;
+    custom)
+        PROFILE_TENSOR=1
+        PROFILE_KV=1
+        PROFILE_EXPERT=1
+        PROFILE_MEMORY=1
+        PROFILE_RESIDENCY=1
+        PROFILE_SMAPS=1
+        ;;
+    *)
+        echo "ERROR: TRACE_PROFILE must be evidence, benchmark, or custom" >&2
+        exit 1
+        ;;
+esac
+
+case "$CACHE_MODE" in
+    cold|warm|as-is) ;;
+    *)
+        echo "ERROR: CACHE_MODE must be cold, warm, or as-is" >&2
+        exit 1
+        ;;
+esac
 
 # ------------------------------------------------------------------
 # Step 0: Check prerequisites
@@ -74,27 +122,57 @@ if [ ! -f "$MODEL_FILE" ]; then
     exit 1
 fi
 
+if [ ! -x "$TIME_BIN" ]; then
+    echo "ERROR: GNU time not found at $TIME_BIN (install package: time)" >&2
+    exit 1
+fi
+
+python3 -c 'import matplotlib, numpy, pandas' 2>/dev/null || {
+    echo "ERROR: analysis dependencies are missing." >&2
+    echo "Install with: python3 -m pip install -r $SCRIPT_DIR/requirements-analysis.txt" >&2
+    exit 1
+}
+
 # ------------------------------------------------------------------
 # Step 1: Clean previous trace output & run inference
 # ------------------------------------------------------------------
 echo "[1/4] Running LLM inference with memory tracing..."
 echo "      Model: $(basename "$MODEL_FILE")"
 echo "      Predict tokens: $NUM_TOKENS_PREDICT"
+echo "      Trace profile: $TRACE_PROFILE"
+echo "      Cache mode: $CACHE_MODE"
 echo "      Output dir: $TRACE_OUT_DIR"
 echo ""
 
-rm -rf "$TRACE_OUT_DIR"
+TRACE_BASE_DIR="$(realpath -m "$TRACE_BASE_DIR")"
+TRACE_OUT_DIR="$(realpath -m "$TRACE_OUT_DIR")"
+case "$TRACE_OUT_DIR" in
+    "$TRACE_BASE_DIR"/*) ;;
+    *)
+        echo "ERROR: TRACE_OUT_DIR must be a child of TRACE_BASE_DIR" >&2
+        exit 1
+        ;;
+esac
+if [ "$TRACE_OUT_DIR" = "/" ] || [ "$TRACE_OUT_DIR" = "$TRACE_BASE_DIR" ]; then
+    echo "ERROR: refusing to replace unsafe trace output directory: $TRACE_OUT_DIR" >&2
+    exit 1
+fi
+rm -rf -- "$TRACE_OUT_DIR"
 mkdir -p "$TRACE_OUT_DIR"
 
 export LLM_MEM_TRACE=1
 export LLM_MEM_TRACE_DIR="$TRACE_OUT_DIR"
-export LLM_MEM_TRACE_TENSOR="${LLM_MEM_TRACE_TENSOR:-1}"
-export LLM_MEM_TRACE_KV="${LLM_MEM_TRACE_KV:-1}"
-export LLM_MEM_TRACE_EXPERT="${LLM_MEM_TRACE_EXPERT:-1}"
-export LLM_MEM_TRACE_MEMORY="${LLM_MEM_TRACE_MEMORY:-1}"
-export LLM_MEM_TRACE_RESIDENCY="${LLM_MEM_TRACE_RESIDENCY:-1}"
+export TRACE_PROFILE CACHE_MODE
+export NUM_TOKENS_PREDICT NUM_THREADS BATCH_SIZE CTX_SIZE TEMP SEED GPU_LAYERS
+export LLM_MEM_TRACE_TENSOR="${LLM_MEM_TRACE_TENSOR:-$PROFILE_TENSOR}"
+export LLM_MEM_TRACE_KV="${LLM_MEM_TRACE_KV:-$PROFILE_KV}"
+export LLM_MEM_TRACE_EXPERT="${LLM_MEM_TRACE_EXPERT:-$PROFILE_EXPERT}"
+export LLM_MEM_TRACE_MEMORY="${LLM_MEM_TRACE_MEMORY:-$PROFILE_MEMORY}"
+export LLM_MEM_TRACE_QUEUE_LIMIT="${LLM_MEM_TRACE_QUEUE_LIMIT:-65536}"
+export LLM_MEM_TRACE_ALLOW_DROP="${LLM_MEM_TRACE_ALLOW_DROP:-0}"
+export LLM_MEM_TRACE_RESIDENCY="${LLM_MEM_TRACE_RESIDENCY:-$PROFILE_RESIDENCY}"
 export LLM_MEM_TRACE_RESIDENCY_MAX_PAGES="${LLM_MEM_TRACE_RESIDENCY_MAX_PAGES:-4096}"
-export LLM_MEM_TRACE_SMAPS="${LLM_MEM_TRACE_SMAPS:-1}"
+export LLM_MEM_TRACE_SMAPS="${LLM_MEM_TRACE_SMAPS:-$PROFILE_SMAPS}"
 export LLM_MEM_TRACE_OS_HINTS="${LLM_MEM_TRACE_OS_HINTS:-0}"
 export LLM_MEM_TRACE_OPT_MADVISE_WILLNEED="${LLM_MEM_TRACE_OPT_MADVISE_WILLNEED:-0}"
 export LLM_MEM_TRACE_OPT_MADVISE_SEQUENTIAL="${LLM_MEM_TRACE_OPT_MADVISE_SEQUENTIAL:-0}"
@@ -129,14 +207,47 @@ echo "$TEST_PROMPT" > "$PROMPT_FILE"
 echo "      Prompt token count (approx): $(wc -w < "$PROMPT_FILE") words"
 echo ""
 
-"$LLAMA_CLI" \
+MANIFEST_ARGS=(
+    --output "$TRACE_OUT_DIR/run_manifest.json"
+    --project "$REPO_DIR"
+    --model "$MODEL_FILE"
+    --prompt "$PROMPT_FILE"
+    --llama-cli "$LLAMA_CLI"
+    --run-name "$RUN_NAME"
+    --trace-profile "$TRACE_PROFILE"
+    --cache-mode "$CACHE_MODE"
+    --repeat-index "${REPEAT_INDEX:-}"
+    --order-position "${ORDER_POSITION:-}"
+    --order-mode "${ORDER_MODE:-}"
+    --order-seed "${ORDER_SEED:-}"
+    --memory-max "${MEMORY_MAX:-}"
+    --memory-swap-max "${MEMORY_SWAP_MAX:-}"
+    --model-sha256 "${MODEL_SHA256:-}"
+)
+if [ "$ALLOW_DIRTY_REPO" != "1" ]; then
+    MANIFEST_ARGS+=(--require-clean)
+fi
+python3 "$SCRIPT_DIR/write_run_manifest.py" "${MANIFEST_ARGS[@]}"
+
+python3 "$SCRIPT_DIR/prepare_model_cache.py" \
+    --model "$MODEL_FILE" \
+    --mode "$CACHE_MODE" \
+    > "$TRACE_OUT_DIR/cache_preparation.json"
+
+set +e
+"$TIME_BIN" -q \
+    -f '{"wall_time_s":%e,"user_time_s":%U,"system_time_s":%S,"max_rss_kb":%M,"major_faults":%F,"minor_faults":%R,"file_inputs":%I,"file_outputs":%O,"exit_code":%x}' \
+    -o "$TRACE_OUT_DIR/process_metrics.json" \
+    "$LLAMA_CLI" \
     -m "$MODEL_FILE" \
     -f "$PROMPT_FILE" \
     -n "$NUM_TOKENS_PREDICT" \
     -t "$NUM_THREADS" \
     -b "$BATCH_SIZE" \
     -c "$CTX_SIZE" \
+    --gpu-layers "$GPU_LAYERS" \
     --temp "$TEMP" \
+    --seed "$SEED" \
     --no-display-prompt \
     --simple-io \
     --single-turn \
@@ -144,6 +255,19 @@ echo ""
     --no-perf \
     --no-show-timings \
     > "$TRACE_OUT_DIR/inference_output.txt" 2>"$TRACE_OUT_DIR/inference_stderr.txt"
+INFERENCE_STATUS=$?
+set -e
+
+if [ "$INFERENCE_STATUS" -ne 0 ]; then
+    echo "ERROR: llama-cli exited with status $INFERENCE_STATUS" >&2
+    exit "$INFERENCE_STATUS"
+fi
+
+if ! command -v sha256sum >/dev/null 2>&1; then
+    echo "ERROR: sha256sum is required for output consistency validation" >&2
+    exit 1
+fi
+sha256sum "$TRACE_OUT_DIR/inference_output.txt" | awk '{print $1}' > "$TRACE_OUT_DIR/output.sha256"
 
 echo "      Inference completed."
 echo ""
@@ -160,6 +284,12 @@ declare -A TRACE_FILES=(
     ["memory"]="memory_trace.jsonl"
 )
 declare -A LINE_COUNTS
+declare -A SINK_ENABLED=(
+    ["tensor"]="$LLM_MEM_TRACE_TENSOR"
+    ["kv"]="$LLM_MEM_TRACE_KV"
+    ["expert"]="$LLM_MEM_TRACE_EXPERT"
+    ["memory"]="$LLM_MEM_TRACE_MEMORY"
+)
 
 for key in "${!TRACE_FILES[@]}"; do
     f="$TRACE_OUT_DIR/${TRACE_FILES[$key]}"
@@ -170,12 +300,24 @@ for key in "${!TRACE_FILES[@]}"; do
     else
         LINE_COUNTS[$key]=0
         echo "      ${TRACE_FILES[$key]}: NOT FOUND (check if sink is enabled)"
+        if [ "${SINK_ENABLED[$key]}" != "0" ]; then
+            echo "ERROR: enabled trace sink did not create ${TRACE_FILES[$key]}" >&2
+            exit 1
+        fi
     fi
 done
 
-if [ -f "$TRACE_OUT_DIR/summary.json" ]; then
-    echo "      summary.json: $(cat "$TRACE_OUT_DIR/summary.json")"
+SUMMARY_ARGS=("$TRACE_OUT_DIR/summary.json")
+for key in tensor kv expert memory; do
+    if [ "${SINK_ENABLED[$key]}" != "0" ]; then
+        SUMMARY_ARGS+=(--expect-sink "$key")
+    fi
+done
+if [ "$ALLOW_DROPPED_EVENTS" = "1" ]; then
+    SUMMARY_ARGS+=(--allow-dropped)
 fi
+python3 "$SCRIPT_DIR/validate_trace_summary.py" "${SUMMARY_ARGS[@]}"
+echo "      summary.json: $(cat "$TRACE_OUT_DIR/summary.json")"
 
 echo ""
 
@@ -197,5 +339,6 @@ echo "Output files:"
 echo "  Trace data:       $TRACE_OUT_DIR/"
 echo "  Analysis results: $TRACE_OUT_DIR/analysis/"
 echo "  Inference output: $TRACE_OUT_DIR/inference_output.txt"
+echo "  Output hash:      $TRACE_OUT_DIR/output.sha256"
 echo ""
 echo "Open $TRACE_OUT_DIR/analysis/analysis_report.html to view the full report."

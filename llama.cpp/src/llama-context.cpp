@@ -1307,9 +1307,11 @@ int llama_context::encode(const llama_batch & batch_inp) {
     for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
         llm_mem_trace_token_begin((int) i);
     }
+    llm_mem_trace_step_begin();
 
     ggml_status status;
     const auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_ENCODER, nullptr, status);
+    llm_mem_trace_step_end();
 
     for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
         llm_mem_trace_token_end((int) i);
@@ -1712,9 +1714,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
         for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
             llm_mem_trace_token_begin((int) i);
         }
+        llm_mem_trace_step_begin();
 
         ggml_status status;
         const auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_DECODER, mctx.get(), status);
+        llm_mem_trace_step_end();
 
         for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
             llm_mem_trace_token_end((int) i);

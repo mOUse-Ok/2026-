@@ -1,54 +1,73 @@
 # 与类似项目对比
 
-## 对比对象
+## 1. 对比范围
 
-| 项目/方向 | 主要关注点 | 与本项目关系 |
+| 项目或方向 | 主要能力 | 本项目的关系与差异 |
 | --- | --- | --- |
-| llama.cpp | 本地 LLM 推理、量化、跨平台运行 | 本项目基于其完整工程扩展 trace 与 OS hint 实验 |
-| MoE-Infinity | MoE expert tracing/cache/prefetch | 本项目借鉴 request-level expert 追踪和 expert cache 思路，但实现为用户态 trace/OS hint 实验 |
-| SpecMD Least-Stale | 基于 stale 程度的替换策略 | 本项目实现 least-stale 离线模拟，并与 LRU/LFU/window-LFU 比较 |
-| ST-MoE 相关工作 | MoE expert 跨 token/跨层可预测性 | 本项目使用 layer/expert 维度分析 routed expert 行为 |
-| PagedAttention/vAttention | KV cache 的分页式管理 | 本项目当前侧重 KV cache 分析与投影，未改写 KV allocator |
-| Linux MGLRU/DAMON/madvise | 内核页面回收和用户态 hint | 本项目不改内核，使用 `madvise`/`posix_fadvise` 做用户态实验 |
+| llama.cpp | 本地量化模型推理与跨平台执行 | 本项目保留完整上游工程，在推理路径旁增加默认关闭的 trace、OS hint 和实验可信度工具 |
+| MoE-Infinity | 基于请求的 expert 追踪、缓存与预取 | 本项目借鉴 expert 语义，但把真实路由信息映射到 Linux 页面提示，并记录物理内存和缺页反馈 |
+| SpecMD Least-Stale | 基于陈旧程度的替换决策 | 本项目仅在离线 trace 模拟器中实现和比较，不把模拟命中率等同于运行时收益 |
+| PagedAttention、vAttention | KV cache 分页和虚拟内存管理 | 本项目已有 KV trace、预算模拟和 cgroup 压力矩阵，尚未声称完成运行时分页 KV allocator |
+| Linux MGLRU、DAMON、PSI、cgroup v2 | 页面回收、访问监测、压力观测和资源限制 | 本项目不修改内核，利用模型语义补充内核不可见的信息，并通过官方接口施加提示和采集反馈 |
+| FlexInfer 等异步卸载工作 | 设备端 LLM 的按需加载、预取与卸载 | 本项目当前异步队列仍是静态启发式；后续创新重点是在线 slack、可取消批处理和内存压力联合控制 |
 
-## 与基础 llama.cpp 的差异
+## 2. 相对基础 llama.cpp 的新增能力
 
-基础 `llama.cpp` 提供高效本地推理能力，但默认不输出本项目所需的细粒度内存 trace，也不基于 MoE routing 做 expert slice OS hint。本项目新增：
+- tensor、KV、expert、memory 等 JSONL trace，以及统一的事件时间线。
+- 以一次 `process_ubatch()` 为边界的 `STEP_BEGIN/STEP_END` 权威阶段计时。
+- 基于 MoE routed expert 的预取、异步提示队列和 deadline/route score 调度。
+- expert 与 KV 的离线替换策略模拟，以及 cgroup 受限内存实验矩阵。
+- 每个 trace sink 的 `enqueued/written/dropped` 计数和零丢失检查。
+- 冷缓存准备、GNU time 全进程指标、运行 Manifest、输出哈希和重复实验一致性验证。
+- 延迟、缺页、RSS、swap、hint 开销联合比较的 Pareto 分析。
 
-- tensor/KV/expert/memory JSONL trace。
-- OS hint 事件记录与分析。
-- expert-aware prefetch。
-- expert slice cache policy 离线模拟。
-- 异步 expert hint queue。
-- deadline-aware priority 调度。
-- repeated-run 对比和 Pareto 分析。
+这些修改均为可选实验功能。关闭 trace 和 OS hints 时，不改变模型权重、计算图或生成算法。
 
-## 与内核页面替换方案的差异
+## 3. 相对通用页面替换的特点
 
-本项目不修改 Linux 内核，不直接替换 MGLRU 或 DAMON。原因：
+Linux 页面替换器能观察页访问、回收和系统压力，但通常不知道“哪个文件区间对应下一层即将使用的 expert”。本项目的用户态策略能够获得 layer、expert、router score 和推理阶段，从而做语义相关的提示。两者不是替代关系：内核负责真实页面生命周期，本项目负责提供模型侧先验并测量提示是否值得。
 
-- 初赛阶段更需要可复现、低侵入、便于演示的用户态方案。
-- LLM 推理过程具有模型结构和 expert routing 先验，用户态能获得内核不可见的语义信息。
-- 使用 `madvise` 和 `posix_fadvise` 可以在不改内核的前提下影响页面预取/回收行为。
+当前实现相对通用 LRU/LFU 的主要不同是：
 
-## 与单纯 top-k 预取的差异
+1. 缓存项对应 `(layer, expert, tensor)` 的文件映射区间，而不是无语义的单页。
+2. 预取顺序考虑到达使用点的层距离和 route score。
+3. 策略评价同时计算延迟收益、major faults、常驻内存、swap 和系统调用成本。
+4. 离线模拟只用于候选筛选，最终结论必须由受控真实运行确认。
 
-实验显示 top-k 截断虽然能减少 hint calls，但会显著损失 prefetch coverage，导致 major faults 回升。因此最终主线不是简单减少专家数，而是：
+## 4. 当前自主工作与创新边界
 
-1. 保留完整 routed expert coverage。
-2. 将 hint call 从 decode 关键路径迁出。
-3. 用 deadline-aware priority 提升异步 hint 的时效性。
+本项目目前具有三项本队完成的系统组合：
 
-## 当前优势
+- 将真实 MoE 路由语义映射到 Linux 页面提示，而不是仅做顺序文件预取。
+- 将 `madvise` 从 decode 同步路径移入异步队列，并按 step、layer 和 router score 调度。
+- 通过同一套 trace 闭环联合筛选推理速度和物理内存指标，而不是只优化单一命中率。
 
-- 工程侵入小：默认关闭，不改变 baseline。
-- 可复现：提供 pipeline、matrix、analysis 和 summary 脚本。
-- 指标完整：同时比较 latency、faults、RSS、swap、hint events。
-- 结果诚实：给出了一个Pareto权衡策略。
+其中 `deadline_score` 是最接近自主机制的部分，但当前仍属于静态启发式：它没有测量真实 page-in 服务时间和任务 slack，也没有根据 PSI、cgroup 内存水位、refault 或队列积压动态调预算。因此现阶段适合表述为“系统机制与工程组合创新”，不把它包装成已经经过充分证明的核心算法创新。
 
-## 当前不足
+## 5. 与简单 top-k 预取的差异
 
-- hint calls 仍接近 10 万，未达到最初大幅减少 syscall 的理想目标。
-- 只在当前本地模型和机器上完成 N=3 验证，泛化性还需更多模型和硬件验证。
-- KV cache 目前主要是分析和投影，尚未实现分页式 KV 管理。
-- `MADV_DONTNEED`/`MADV_PAGEOUT` 仍是显式实验项，未作为默认策略。
+历史探索中，直接减少 routed expert 数量虽然降低 hint 数，却可能损失预取覆盖率并增加 major faults。当前路线保留语义覆盖，通过异步执行、优先级、TTL 和批量合并降低关键路径干扰。由于旧实验尚未满足新的冷缓存和完整性标准，这一观察只用于解释设计选择，正式幅度需重新测量。
+
+## 6. 可信度方面的改进
+
+与只保存一份终端输出或单次性能数字的实验方式相比，本项目新增以下约束：
+
+- 一次运行同时记录代码、模型、输入、参数、硬件和 cgroup 实际值。
+- 冷缓存准备失败即判定无效，不静默变成热缓存实验。
+- 阶段延迟来自 `STEP_END`，全进程 faults/RSS 来自 GNU time，各指标口径明确。
+- 正式证据要求 trace 零丢失、输出哈希一致、仓库干净和运行条件一致。
+- 四种候选按位置轮换并重复运行，缺失数据不参与“更优”判断。
+
+## 7. 当前不足
+
+- 旧 N=3 数据只能作为探索记录，尚缺按新协议完成的 N=8 受控复测。
+- hint 数仍然较大，当前异步队列降低的是关键路径干扰，并未从根本上消除无效预取。
+- 缺少真实 deadline/slack 估计、可取消请求和压力反馈的动态预算。
+- KV cache 目前以分析与模拟为主，尚未与 expert 页面共享统一运行时内存预算。
+- 泛化验证仍需覆盖不同输入长度、内存上限、模型和硬件。
+
+## 8. 决赛阶段建议主线
+
+主线建议从静态 `deadline_score` 升级为“模型语义和系统内存压力双反馈控制器”：联合 route score、预计层访问期限和历史复用，与 cgroup `memory.current/high`、PSI、refault、swap 和提示队列积压，动态选择 `prefetch/keep/cold/pageout/skip`，并在线调整预算和预取深度。
+
+在此基础上增加真实 slack 驱动的可取消批量预取：在线估计每层计算时间、page-in 延迟和队列服务时间，只提交预计能在使用前完成且收益大于成本的任务。该路线能把现有 trace、异步队列、deadline 启发式和 cgroup 矩阵串成一个完整自主机制。

@@ -62,3 +62,9 @@ llama.cpp/trace_output/
 
 # 本地 LLM 访存分析报告（由 trace 输出整理得到，不提交）
 llm_mem_trace_report.md
+
+# 草稿文档
+llmop_draft.tex
+
+# 本地文档和实验临时产物
+/tmp/
