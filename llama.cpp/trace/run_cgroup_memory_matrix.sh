@@ -13,6 +13,8 @@ TRACE_BASE_DIR="${TRACE_BASE_DIR:-$PROJECT_DIR/trace_output}"
 RUN_PREFIX="${RUN_PREFIX:-cgroup_pressure}"
 REPEAT_COUNT="${REPEAT_COUNT:-1}"
 NUM_TOKENS_PREDICT="${NUM_TOKENS_PREDICT:-80}"
+TRACE_PROFILE="${TRACE_PROFILE:-benchmark}"
+CACHE_MODE="${CACHE_MODE:-cold}"
 MEMORY_LIMITS_MB="${MEMORY_LIMITS_MB:-4096,5120,6144}"
 RUN_GROUPS="${RUN_GROUPS:-baseline,deadline_score}"
 EXECUTE="${RUN_MEMORY_PRESSURE_EXECUTE:-0}"
@@ -221,10 +223,17 @@ run_case() {
         "TRACE_BASE_DIR=$TRACE_BASE_DIR"
         "RUN_NAME=$run_name"
         "NUM_TOKENS_PREDICT=$NUM_TOKENS_PREDICT"
+        "TRACE_PROFILE=$TRACE_PROFILE"
+        "CACHE_MODE=$CACHE_MODE"
+        "REPEAT_INDEX=$idx"
+        "MEMORY_MAX=${limit_mb}M"
     )
     local status
 
     case_env "$group"
+    if [ "$CGROUP_SWAP_MAX" != "max" ]; then
+        cmd_env+=("MEMORY_SWAP_MAX=$CGROUP_SWAP_MAX")
+    fi
     cmd_env+=("${CASE_ENV[@]}")
     print_run "$run_name" "$limit_mb" "$cgdir" "${cmd_env[@]}"
 
@@ -262,6 +271,8 @@ echo "Repeat count: $REPEAT_COUNT"
 echo "Memory limits: $MEMORY_LIMITS_MB MiB"
 echo "Run groups: $RUN_GROUPS"
 echo "Trace base: $TRACE_BASE_DIR"
+echo "Trace profile: $TRACE_PROFILE"
+echo "Cache mode: $CACHE_MODE"
 echo "Cgroup parent: $CGROUP_PARENT"
 echo ""
 

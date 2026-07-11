@@ -118,9 +118,9 @@ top-k 会显著破坏 prefetch coverage，major faults 回升明显。coalescing
 
 其中 `deadline_score` 先按 step/layer 接近程度排序，再按 route score 排序。
 
-### 结论
+### 阶段观察
 
-N=3 重复实验中，`deadline_score` 是当前综合最优策略。
+早期 N=3 重复实验中，`deadline_score` 在当时的采集口径下表现较好，因此被选入正式复测候选。该结论不再作为最终获胜结论。
 
 ## 阶段 7：Route TTL 与重复实验
 
@@ -135,19 +135,40 @@ N=3 重复实验中，`deadline_score` 是当前综合最优策略。
 - 新增 `summarize_repeat_runs.py` 聚合 N 次运行。
 - 新增 `run_finalist_repeat_matrix.sh` 固化最终矩阵。
 
-### 结论
+### 阶段观察
 
-`decode_ttl1` 能减少 hint calls，但延迟和 RSS 不如 `deadline_score`。最终报告采用 N=3 均值和标准差。
+`decode_ttl1` 在早期数据中减少了 hint calls，但延迟和 RSS 未显示稳定优势。N=3 数据保留为研发记录，后续性能结论改用更严格的受控重复实验。
+
+## 阶段 8：可信基准修订
+
+### 问题
+
+复核旧实验后发现，单次运行是否可比较缺少强制证据：推理阶段计时边界、文件缓存状态、trace 丢失、全进程 faults、输入输出一致性和运行顺序都可能影响结论。
+
+### 解决方法
+
+- 以一次 `process_ubatch()` 为权威范围增加 `STEP_BEGIN/STEP_END`，旧 `TOKEN_END` 仅保留兼容。
+- 为每个 trace sink 增加 `enqueued/written/dropped` 计数；正式证据要求零丢失。
+- 增加 `evidence` 与 `benchmark` profile，区分完整观测和低开销性能测试。
+- 使用文件级 `POSIX_FADV_DONTNEED` 准备冷缓存，失败时拒绝运行。
+- 使用 GNU time 采集全进程 wall time、峰值 RSS、major/minor faults 和文件 I/O。
+- 每次运行生成 Manifest、缓存准备结果、进程指标、trace summary、输出哈希和分析指标。
+- 正式矩阵采用四方案位置轮换，默认 N=8；聚合器拒绝脏仓库、缺失产物、条件不一致和输出不一致的样本。
+- 修正 Pareto 缺失值处理，删除脚本自动生成的固定“最佳策略”结论。
+
+### 阶段结论
+
+旧 N=3 数据可用于候选筛选，但证据强度不足以支撑最终排名。下一次正式结论必须来自 clean commit、可验证冷缓存、零丢失 trace、固定 cgroup 条件和 N=8 位置轮换矩阵。
 
 ## 当前状态
 
-- 主推荐策略：`route_all_async4_deadline_score`
-- 对照策略：`expert_prefetch_route_all`
-- Pareto 备选：`decode_ttl1`
-- 已完成构建、Python 静态检查、脚本 dry-run 和 N=3 重复实验。
+- 正式候选：baseline、`expert_prefetch_route_all`、`route_all_async4_deadline_score`、`decode_ttl1`。
+- 当前只确认它们具备进入受控复测的价值，尚未按新协议确定唯一最优策略。
+- 可信基准工具链已形成，正式 N=8 长时间矩阵留待 clean commit 和稳定 cgroup 环境执行。
 
 ## 后续计划
 
-- 继续探索在保持 coverage 的同时减少 syscall 数量，例如更精确的 range batching。
-- 在更多模型、不同内存压力、不同输入长度下验证稳定性。
-- 将当前本地实验结果整理进正式答辩材料。
+- 完成新协议下的 N=8 正式矩阵，并如实报告均值、标准差、无效样本和 Pareto 前沿。
+- 从静态 `deadline_score` 发展语义与内存压力双反馈控制器。
+- 在线估计 layer compute、page-in 和队列时间，实现 slack 驱动的可取消批量预取。
+- 在更多内存限制、输入长度、模型和硬件上验证稳定性。

@@ -12,8 +12,11 @@ import csv
 import html
 import json
 import os
+import tempfile
 from pathlib import Path
 from typing import Any
+
+os.environ.setdefault("MPLCONFIGDIR", os.path.join(tempfile.gettempdir(), "llmop-matplotlib"))
 
 import matplotlib
 matplotlib.use("Agg")
@@ -35,9 +38,11 @@ RUN_LABELS = {
 }
 
 KEY_METRICS = [
-    ("total_major_faults", "Major Fault Delta", "lower"),
-    ("total_minor_faults", "Minor Fault Delta", "lower"),
-    ("decode_avg_latency_us", "Decode Latency (us)", "lower"),
+    ("total_major_faults", "Whole-process Major Faults", "lower"),
+    ("total_minor_faults", "Whole-process Minor Faults", "lower"),
+    ("process_wall_time_s", "Whole-process Wall Time (s)", "lower"),
+    ("decode_avg_latency_us", "Decode Mean Latency (us)", "lower"),
+    ("decode_p95_latency_us", "Decode p95 Latency (us)", "lower"),
     ("prefill_avg_latency_us", "Prefill Latency (us)", "lower"),
     ("first_touch_resident_pct_weighted", "First-touch Resident (%)", "higher"),
     ("first_touch_nonresident_gb_est", "First-touch Nonresident (GiB)", "lower"),
@@ -65,12 +70,25 @@ KEY_METRICS = [
 ]
 
 PARETO_METRICS = [
-    ("decode_avg_latency_us", "lower"),
+    ("decode_p95_latency_us", "lower"),
+    ("process_wall_time_s", "lower"),
     ("total_major_faults", "lower"),
     ("rss_peak_gb", "lower"),
     ("swap_peak_mb", "lower"),
     ("os_hint_events", "lower"),
 ]
+
+
+def validate_official_metrics(run: str, metrics: dict[str, Any]) -> None:
+    missing = [key for key, _ in PARETO_METRICS if metric_value(metrics, key) is None]
+    if missing:
+        raise ValueError(f"{run}: missing official comparison metrics: {', '.join(missing)}")
+    if metrics.get("fault_metric_source") != "gnu_time_process":
+        raise ValueError(f"{run}: official comparison requires GNU time whole-process faults")
+    if metrics.get("latency_metric_source") != "step_end":
+        raise ValueError(f"{run}: official comparison requires STEP_END latency")
+    if int(metrics.get("decode_steps", 0)) <= 0:
+        raise ValueError(f"{run}: official comparison requires at least one decode step")
 
 
 def load_metrics(run_dir: Path) -> dict[str, Any]:
@@ -139,12 +157,13 @@ def signed_improvement(metric: str, value: float, baseline: float) -> float:
     return -change if direction == "lower" else change
 
 
-def metric_value(row: dict[str, Any], key: str) -> float:
-    value = row.get(key, 0)
+def metric_value(row: dict[str, Any], key: str) -> float | None:
+    value = row.get(key)
     try:
-        return float(value)
+        number = float(value)
     except (TypeError, ValueError):
-        return 0.0
+        return None
+    return number if np.isfinite(number) else None
 
 
 def dominates(candidate: dict[str, Any], other: dict[str, Any]) -> bool:
@@ -152,6 +171,8 @@ def dominates(candidate: dict[str, Any], other: dict[str, Any]) -> bool:
     for key, direction in PARETO_METRICS:
         a = metric_value(candidate, key)
         b = metric_value(other, key)
+        if a is None or b is None:
+            return False
         if direction == "lower":
             if a > b:
                 return False
@@ -182,10 +203,15 @@ def fmt_num(value: Any) -> str:
     return str(value)
 
 
-def collect_rows(base_dir: Path, runs: list[str]) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+def collect_rows(
+        base_dir: Path,
+        runs: list[str],
+        official: bool = False) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
     metrics_by_run: dict[str, dict[str, Any]] = {}
     for run in runs:
         metrics_by_run[run] = load_metrics(base_dir / run)
+        if official:
+            validate_official_metrics(run, metrics_by_run[run])
 
     baseline = metrics_by_run[runs[0]]
     rows: list[dict[str, Any]] = []
@@ -196,11 +222,15 @@ def collect_rows(base_dir: Path, runs: list[str]) -> tuple[list[dict[str, Any]],
             "label": RUN_LABELS.get(run, run),
         }
         for key, _, _ in KEY_METRICS:
-            value = metrics.get(key, 0)
-            base_value = baseline.get(key, 0)
+            value = metrics.get(key)
+            base_value = baseline.get(key)
             row[key] = value
-            row[f"{key}_change_pct"] = pct_change(float(value), float(base_value)) if base_value else 0.0
-            row[f"{key}_improvement_pct"] = signed_improvement(key, float(value), float(base_value)) if base_value else 0.0
+            if isinstance(value, (int, float)) and isinstance(base_value, (int, float)) and base_value:
+                row[f"{key}_change_pct"] = pct_change(float(value), float(base_value))
+                row[f"{key}_improvement_pct"] = signed_improvement(key, float(value), float(base_value))
+            else:
+                row[f"{key}_change_pct"] = float("nan")
+                row[f"{key}_improvement_pct"] = float("nan")
         rows.append(row)
     mark_pareto(rows)
     return rows, metrics_by_run
@@ -257,7 +287,8 @@ def plot_overview(rows: list[dict[str, Any]], out_dir: Path) -> Path:
     colors = ["#78909C", "#42A5F5", "#66BB6A", "#AB47BC", "#FFA726", "#26A69A", "#EC407A", "#5C6BC0"]
 
     for ax, (key, title, ylabel, higher_better) in zip(axes.ravel(), plots):
-        vals = [float(row.get(key, 0) or 0) for row in rows]
+        raw_vals = [metric_value(row, key) for row in rows]
+        vals = [value if value is not None else 0.0 for value in raw_vals]
         ax.barh(y_pos, vals, color=[colors[i % len(colors)] for i in range(len(labels))], alpha=0.85)
         ax.set_title(title)
         ax.set_xlabel(ylabel)
@@ -270,7 +301,9 @@ def plot_overview(rows: list[dict[str, Any]], out_dir: Path) -> Path:
         ax.set_xlim(0, xmax * 1.28)
         baseline = vals[0] if vals else 0
         for i, v in enumerate(vals):
-            if i == 0 or baseline == 0:
+            if raw_vals[i] is None:
+                text = "N/A"
+            elif i == 0 or baseline == 0:
                 text = fmt_num(v)
             else:
                 change = pct_change(float(v), float(baseline))
@@ -362,61 +395,35 @@ def plot_fault_timeline(base_dir: Path, runs: list[str], out_dir: Path) -> Path:
 
 
 def write_summary(rows: list[dict[str, Any]], out_dir: Path) -> Path:
-    baseline = rows[0]
-    expert = next((row for row in rows if row["run"] == "expert_prefetch"), None)
-    all_hints = next((row for row in rows if row["run"] == "all_hints"), None)
-    load = next((row for row in rows if row["run"] == "load_prefetch"), None)
-
     lines = [
         "# OS Hint 优化对比摘要",
         "",
-        "本摘要基于同一 prompt、同一模型、同一 trace pipeline 的单次消融实验。当前结论表示效果幅度明显，严格统计显著性仍需要多次重复实验。",
+        "本摘要只呈现输入运行的指标与 Pareto 关系，不按策略名称生成预设胜负结论。正式结论应使用通过完整性校验的重复实验聚合结果。",
         "",
-        "## 核心结论",
+        "## Pareto 结果",
         "",
     ]
     pareto = [row for row in rows if row.get("pareto_optimal")]
     if pareto:
         lines.extend([
-            "- Pareto 最优实验组（同时考虑 decode latency、major faults、RSS、swap 和 OS hint 系统调用）："
+            "- 当前输入数据的 Pareto 候选（p95 decode、全进程 wall time、major faults、RSS、swap、hint calls）："
             + "、".join(row["label"] for row in pareto) + "。",
-            "",
-        ])
-    if expert:
-        lines.extend([
-            f"- expert-aware prefetch 将 major fault delta 从 {fmt_num(baseline['total_major_faults'])} 降到 {fmt_num(expert['total_major_faults'])}，改善 {expert['total_major_faults_improvement_pct']:.1f}%。",
-            f"- expert-aware prefetch 将 decode 平均延迟从 {fmt_num(baseline['decode_avg_latency_us'])} us 降到 {fmt_num(expert['decode_avg_latency_us'])} us，改善 {expert['decode_avg_latency_us_improvement_pct']:.1f}%。",
-            f"- expert-aware prefetch 将 first-touch 驻留率从 {baseline['first_touch_resident_pct_weighted']:.2f}% 提升到 {expert['first_touch_resident_pct_weighted']:.2f}%，提升 {expert['first_touch_resident_pct_weighted'] - baseline['first_touch_resident_pct_weighted']:.2f} 个百分点。",
-            f"- 代价是 RSS 峰值从 {baseline['rss_peak_gb']:.2f} GiB 升到 {expert['rss_peak_gb']:.2f} GiB，minor fault delta 增加 {expert['total_minor_faults_change_pct']:.1f}%，OS hint 事件达到 {fmt_num(expert['os_hint_events'])} 次。",
-            "",
-        ])
-    if load:
-        lines.extend([
-            f"- 加载期预取 hint 触发 {fmt_num(load['os_hint_events'])} 次且失败 0 次，但 prefill 延迟变差 {abs(load['prefill_avg_latency_us_improvement_pct']):.1f}%，说明简单文件/地址级预取不能直接证明有效。",
-            "",
-        ])
-    if all_hints:
-        lines.extend([
-            f"- 全策略组合仍能将 major fault delta 改善 {all_hints['total_major_faults_improvement_pct']:.1f}%，但 decode 延迟只改善 {all_hints['decode_avg_latency_us_improvement_pct']:.1f}%，不如 expert-aware prefetch 单独启用。",
-            f"- 全策略组合产生 {fmt_num(all_hints['os_hint_events'])} 次 OS hint，说明策略叠加会放大系统调用与日志开销。",
             "",
         ])
 
     lines.extend([
         "## 指标表",
         "",
-        "| Run | Pareto | Major Faults | Minor Faults | Decode us | Prefill us | Residency % | RSS GiB | Swap MiB | OS Hint Calls | Cache Hit % | Cache Peak MiB | Evictions |",
-        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| Run | Pareto | Wall s | Major Faults | Decode mean us | Decode p95 us | RSS GiB | Swap MiB | OS Hint Calls |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ])
     for row in rows:
         lines.append(
             f"| {row['label']} | {'yes' if row.get('pareto_optimal') else 'no'} | "
-            f"{fmt_num(row['total_major_faults'])} | {fmt_num(row['total_minor_faults'])} | "
-            f"{fmt_num(row['decode_avg_latency_us'])} | {fmt_num(row['prefill_avg_latency_us'])} | "
-            f"{row['first_touch_resident_pct_weighted']:.2f} | {row['rss_peak_gb']:.2f} | "
-            f"{row['swap_peak_mb']:.2f} | {fmt_num(row['os_hint_events'])} | "
-            f"{row.get('expert_cache_hit_rate_pct', 0):.2f} | {row.get('expert_cache_peak_mb', 0):.2f} | "
-            f"{fmt_num(row.get('expert_cache_evictions', 0))} |"
+            f"{fmt_num(row.get('process_wall_time_s'))} | {fmt_num(row.get('total_major_faults'))} | "
+            f"{fmt_num(row.get('decode_avg_latency_us'))} | {fmt_num(row.get('decode_p95_latency_us'))} | "
+            f"{fmt_num(row.get('rss_peak_gb'))} | {fmt_num(row.get('swap_peak_mb'))} | "
+            f"{fmt_num(row.get('os_hint_events'))} |"
         )
 
     path = out_dir / "comparison_summary.md"
@@ -432,12 +439,11 @@ def write_html(rows: list[dict[str, Any]], plots: list[Path], summary_md: Path, 
         <div class="card">
           <h3>{html.escape(row['label'])}</h3>
           <p><b>Pareto:</b> {'yes' if row.get('pareto_optimal') else 'no'}</p>
-          <p><b>Major faults:</b> {fmt_num(row['total_major_faults'])}</p>
-          <p><b>Decode latency:</b> {fmt_num(row['decode_avg_latency_us'])} us</p>
-          <p><b>Residency:</b> {row['first_touch_resident_pct_weighted']:.2f}%</p>
-          <p><b>Peak RSS:</b> {row['rss_peak_gb']:.2f} GiB</p>
-          <p><b>OS hint calls:</b> {fmt_num(row['os_hint_events'])}</p>
-          <p><b>Cache hit:</b> {row.get('expert_cache_hit_rate_pct', 0):.2f}%</p>
+          <p><b>Wall time:</b> {fmt_num(row.get('process_wall_time_s'))} s</p>
+          <p><b>Major faults:</b> {fmt_num(row.get('total_major_faults'))}</p>
+          <p><b>Decode p95:</b> {fmt_num(row.get('decode_p95_latency_us'))} us</p>
+          <p><b>Peak RSS:</b> {fmt_num(row.get('rss_peak_gb'))} GiB</p>
+          <p><b>OS hint calls:</b> {fmt_num(row.get('os_hint_events'))}</p>
         </div>
         """)
     imgs = "\n".join(f'<img src="{plot.name}" alt="{plot.name}">' for plot in plots)
@@ -475,13 +481,15 @@ def main() -> None:
     parser.add_argument("--base-dir", required=True, help="Directory containing run subdirectories")
     parser.add_argument("--runs", nargs="+", default=["baseline", "load_prefetch", "expert_prefetch", "all_hints"])
     parser.add_argument("--output-dir", default=None)
+    parser.add_argument("--official", action="store_true",
+                        help="Reject runs without STEP_END latency and whole-process GNU time metrics")
     args = parser.parse_args()
 
     base_dir = Path(args.base_dir)
     out_dir = Path(args.output_dir) if args.output_dir else base_dir / "comparison"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    rows, _ = collect_rows(base_dir, args.runs)
+    rows, _ = collect_rows(base_dir, args.runs, official=args.official)
     csv_path = write_csv(rows, out_dir)
     plots = [
         plot_overview(rows, out_dir),

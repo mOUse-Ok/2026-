@@ -22,14 +22,20 @@ struct TraceWriter {
     FILE * fp = nullptr;
     std::mutex mu;
     std::condition_variable cv;
+    std::condition_variable cv_space;
     std::vector<std::string> queue;
     std::thread thread;
     std::atomic<bool> running{false};
+    std::atomic<uint64_t> enqueued{0};
+    std::atomic<uint64_t> written{0};
     std::atomic<uint64_t> dropped{0};
     size_t max_queue = 8192;
+    bool allow_drop = false;
 
-    void start(const std::string & file_path) {
+    void start(const std::string & file_path, size_t queue_limit, bool drop_when_full) {
         path = file_path;
+        max_queue = queue_limit > 0 ? queue_limit : 8192;
+        allow_drop = drop_when_full;
         fp = std::fopen(path.c_str(), "w");
         if (!fp) {
             return;
@@ -41,6 +47,7 @@ struct TraceWriter {
     void stop() {
         running.store(false, std::memory_order_release);
         cv.notify_all();
+        cv_space.notify_all();
         if (thread.joinable()) {
             thread.join();
         }
@@ -55,17 +62,23 @@ struct TraceWriter {
         if (!running.load(std::memory_order_acquire)) {
             return;
         }
-        if (!mu.try_lock()) {
-            dropped.fetch_add(1, std::memory_order_relaxed);
-            return;
-        }
-        if (queue.size() >= max_queue) {
-            dropped.fetch_add(1, std::memory_order_relaxed);
-            mu.unlock();
-            return;
+        std::unique_lock<std::mutex> lock(mu);
+        if (allow_drop) {
+            if (queue.size() >= max_queue) {
+                dropped.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+        } else {
+            cv_space.wait(lock, [this] {
+                return queue.size() < max_queue || !running.load(std::memory_order_acquire);
+            });
+            if (!running.load(std::memory_order_acquire)) {
+                return;
+            }
         }
         queue.emplace_back(std::move(line));
-        mu.unlock();
+        enqueued.fetch_add(1, std::memory_order_relaxed);
+        lock.unlock();
         cv.notify_one();
     }
 
@@ -76,6 +89,7 @@ struct TraceWriter {
             if (!queue.empty()) {
                 std::vector<std::string> local;
                 local.swap(queue);
+                cv_space.notify_all();
                 lock.unlock();
                 write_lines(local);
                 lock.lock();
@@ -92,6 +106,7 @@ struct TraceWriter {
             }
             local.swap(queue);
         }
+        cv_space.notify_all();
         write_lines(local);
     }
 
@@ -103,6 +118,7 @@ struct TraceWriter {
             std::fwrite(line.data(), 1, line.size(), fp);
             std::fwrite("\n", 1, 1, fp);
         }
+        written.fetch_add(lines.size(), std::memory_order_relaxed);
         std::fflush(fp);
     }
 };
@@ -111,6 +127,8 @@ struct TraceState {
     bool enabled = false;
     bool sink_enabled[4] = { false, false, false, false };
     std::string dir;
+    size_t queue_limit = 65536;
+    bool allow_drop = false;
 
     TraceWriter tensor;
     TraceWriter kv;
@@ -124,6 +142,7 @@ struct TraceContext {
     std::atomic<const llama_ubatch *> ubatch{nullptr};
     std::atomic<int> phase{LLM_MEM_TRACE_PHASE_UNKNOWN};
     std::atomic<uint64_t> step_id{0};
+    std::atomic<uint64_t> step_begin_ts{0};
     std::mutex token_mu;
     std::vector<uint64_t> token_begin_ts;
 };
@@ -161,6 +180,16 @@ std::string env_str(const char * key, const char * def_value) {
     return val ? std::string(val) : std::string(def_value);
 }
 
+size_t env_size_or_default(const char * key, size_t def_value) {
+    const char * val = std::getenv(key);
+    if (!val || !val[0]) {
+        return def_value;
+    }
+    char * end = nullptr;
+    const unsigned long long parsed = std::strtoull(val, &end, 10);
+    return end != val && parsed > 0 ? (size_t) parsed : def_value;
+}
+
 const char * phase_name(int phase) {
     switch (phase) {
         case LLM_MEM_TRACE_PHASE_PREFILL: return "PREFILL";
@@ -171,22 +200,30 @@ const char * phase_name(int phase) {
 
 void write_summary() {
     auto & s = state();
-    if (!s.enabled) {
-        return;
-    }
-
     std::string path = s.dir + "/summary.json";
     FILE * fp = std::fopen(path.c_str(), "w");
     if (!fp) {
         return;
     }
 
-    std::string line = "{";
-    line += "\"dropped\":{";
-    line += "\"tensor\":" + std::to_string(s.tensor.dropped.load()) + ",";
-    line += "\"kv\":" + std::to_string(s.kv.dropped.load()) + ",";
-    line += "\"expert\":" + std::to_string(s.expert.dropped.load()) + ",";
-    line += "\"memory\":" + std::to_string(s.memory.dropped.load());
+    std::string line = "{\"schema_version\":2";
+    line += ",\"allow_drop\":" + std::string(s.allow_drop ? "true" : "false");
+    line += ",\"queue_limit\":" + std::to_string(s.queue_limit);
+    const auto append_counts = [&line](const char * name, const TraceWriter & writer, bool enabled, bool comma) {
+        line += "\"" + std::string(name) + "\":{";
+        line += "\"enabled\":" + std::string(enabled ? "true" : "false") + ",";
+        line += "\"enqueued\":" + std::to_string(writer.enqueued.load()) + ",";
+        line += "\"written\":" + std::to_string(writer.written.load()) + ",";
+        line += "\"dropped\":" + std::to_string(writer.dropped.load()) + "}";
+        if (comma) {
+            line += ",";
+        }
+    };
+    line += ",\"sinks\":{";
+    append_counts("tensor", s.tensor, s.sink_enabled[LLM_MEM_TRACE_SINK_TENSOR], true);
+    append_counts("kv", s.kv, s.sink_enabled[LLM_MEM_TRACE_SINK_KV], true);
+    append_counts("expert", s.expert, s.sink_enabled[LLM_MEM_TRACE_SINK_EXPERT], true);
+    append_counts("memory", s.memory, s.sink_enabled[LLM_MEM_TRACE_SINK_MEMORY], false);
     line += "}}";
 
     std::fwrite(line.data(), 1, line.size(), fp);
@@ -224,18 +261,24 @@ extern "C" void llm_mem_trace_init(const char * dir) {
         s.sink_enabled[LLM_MEM_TRACE_SINK_KV]     = env_bool_or_default("LLM_MEM_TRACE_KV", true);
         s.sink_enabled[LLM_MEM_TRACE_SINK_EXPERT] = env_bool_or_default("LLM_MEM_TRACE_EXPERT", true);
         s.sink_enabled[LLM_MEM_TRACE_SINK_MEMORY] = env_bool_or_default("LLM_MEM_TRACE_MEMORY", true);
+        s.queue_limit = env_size_or_default("LLM_MEM_TRACE_QUEUE_LIMIT", 65536);
+        s.allow_drop = env_bool_or_default("LLM_MEM_TRACE_ALLOW_DROP", false);
 
         if (s.sink_enabled[LLM_MEM_TRACE_SINK_TENSOR]) {
-            s.tensor.start(s.dir + "/tensor_trace.jsonl");
+            s.tensor.start(s.dir + "/tensor_trace.jsonl", s.queue_limit, s.allow_drop);
         }
         if (s.sink_enabled[LLM_MEM_TRACE_SINK_KV]) {
-            s.kv.start(s.dir + "/kv_trace.jsonl");
+            s.kv.start(s.dir + "/kv_trace.jsonl", s.queue_limit, s.allow_drop);
         }
         if (s.sink_enabled[LLM_MEM_TRACE_SINK_EXPERT]) {
-            s.expert.start(s.dir + "/expert_trace.jsonl");
+            s.expert.start(s.dir + "/expert_trace.jsonl", s.queue_limit, s.allow_drop);
         }
         if (s.sink_enabled[LLM_MEM_TRACE_SINK_MEMORY]) {
-            s.memory.start(s.dir + "/memory_trace.jsonl");
+            s.memory.start(s.dir + "/memory_trace.jsonl", s.queue_limit, s.allow_drop);
+            const uint64_t ts = llm_mem_trace_time_ns();
+            const std::string line = "{\"event\":\"TRACE_START\",\"ts_ns\":" + std::to_string(ts) + "}";
+            llm_mem_trace_write(LLM_MEM_TRACE_SINK_MEMORY, line.c_str(), line.size());
+            llm_mem_trace_memory_sample("trace_init");
         }
 
         std::atexit(llm_mem_trace_shutdown);
@@ -248,7 +291,12 @@ extern "C" void llm_mem_trace_shutdown(void) {
         return;
     }
 
-    s.enabled = false;
+    if (s.sink_enabled[LLM_MEM_TRACE_SINK_MEMORY]) {
+        llm_mem_trace_memory_sample("trace_shutdown");
+        const uint64_t ts = llm_mem_trace_time_ns();
+        const std::string line = "{\"event\":\"TRACE_END\",\"ts_ns\":" + std::to_string(ts) + "}";
+        llm_mem_trace_write(LLM_MEM_TRACE_SINK_MEMORY, line.c_str(), line.size());
+    }
 
     s.tensor.stop();
     s.kv.stop();
@@ -256,6 +304,7 @@ extern "C" void llm_mem_trace_shutdown(void) {
     s.memory.stop();
 
     write_summary();
+    s.enabled = false;
 }
 
 extern "C" int llm_mem_trace_enabled(void) {
@@ -273,6 +322,7 @@ extern "C" void llm_mem_trace_set_ubatch(const struct llama_ubatch * ubatch, int
     auto & ctx = context();
     ctx.phase.store(phase, std::memory_order_release);
     ctx.step_id.store(step_id, std::memory_order_release);
+    ctx.step_begin_ts.store(0, std::memory_order_release);
     ctx.ubatch.store(ubatch, std::memory_order_release);
 
     if (ubatch) {
@@ -286,6 +336,7 @@ extern "C" void llm_mem_trace_clear_ubatch(void) {
     ctx.ubatch.store(nullptr, std::memory_order_release);
     ctx.phase.store(LLM_MEM_TRACE_PHASE_UNKNOWN, std::memory_order_release);
     ctx.step_id.store(0, std::memory_order_release);
+    ctx.step_begin_ts.store(0, std::memory_order_release);
     std::lock_guard<std::mutex> lock(ctx.token_mu);
     ctx.token_begin_ts.clear();
 }
@@ -300,6 +351,50 @@ extern "C" int llm_mem_trace_get_phase(void) {
 
 extern "C" uint64_t llm_mem_trace_get_step(void) {
     return context().step_id.load(std::memory_order_acquire);
+}
+
+extern "C" void llm_mem_trace_step_begin(void) {
+    if (!llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_MEMORY)) {
+        return;
+    }
+    auto & ctx = context();
+    const llama_ubatch * ubatch = llm_mem_trace_get_ubatch();
+    if (!ubatch) {
+        return;
+    }
+    const uint64_t ts = llm_mem_trace_time_ns();
+    ctx.step_begin_ts.store(ts, std::memory_order_release);
+
+    std::string line;
+    line.reserve(192);
+    line += "{\"event\":\"STEP_BEGIN\",\"ts_ns\":" + std::to_string(ts);
+    line += ",\"phase\":\"" + std::string(phase_name(llm_mem_trace_get_phase())) + "\"";
+    line += ",\"step\":" + std::to_string(llm_mem_trace_get_step());
+    line += ",\"n_tokens\":" + std::to_string(ubatch->n_tokens) + "}";
+    llm_mem_trace_write(LLM_MEM_TRACE_SINK_MEMORY, line.c_str(), line.size());
+}
+
+extern "C" void llm_mem_trace_step_end(void) {
+    if (!llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_MEMORY)) {
+        return;
+    }
+    auto & ctx = context();
+    const llama_ubatch * ubatch = llm_mem_trace_get_ubatch();
+    const uint64_t start_ts = ctx.step_begin_ts.exchange(0, std::memory_order_acq_rel);
+    if (!ubatch || start_ts == 0) {
+        return;
+    }
+    const uint64_t ts = llm_mem_trace_time_ns();
+
+    std::string line;
+    line.reserve(224);
+    line += "{\"event\":\"STEP_END\",\"ts_ns\":" + std::to_string(ts);
+    line += ",\"phase\":\"" + std::string(phase_name(llm_mem_trace_get_phase())) + "\"";
+    line += ",\"step\":" + std::to_string(llm_mem_trace_get_step());
+    line += ",\"n_tokens\":" + std::to_string(ubatch->n_tokens);
+    line += ",\"latency_ns\":" + std::to_string(ts - start_ts) + "}";
+    llm_mem_trace_write(LLM_MEM_TRACE_SINK_MEMORY, line.c_str(), line.size());
+    llm_mem_trace_memory_sample("step_end");
 }
 
 extern "C" void llm_mem_trace_token_begin(int token_idx) {
@@ -376,11 +471,11 @@ extern "C" void llm_mem_trace_token_end(int token_idx) {
     }
     if (start_ts != 0) {
         line += ",\"latency_ns\":" + std::to_string(ts - start_ts);
+        line += ",\"latency_scope\":\"ubatch_legacy\"";
     }
     line += "}";
 
     llm_mem_trace_write(LLM_MEM_TRACE_SINK_MEMORY, line.c_str(), line.size());
-    llm_mem_trace_memory_sample("token_end");
 }
 
 extern "C" void llm_mem_trace_write(int sink, const char * line, size_t len) {
