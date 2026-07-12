@@ -16,7 +16,7 @@ NUM_TOKENS_PREDICT="${NUM_TOKENS_PREDICT:-80}"
 TRACE_PROFILE="${TRACE_PROFILE:-benchmark}"
 CACHE_MODE="${CACHE_MODE:-cold}"
 MEMORY_LIMITS_MB="${MEMORY_LIMITS_MB:-4096,5120,6144}"
-RUN_GROUPS="${RUN_GROUPS:-baseline,deadline_score}"
+RUN_GROUPS="${RUN_GROUPS:-baseline,deadline_score,feedback_slack,feedback_slack_predict}"
 EXECUTE="${RUN_MEMORY_PRESSURE_EXECUTE:-0}"
 CGROUP_PARENT="${CGROUP_PARENT:-/sys/fs/cgroup}"
 CGROUP_NAME_PREFIX="${CGROUP_NAME_PREFIX:-llm_mem_trace}"
@@ -62,6 +62,11 @@ case_env() {
                 LLM_MEM_TRACE_OPT_EXPERT_ASYNC=0
                 LLM_MEM_TRACE_OPT_EXPERT_ASYNC_PRIORITY=0
                 LLM_MEM_TRACE_OPT_EXPERT_ASYNC_PRIORITY_HEAP=0
+                LLM_MEM_TRACE_OPT_EXPERT_CONTROLLER=off
+                LLM_MEM_TRACE_OPT_EXPERT_FEEDBACK=0
+                LLM_MEM_TRACE_OPT_EXPERT_SLACK=0
+                LLM_MEM_TRACE_OPT_EXPERT_VALUE_GATE=0
+                LLM_MEM_TRACE_OPT_EXPERT_CROSS_LAYER_PREDICT=0
                 LLM_MEM_TRACE_OPT_EXPERT_COALESCE=0
                 LLM_MEM_TRACE_OPT_EXPERT_ROUTE_HINT_TTL_STEPS=0
             )
@@ -75,6 +80,11 @@ case_env() {
                 LLM_MEM_TRACE_OPT_EXPERT_ASYNC=0
                 LLM_MEM_TRACE_OPT_EXPERT_ASYNC_PRIORITY=0
                 LLM_MEM_TRACE_OPT_EXPERT_ASYNC_PRIORITY_HEAP=0
+                LLM_MEM_TRACE_OPT_EXPERT_CONTROLLER=off
+                LLM_MEM_TRACE_OPT_EXPERT_FEEDBACK=0
+                LLM_MEM_TRACE_OPT_EXPERT_SLACK=0
+                LLM_MEM_TRACE_OPT_EXPERT_VALUE_GATE=0
+                LLM_MEM_TRACE_OPT_EXPERT_CROSS_LAYER_PREDICT=0
                 LLM_MEM_TRACE_OPT_EXPERT_COALESCE=0
                 LLM_MEM_TRACE_OPT_EXPERT_ROUTE_HINT_TTL_STEPS=0
             )
@@ -91,6 +101,11 @@ case_env() {
                 LLM_MEM_TRACE_OPT_EXPERT_ASYNC_PRIORITY=1
                 LLM_MEM_TRACE_OPT_EXPERT_ASYNC_PRIORITY_MODE=deadline_score
                 LLM_MEM_TRACE_OPT_EXPERT_ASYNC_PRIORITY_HEAP=0
+                LLM_MEM_TRACE_OPT_EXPERT_CONTROLLER=off
+                LLM_MEM_TRACE_OPT_EXPERT_FEEDBACK=0
+                LLM_MEM_TRACE_OPT_EXPERT_SLACK=0
+                LLM_MEM_TRACE_OPT_EXPERT_VALUE_GATE=0
+                LLM_MEM_TRACE_OPT_EXPERT_CROSS_LAYER_PREDICT=0
                 LLM_MEM_TRACE_OPT_EXPERT_COALESCE=0
                 LLM_MEM_TRACE_OPT_EXPERT_ROUTE_HINT_TTL_STEPS=0
             )
@@ -110,12 +125,51 @@ case_env() {
                 LLM_MEM_TRACE_OPT_EXPERT_ASYNC_PRIORITY=1
                 LLM_MEM_TRACE_OPT_EXPERT_ASYNC_PRIORITY_MODE=deadline_score
                 LLM_MEM_TRACE_OPT_EXPERT_ASYNC_PRIORITY_HEAP=0
+                LLM_MEM_TRACE_OPT_EXPERT_CONTROLLER=off
+                LLM_MEM_TRACE_OPT_EXPERT_FEEDBACK=0
+                LLM_MEM_TRACE_OPT_EXPERT_SLACK=0
+                LLM_MEM_TRACE_OPT_EXPERT_VALUE_GATE=0
+                LLM_MEM_TRACE_OPT_EXPERT_CROSS_LAYER_PREDICT=0
                 LLM_MEM_TRACE_OPT_EXPERT_COALESCE=0
+            )
+            ;;
+        feedback_slack|feedback_slack_predict)
+            local controller_profile=feedback_slack
+            local predict_enabled=0
+            if [ "$group" = "feedback_slack_predict" ]; then
+                controller_profile=feedback_slack_predict
+                predict_enabled=1
+            fi
+            CASE_ENV=(
+                LLM_MEM_TRACE_OS_HINTS=1
+                LLM_MEM_TRACE_OPT_EXPERT_PREFETCH=1
+                LLM_MEM_TRACE_OPT_EXPERT_POLICY=route
+                LLM_MEM_TRACE_OPT_EXPERT_PREFETCH_TOPK=0
+                LLM_MEM_TRACE_OPT_EXPERT_CONTROLLER="$controller_profile"
+                LLM_MEM_TRACE_OPT_EXPERT_FEEDBACK=1
+                LLM_MEM_TRACE_OPT_EXPERT_SLACK=1
+                LLM_MEM_TRACE_OPT_EXPERT_VALUE_GATE=1
+                LLM_MEM_TRACE_OPT_EXPERT_CROSS_LAYER_PREDICT="$predict_enabled"
+                LLM_MEM_TRACE_OPT_EXPERT_ASYNC=1
+                LLM_MEM_TRACE_OPT_EXPERT_ASYNC_QUEUE=131072
+                LLM_MEM_TRACE_OPT_EXPERT_ASYNC_WORKERS=4
+                LLM_MEM_TRACE_OPT_EXPERT_ASYNC_PRIORITY=1
+                LLM_MEM_TRACE_OPT_EXPERT_ASYNC_PRIORITY_MODE=deadline_score
+                LLM_MEM_TRACE_OPT_EXPERT_ASYNC_PRIORITY_HEAP=1
+                LLM_MEM_TRACE_OPT_EXPERT_ASYNC_BATCH=8
+                LLM_MEM_TRACE_OPT_EXPERT_ASYNC_BATCH_WAIT_US=100
+                LLM_MEM_TRACE_OPT_EXPERT_ASYNC_BATCH_COALESCE=1
+                LLM_MEM_TRACE_OPT_EXPERT_ASYNC_FALLBACK=0
+                LLM_MEM_TRACE_OPT_EXPERT_PREDICT_TOPK=2
+                LLM_MEM_TRACE_OPT_EXPERT_PREDICT_MIN_SAMPLES=8
+                LLM_MEM_TRACE_OPT_EXPERT_PREDICT_MIN_CONFIDENCE=0.10
+                LLM_MEM_TRACE_OPT_EXPERT_COALESCE=0
+                LLM_MEM_TRACE_OPT_EXPERT_ROUTE_HINT_TTL_STEPS=0
             )
             ;;
         *)
             echo "ERROR: unknown RUN_GROUP: $group" >&2
-            echo "Known groups: baseline, expert_prefetch, deadline_score, decode_ttl1" >&2
+            echo "Known groups: baseline, expert_prefetch, deadline_score, decode_ttl1, feedback_slack, feedback_slack_predict" >&2
             exit 1
             ;;
     esac

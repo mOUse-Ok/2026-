@@ -148,7 +148,7 @@ dry-run 应显示四种方案在相邻重复轮次中的位置轮换，并打印
 - 启用 trace 的增量构建通过。
 - 关闭 trace 的独立 Release 构建通过；验证过程中发现并修正了 no-trace 配置缺少 `trace_event.h` 包含路径的问题。
 - Python 语法检查、全部 shell 语法检查和 `git diff --check` 通过。
-- 7 个分析与聚合单元测试全部通过。
+- 9 个分析与聚合单元测试全部通过，其中新增压力/slack/预测指标聚合回归。
 - 四方案 N=2 拉丁方矩阵 dry-run 通过，第二轮顺序相对第一轮轮换一个位置。
 - baseline/deadline_score 的 4096 MiB cgroup 矩阵 dry-run 通过。
 - 使用现有 GGUF、`TRACE_PROFILE=benchmark`、`CACHE_MODE=as-is`、`NUM_TOKENS_PREDICT=1` 完成短 smoke。
@@ -156,3 +156,15 @@ dry-run 应显示四种方案在相邻重复轮次中的位置轮换，并打印
 - 六类可信证据产物和输出哈希均生成，分析指标来源为 `STEP_END` 与 GNU time。
 
 本次 smoke 只出现 3 个 prefill step，没有形成 decode 样本，因此仅证明流水线和证据产物可用，不作为性能结论。正式 N=8 矩阵未在本轮自动执行。
+
+## 10. 双反馈与预测功能验证（2026-07-11）
+
+使用 `feedback_slack_predict`、`TRACE_PROFILE=benchmark`、`CACHE_MODE=as-is`、`NUM_TOKENS_PREDICT=1` 完成功能 smoke：
+
+- expert sink `19112/19112/0`，memory sink `28495/28495/0`，无 trace 丢失。
+- 产生 91 个 `EXPERT_PRESSURE` 样本，并记录 memory ratio、PSI、refault 和动态预算。
+- 异步队列入队 663 项、执行 636 项，fallback 为 0；micro-batch 合并节省 3 次系统调用，按 slack 取消 24 项。
+- 在线预测器观察 19112 条 route，形成 301 个可评估候选，命中 181 个；precision 60.13%、recall 14.98%、set hit rate 80.13%。
+- 当次 WSL 根 cgroup 的 PSI/refault 主要被判定为高或临界压力；852 条预测相关决策中，72 条实际发出 predicted hint，其余由 value/pressure gate 拒绝。
+
+以上数据证明预测、压力反馈、成本门控和指标分析链路可运行。由于本次使用 `as-is` 缓存、脏工作区、无限制根 cgroup 且没有 decode 样本，不能据此判断控制器优于 baseline，也不能把预测命中率直接写成端到端收益。下一步必须在 delegated cgroup 中执行四方案 N=8 冷缓存矩阵。
