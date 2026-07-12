@@ -160,15 +160,34 @@ top-k 会显著破坏 prefetch coverage，major faults 回升明显。coalescing
 
 旧 N=3 数据可用于候选筛选，但证据强度不足以支撑最终排名。下一次正式结论必须来自 clean commit、可验证冷缓存、零丢失 trace、固定 cgroup 条件和 N=8 位置轮换矩阵。
 
+## 阶段 9：双反馈、slack 取消与成本门控预测
+
+### 问题
+
+旧 `deadline_score` 只按 step/layer 和 router score 静态排序，不知道系统是否正在 refault，也不能判断任务出队时是否已经错过使用期限。简单跨层预测还可能增加误取页面和 RSS。
+
+### 解决方法
+
+- 读取 cgroup v2 memory current/high/max、swap、PSI 和 workingset refault 增量，将压力分为四级并动态缩放 expert 预算。
+- 使用每层执行时间和 hint 系统调用时间 EWMA 估计 slack；priority heap 按真实 deadline 排序。
+- worker 出队时重新检查 deadline、压力和 value ratio，支持取消，不回退到推理线程同步调用。
+- 增加有 100 us 等待上限的 micro-batch 和相邻区间合并。
+- 按 token 在线学习相邻层 expert 转移，生成有最小样本和置信度要求的 top-2 候选。
+- 预测候选继续接受成本和压力门控，单独报告 precision/recall 与实际 predicted prefetch 数。
+
+### 功能观察
+
+`feedback_slack_predict` 短 smoke 中预测 precision 为 60.13%，set hit rate 为 80.13%。当时 WSL 根 cgroup 呈高 PSI/refault，控制器共执行 636 次 hint，其中 72 次来自跨层预测，并按 slack 取消 24 项。该结果说明控制链生效，但不构成性能改善证据。
+
 ## 当前状态
 
-- 正式候选：baseline、`expert_prefetch_route_all`、`route_all_async4_deadline_score`、`decode_ttl1`。
+- 当前正式矩阵候选：baseline、旧 `deadline_score`、`feedback_slack`、`feedback_slack_predict`。
 - 当前只确认它们具备进入受控复测的价值，尚未按新协议确定唯一最优策略。
 - 可信基准工具链已形成，正式 N=8 长时间矩阵留待 clean commit 和稳定 cgroup 环境执行。
 
 ## 后续计划
 
 - 完成新协议下的 N=8 正式矩阵，并如实报告均值、标准差、无效样本和 Pareto 前沿。
-- 从静态 `deadline_score` 发展语义与内存压力双反馈控制器。
-- 在线估计 layer compute、page-in 和队列时间，实现 slack 驱动的可取消批量预取。
+- 在 delegated cgroup 下校准压力、page-in、batch wait 和 value ratio 参数。
+- 只有当预测扩展同时改善端到端 Pareto 指标时，才将其纳入主方案。
 - 在更多内存限制、输入长度、模型和硬件上验证稳定性。

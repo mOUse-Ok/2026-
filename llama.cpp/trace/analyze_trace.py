@@ -1085,6 +1085,33 @@ def collect_metrics(data: dict[str, list[dict]]) -> dict:
         for policy, count in Counter(r.get("policy", "none") for r in os_hints if r.get("policy")).items():
             key = "expert_cache_policy_" + "".join(ch if ch.isalnum() else "_" for ch in policy.lower()) + "_events"
             metrics[key] = count
+        controlled_hints = [r for r in os_hints if "route_confidence" in r]
+        predicted_hints = [r for r in controlled_hints if r.get("predicted") is True]
+        metrics["expert_controller_records"] = len(controlled_hints)
+        metrics["expert_predicted_records"] = len(predicted_hints)
+        metrics["expert_predicted_prefetches"] = sum(
+            1 for r in predicted_hints if r.get("decision") == "prefetch"
+        )
+        metrics["expert_predicted_skips"] = sum(
+            1 for r in predicted_hints if r.get("decision") == "skip"
+        )
+        value_ratios = [float(r["value_ratio"]) for r in controlled_hints if isinstance(r.get("value_ratio"), (int, float))]
+        if value_ratios:
+            metrics["expert_controller_value_ratio_avg"] = float(np.mean(value_ratios))
+        slack_values = [int(r["slack_ns"]) for r in controlled_hints if isinstance(r.get("slack_ns"), (int, float))]
+        if slack_values:
+            metrics["expert_controller_slack_p50_us"] = float(np.percentile(slack_values, 50)) / 1e3
+        controller_cancel_actions = {
+            "expert_prefetch_cancel_expired",
+            "expert_prefetch_cancel_pressure",
+            "expert_prefetch_cancel_value",
+            "expert_prefetch_cancel_queue_full",
+            "expert_prefetch_skip_pressure",
+            "expert_prefetch_skip_value",
+        }
+        metrics["expert_controller_cancelled_total"] = sum(
+            1 for r in controlled_hints if r.get("action") in controller_cancel_actions
+        )
 
     async_summaries = [r for r in data["memory"] if r.get("event") == "EXPERT_ASYNC_SUMMARY"]
     if async_summaries:
@@ -1102,8 +1129,20 @@ def collect_metrics(data: dict[str, list[dict]]) -> dict:
         metrics["expert_async_queue_full_fallbacks"] = sum(int(r.get("queue_full_fallbacks", 0)) for r in async_summaries)
         metrics["expert_async_start_fail_fallbacks"] = sum(int(r.get("start_fail_fallbacks", 0)) for r in async_summaries)
         metrics["expert_async_max_queue_depth"] = max(int(r.get("max_queue_depth", 0)) for r in async_summaries)
+        metrics["expert_async_max_queued_mb"] = max(int(r.get("max_queued_bytes", 0)) for r in async_summaries) / (1024**2)
         metrics["expert_async_queue_capacity"] = max(int(r.get("queue_capacity", 0)) for r in async_summaries)
         metrics["expert_async_workers"] = max(int(r.get("workers", 0)) for r in async_summaries)
+        metrics["expert_async_cancelled_expired"] = sum(int(r.get("cancelled_expired", 0)) for r in async_summaries)
+        metrics["expert_async_cancelled_pressure"] = sum(int(r.get("cancelled_pressure", 0)) for r in async_summaries)
+        metrics["expert_async_cancelled_value"] = sum(int(r.get("cancelled_value", 0)) for r in async_summaries)
+        metrics["expert_async_cancelled_queue_full"] = sum(int(r.get("cancelled_queue_full", 0)) for r in async_summaries)
+        metrics["expert_async_worker_batches"] = sum(int(r.get("worker_batches", 0)) for r in async_summaries)
+        metrics["expert_async_batched_candidates"] = sum(int(r.get("batched_candidates", 0)) for r in async_summaries)
+        metrics["expert_async_coalesced_syscalls_saved"] = sum(
+            int(r.get("coalesced_syscalls_saved", 0)) for r in async_summaries
+        )
+        metrics["expert_async_batch_size"] = max(int(r.get("batch_size", 1)) for r in async_summaries)
+        metrics["expert_async_batch_wait_us"] = max(int(r.get("batch_wait_us", 0)) for r in async_summaries)
 
     route_hint_summaries = [r for r in data["memory"] if r.get("event") == "EXPERT_ROUTE_HINT_SUMMARY"]
     if route_hint_summaries:
@@ -1114,6 +1153,57 @@ def collect_metrics(data: dict[str, list[dict]]) -> dict:
         metrics["expert_route_hint_skipped"] = sum(int(r.get("skipped", 0)) for r in route_hint_summaries)
         metrics["expert_route_hint_duplicate_skipped"] = sum(int(r.get("duplicate_skipped", 0)) for r in route_hint_summaries)
         metrics["expert_route_hint_ttl_skipped"] = sum(int(r.get("ttl_skipped", 0)) for r in route_hint_summaries)
+
+    pressure_events = [r for r in data["memory"] if r.get("event") == "EXPERT_PRESSURE"]
+    if pressure_events:
+        metrics["expert_pressure_samples"] = len(pressure_events)
+        for level, count in Counter(str(r.get("level", "unknown")) for r in pressure_events).items():
+            metrics[f"expert_pressure_{level}_samples"] = count
+        metrics["expert_pressure_high_or_critical_samples"] = sum(
+            1 for r in pressure_events if r.get("level") in {"high", "critical"}
+        )
+        metrics["expert_pressure_memory_ratio_peak_pct"] = max(
+            float(r.get("memory_ratio_pct", 0.0)) for r in pressure_events
+        )
+        metrics["expert_pressure_psi_some_peak"] = max(float(r.get("psi_some_avg10", 0.0)) for r in pressure_events)
+        metrics["expert_pressure_psi_full_peak"] = max(float(r.get("psi_full_avg10", 0.0)) for r in pressure_events)
+        metrics["expert_pressure_refault_delta_total"] = sum(int(r.get("refault_delta", 0)) for r in pressure_events)
+        budgets = [int(r.get("prefetch_budget_bytes", 0)) for r in pressure_events]
+        metrics["expert_pressure_budget_min_mb"] = min(budgets) / (1024**2)
+        metrics["expert_pressure_budget_max_mb"] = max(budgets) / (1024**2)
+
+    prediction_summaries = [r for r in data["memory"] if r.get("event") == "EXPERT_PREDICT_SUMMARY"]
+    if prediction_summaries:
+        metrics["expert_prediction_summary_events"] = len(prediction_summaries)
+        for field in (
+            "observed_routes",
+            "learned_transitions",
+            "transition_buckets",
+            "prediction_sets",
+            "prediction_candidates",
+            "evaluated_sets",
+            "evaluated_candidates",
+            "prediction_hits",
+            "prediction_set_hits",
+            "actual_experts_evaluated",
+            "unevaluated_sets",
+            "capacity_skips",
+            "destination_replacements",
+        ):
+            metric_name = f"expert_{field}" if field.startswith("prediction_") else f"expert_prediction_{field}"
+            metrics[metric_name] = sum(int(r.get(field, 0)) for r in prediction_summaries)
+        evaluated = metrics["expert_prediction_evaluated_candidates"]
+        actual = metrics["expert_prediction_actual_experts_evaluated"]
+        evaluated_sets = metrics["expert_prediction_evaluated_sets"]
+        metrics["expert_prediction_precision_pct"] = (
+            100.0 * metrics["expert_prediction_hits"] / evaluated if evaluated else 0.0
+        )
+        metrics["expert_prediction_recall_pct"] = (
+            100.0 * metrics["expert_prediction_hits"] / actual if actual else 0.0
+        )
+        metrics["expert_prediction_set_hit_rate_pct"] = (
+            100.0 * metrics["expert_prediction_set_hits"] / evaluated_sets if evaluated_sets else 0.0
+        )
 
     return metrics
 

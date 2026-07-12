@@ -54,6 +54,9 @@
 - Linux cgroup v2：受限内存实验和 memory controller 指标采集机制。
 - Linux PSI：CPU、内存和 I/O 压力反馈接口。
 - DAMON_RECLAIM：基于访问监测的内存回收机制，作为后续闭环控制器参考。
+- FlexInfer：异步预取和受限内存下 tensor 保留方向；本项目作用于 Linux 映射页，不复制其卸载实现。
+- SP-MoE：及时预取、分析时延模型和批量 I/O 方向；本项目使用 cgroup/PSI/refault 反馈与出队重判。
+- OD-MoE：多层提前 expert 预测方向；本项目没有使用其 emulative predictor，而是实现无训练、有界的相邻层在线转移统计。
 - StreamingLLM：attention sink 与 recent window 的长上下文 KV 保留方向。
 - H2O：heavy-hitter KV cache token 保留方向；当前项目仅在文档和模拟脚本中标记其需要 attention score 埋点，未实现该算法。
 - KIVI：KV cache 量化方向；当前项目仅做 trace-driven 内存预算估算，未复制其量化实现。

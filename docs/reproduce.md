@@ -118,24 +118,38 @@ LLM_MEM_TRACE_OS_HINTS=0 \
 bash llama.cpp/trace/run_trace_pipeline.sh
 ```
 
-## 8. 单次候选策略运行
+## 8. 单次双反馈控制器运行
 
 ```bash
-RUN_NAME=deadline_score \
+RUN_NAME=feedback_slack \
 TRACE_PROFILE=benchmark \
 CACHE_MODE=cold \
 MODEL_FILE="$MODEL_FILE" \
-LLM_MEM_TRACE_OS_HINTS=1 \
-LLM_MEM_TRACE_OPT_EXPERT_PREFETCH=1 \
-LLM_MEM_TRACE_OPT_EXPERT_POLICY=route \
-LLM_MEM_TRACE_OPT_EXPERT_PREFETCH_TOPK=0 \
-LLM_MEM_TRACE_OPT_EXPERT_ASYNC=1 \
-LLM_MEM_TRACE_OPT_EXPERT_ASYNC_QUEUE=131072 \
-LLM_MEM_TRACE_OPT_EXPERT_ASYNC_WORKERS=4 \
-LLM_MEM_TRACE_OPT_EXPERT_ASYNC_PRIORITY=1 \
-LLM_MEM_TRACE_OPT_EXPERT_ASYNC_PRIORITY_MODE=deadline_score \
+LLM_MEM_TRACE_OPT_EXPERT_CONTROLLER=feedback_slack \
 bash llama.cpp/trace/run_trace_pipeline.sh
 ```
+
+增加相邻层预测实验时，将控制器改为：
+
+```bash
+LLM_MEM_TRACE_OPT_EXPERT_CONTROLLER=feedback_slack_predict
+```
+
+高层 profile 会启用异步 deadline heap、4 workers、batch=8、100 us batch wait、压力反馈、slack 和 value gate。关键调参接口如下：
+
+| 变量 | 默认值 | 含义 |
+| --- | ---: | --- |
+| `LLM_MEM_TRACE_OPT_EXPERT_CACHE_MB` | 512 | low 压力下的基础预取预算 |
+| `LLM_MEM_TRACE_OPT_EXPERT_PRESSURE_SAMPLE_MS` | 50 | cgroup/PSI/refault 采样周期 |
+| `LLM_MEM_TRACE_OPT_EXPERT_PAGEIN_MBPS` | 512 | page-in 一阶带宽估计 |
+| `LLM_MEM_TRACE_OPT_EXPERT_VALUE_MIN_RATIO` | 1.0 | 最小预计收益/成本比 |
+| `LLM_MEM_TRACE_OPT_EXPERT_ASYNC_BATCH` | 8 | worker 一次最多取出的任务数 |
+| `LLM_MEM_TRACE_OPT_EXPERT_ASYNC_BATCH_WAIT_US` | 100 | 等待相邻任务形成 micro-batch 的上限 |
+| `LLM_MEM_TRACE_OPT_EXPERT_PREDICT_TOPK` | 2 | 下一层预测候选数 |
+| `LLM_MEM_TRACE_OPT_EXPERT_PREDICT_MIN_SAMPLES` | 8 | 启用一条转移统计前的最小样本数 |
+| `LLM_MEM_TRACE_OPT_EXPERT_PREDICT_MIN_CONFIDENCE` | 0.10 | 预测候选最低置信度 |
+
+不要仅根据 prediction precision 选择策略；必须同时检查实际 predicted prefetches、取消原因、hint 数、major faults、RSS/swap 和 decode p95。
 
 ## 9. 正式重复矩阵
 
@@ -170,7 +184,7 @@ bash llama.cpp/trace/run_finalist_repeat_matrix.sh
 
 ```bash
 MEMORY_LIMITS_MB=4096,5120,6144 \
-RUN_GROUPS=baseline,deadline_score \
+RUN_GROUPS=baseline,deadline_score,feedback_slack,feedback_slack_predict \
 REPEAT_COUNT=1 \
 bash llama.cpp/trace/run_cgroup_memory_matrix.sh
 ```
@@ -181,7 +195,7 @@ bash llama.cpp/trace/run_cgroup_memory_matrix.sh
 RUN_MEMORY_PRESSURE_EXECUTE=1 \
 CGROUP_PARENT=/sys/fs/cgroup/<delegated-parent> \
 MEMORY_LIMITS_MB=4096,5120,6144 \
-RUN_GROUPS=baseline,deadline_score \
+RUN_GROUPS=baseline,deadline_score,feedback_slack,feedback_slack_predict \
 REPEAT_COUNT=8 \
 MODEL_FILE="$MODEL_FILE" \
 bash llama.cpp/trace/run_cgroup_memory_matrix.sh

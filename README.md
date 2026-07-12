@@ -22,7 +22,7 @@
 
 关键文件：
 
-- `llama.cpp/trace/tensor_trace.cpp`：OS hint、expert slice cache、异步 expert prefetch、priority queue、route TTL 等核心实现。
+- `llama.cpp/trace/tensor_trace.cpp`：OS hint、expert slice cache、异步队列、语义与压力双反馈控制、slack 取消及跨层预测核心实现。
 - `llama.cpp/trace/analyze_trace.py`：trace 分析、指标聚合和报告生成。
 - `llama.cpp/trace/trace_metrics.py`：STEP 延迟、trace-window faults 和尾延迟等无第三方依赖核心指标。
 - `llama.cpp/trace/simulate_expert_cache.py`：trace-driven expert cache 替换策略模拟。
@@ -66,23 +66,27 @@ NUM_TOKENS_PREDICT=80 \
 bash llama.cpp/trace/run_trace_pipeline.sh
 ```
 
-运行当前重点候选策略（是否优于 baseline 以受控复测为准）：
+运行当前主线“双反馈 + slack”控制器：
 
 ```bash
 MODEL_FILE=/path/to/model.gguf \
-RUN_NAME=deadline_score \
+RUN_NAME=feedback_slack \
 NUM_TOKENS_PREDICT=80 \
-LLM_MEM_TRACE_OS_HINTS=1 \
-LLM_MEM_TRACE_OPT_EXPERT_PREFETCH=1 \
-LLM_MEM_TRACE_OPT_EXPERT_POLICY=route \
-LLM_MEM_TRACE_OPT_EXPERT_PREFETCH_TOPK=0 \
-LLM_MEM_TRACE_OPT_EXPERT_ASYNC=1 \
-LLM_MEM_TRACE_OPT_EXPERT_ASYNC_QUEUE=131072 \
-LLM_MEM_TRACE_OPT_EXPERT_ASYNC_WORKERS=4 \
-LLM_MEM_TRACE_OPT_EXPERT_ASYNC_PRIORITY=1 \
-LLM_MEM_TRACE_OPT_EXPERT_ASYNC_PRIORITY_MODE=deadline_score \
+LLM_MEM_TRACE_OPT_EXPERT_CONTROLLER=feedback_slack \
 bash llama.cpp/trace/run_trace_pipeline.sh
 ```
+
+尝试带成本门控的在线相邻层预测：
+
+```bash
+MODEL_FILE=/path/to/model.gguf \
+RUN_NAME=feedback_slack_predict \
+NUM_TOKENS_PREDICT=80 \
+LLM_MEM_TRACE_OPT_EXPERT_CONTROLLER=feedback_slack_predict \
+bash llama.cpp/trace/run_trace_pipeline.sh
+```
+
+控制器读取 cgroup v2 的 `memory.current/high/max`、`memory.pressure`、`memory.swap.current` 和 `memory.stat` refault，动态缩放 expert 预取预算；队列按在线 layer EWMA 估计 deadline，在出队时取消已过期、压力过高或收益不足的任务。预测器只学习当前请求中相邻层 expert 转移，默认 top-2，并把预测命中率和实际预取决策分开统计。所有功能默认关闭，是否优于旧 `deadline_score` 以受控复测为准。
 
 输出目录默认位于 `llama.cpp/trace_output/<RUN_NAME>/`。该目录数据量较大，已在 `.gitignore` 中排除。
 
@@ -123,7 +127,7 @@ cgroup v2 受限内存矩阵 dry-run：
 
 ```bash
 MEMORY_LIMITS_MB=4096,5120 \
-RUN_GROUPS=baseline,deadline_score \
+RUN_GROUPS=baseline,deadline_score,feedback_slack,feedback_slack_predict \
 REPEAT_COUNT=1 \
 bash llama.cpp/trace/run_cgroup_memory_matrix.sh
 ```
@@ -134,7 +138,7 @@ bash llama.cpp/trace/run_cgroup_memory_matrix.sh
 RUN_MEMORY_PRESSURE_EXECUTE=1 \
 CGROUP_PARENT=/sys/fs/cgroup/<delegated-parent> \
 MEMORY_LIMITS_MB=4096,5120 \
-RUN_GROUPS=baseline,deadline_score \
+RUN_GROUPS=baseline,deadline_score,feedback_slack,feedback_slack_predict \
 bash llama.cpp/trace/run_cgroup_memory_matrix.sh
 ```
 

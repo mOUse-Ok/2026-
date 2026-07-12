@@ -34,6 +34,19 @@ DEFAULT_METRICS = [
     "expert_async_enqueued",
     "expert_async_fallback",
     "expert_async_max_queue_depth",
+    "expert_async_max_queued_mb",
+    "expert_async_cancelled_expired",
+    "expert_async_cancelled_pressure",
+    "expert_async_cancelled_value",
+    "expert_async_coalesced_syscalls_saved",
+    "expert_controller_cancelled_total",
+    "expert_pressure_high_or_critical_samples",
+    "expert_pressure_refault_delta_total",
+    "expert_pressure_budget_min_mb",
+    "expert_prediction_candidates",
+    "expert_prediction_precision_pct",
+    "expert_prediction_recall_pct",
+    "expert_prediction_set_hit_rate_pct",
     "expert_route_hint_ttl_skipped",
     "kv_total_mb",
     "kv_mb_per_1k_tokens_est",
@@ -54,6 +67,9 @@ LOWER_IS_BETTER = {
     "os_hint_events",
     "os_hint_advised_mb",
     "expert_async_fallback",
+    "expert_async_max_queued_mb",
+    "expert_pressure_high_or_critical_samples",
+    "expert_pressure_refault_delta_total",
 }
 
 ZERO_DEFAULT_METRICS = {
@@ -67,6 +83,17 @@ ZERO_DEFAULT_METRICS = {
     "expert_route_hint_ttl_skipped",
     "expert_route_hint_candidates",
     "expert_route_hint_issued",
+    "expert_async_cancelled_expired",
+    "expert_async_cancelled_pressure",
+    "expert_async_cancelled_value",
+    "expert_async_coalesced_syscalls_saved",
+    "expert_controller_cancelled_total",
+    "expert_pressure_high_or_critical_samples",
+    "expert_pressure_refault_delta_total",
+    "expert_prediction_candidates",
+    "expert_prediction_precision_pct",
+    "expert_prediction_recall_pct",
+    "expert_prediction_set_hit_rate_pct",
 }
 
 

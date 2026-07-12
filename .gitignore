@@ -66,5 +66,8 @@ llm_mem_trace_report.md
 # 草稿文档
 llmop_draft.tex
 
+# Windows 备用数据流（Linux/WSL 可能会展开成独立文件）
+*:Zone.Identifier
+
 # 本地文档和实验临时产物
 /tmp/
