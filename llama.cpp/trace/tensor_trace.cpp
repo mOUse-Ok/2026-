@@ -2,11 +2,15 @@
 #include "expert_prefetch_types.h"
 #include "expert_tensor_registry.h"
 #include "expert_prefetch_policy.h"
+#include "expert_tensor_stage.h"
+#include "expert_task_lifecycle.h"
+#include "expert_first_use_matcher.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <cctype>
@@ -120,6 +124,14 @@ bool env_truthy(const char * value) {
         return false;
     }
     return !(value[0] == '0' && value[1] == '\0');
+}
+
+bool trace_profile_is_benchmark() {
+    static const bool benchmark = [] {
+        const char * profile = std::getenv("TRACE_PROFILE");
+        return profile && std::strcmp(profile, "benchmark") == 0;
+    }();
+    return benchmark;
 }
 
 bool residency_enabled() {
@@ -370,6 +382,8 @@ struct OsHintMeta {
     bool predicted = false;
     int prediction_source_layer = -1;
     int token_idx = -1;
+    uint64_t issue_id = 0;
+    uint64_t issue_task_count = 0;
 };
 
 void write_os_hint_event(
@@ -388,7 +402,6 @@ void write_os_hint_event(
     if (!llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_MEMORY)) {
         return;
     }
-
     char addr_buf[32];
     std::snprintf(addr_buf, sizeof(addr_buf), "0x%llx", (unsigned long long) addr);
 
@@ -455,6 +468,10 @@ void write_os_hint_event(
             if (meta->token_idx >= 0) {
                 line += ",\"token_idx\":" + std::to_string(meta->token_idx);
             }
+        }
+        if (meta->issue_id != 0) {
+            line += ",\"issue_id\":" + std::to_string(meta->issue_id);
+            line += ",\"issue_task_count\":" + std::to_string(meta->issue_task_count);
         }
     }
     if (file_offset != 0) {
@@ -1470,6 +1487,27 @@ void apply_expert_prefetch_hint(
     }
 }
 
+struct ExpertTaskLifecycleRecord {
+    uint64_t task_id = 0;
+    uint64_t issue_id = 0;
+    uint64_t issue_task_count = 0;
+    ExpertTaskState state = ExpertTaskState::New;
+    uint64_t created_ts_ns = 0;
+    uint64_t enqueued_ts_ns = 0;
+    uint64_t dequeued_ts_ns = 0;
+    uint64_t issued_ts_ns = 0;
+    uint64_t returned_ts_ns = 0;
+    uint64_t step = 0;
+    int layer = -1;
+    int expert = -1;
+    int phase = LLM_MEM_TRACE_PHASE_UNKNOWN;
+    ExpertTensorStage stage = ExpertTensorStage::Unknown;
+    std::string tensor_name;
+    uintptr_t addr = 0;
+    size_t nbytes = 0;
+    double score = 0.0;
+};
+
 struct ExpertHintTask {
     std::string action;
     std::string fadvise_action;
@@ -1505,7 +1543,509 @@ struct ExpertHintTask {
     int prediction_source_layer = -1;
     int token_idx = -1;
     bool use_fadvise = false;
+    ExpertTaskLifecycleRecord lifecycle;
+    std::vector<ExpertTaskLifecycleRecord> coalesced_lifecycles;
+    uint64_t coalesced_task_count = 1;
+    uint64_t issue_id = 0;
 };
+
+enum class ExpertTaskTraceMode {
+    Off,
+    Summary,
+    Detail,
+};
+
+ExpertTaskTraceMode expert_task_trace_mode() {
+    static const ExpertTaskTraceMode mode = [] {
+        const char * configured = std::getenv("LLM_MEM_TRACE_EXPERT_TASK_MODE");
+        if (configured && configured[0]) {
+            if (std::strcmp(configured, "off") == 0) {
+                return ExpertTaskTraceMode::Off;
+            }
+            if (std::strcmp(configured, "summary") == 0) {
+                return ExpertTaskTraceMode::Summary;
+            }
+            if (std::strcmp(configured, "detail") == 0) {
+                return ExpertTaskTraceMode::Detail;
+            }
+        }
+        const char * legacy = std::getenv("LLM_MEM_TRACE_EXPERT_TASK_EVENTS");
+        if (legacy && legacy[0]) {
+            return env_truthy(legacy) ? ExpertTaskTraceMode::Detail : ExpertTaskTraceMode::Summary;
+        }
+        const char * profile = std::getenv("TRACE_PROFILE");
+        return profile && std::strcmp(profile, "benchmark") == 0 ?
+                ExpertTaskTraceMode::Summary : ExpertTaskTraceMode::Detail;
+    }();
+    return mode;
+}
+
+const char * expert_task_trace_mode_name() {
+    switch (expert_task_trace_mode()) {
+        case ExpertTaskTraceMode::Off:     return "off";
+        case ExpertTaskTraceMode::Summary: return "summary";
+        case ExpertTaskTraceMode::Detail:  return "detail";
+    }
+    return "off";
+}
+
+struct ExpertTaskLifecycleStats {
+    std::atomic<uint64_t> created{0};
+    std::atomic<uint64_t> admitted{0};
+    std::atomic<uint64_t> rejected{0};
+    std::atomic<uint64_t> enqueued{0};
+    std::atomic<uint64_t> dequeued{0};
+    std::atomic<uint64_t> issued{0};
+    std::atomic<uint64_t> cancelled{0};
+    std::atomic<uint64_t> invalid_transitions{0};
+    std::atomic<uint64_t> rejected_pressure{0};
+    std::atomic<uint64_t> rejected_value{0};
+    std::atomic<uint64_t> cancelled_pressure{0};
+    std::atomic<uint64_t> cancelled_value{0};
+    std::atomic<uint64_t> cancelled_expired{0};
+    std::atomic<uint64_t> cancelled_queue_full{0};
+    std::atomic<uint64_t> issue_groups{0};
+    std::atomic<uint64_t> coalesced_issue_groups{0};
+    std::atomic<uint64_t> same_stage_issue_groups{0};
+    std::atomic<uint64_t> cross_stage_issue_groups{0};
+    std::atomic<uint64_t> early_task_count{0};
+    std::atomic<uint64_t> late_task_count{0};
+    std::atomic<uint64_t> unknown_task_count{0};
+
+    struct DurationAggregate {
+        std::atomic<uint64_t> count{0};
+        std::atomic<uint64_t> total_ns{0};
+        std::atomic<uint64_t> min_ns{std::numeric_limits<uint64_t>::max()};
+        std::atomic<uint64_t> max_ns{0};
+    };
+    std::array<DurationAggregate, 3> queue_wait_ns;
+};
+
+ExpertTaskLifecycleStats & expert_task_lifecycle_stats() {
+    static ExpertTaskLifecycleStats stats;
+    return stats;
+}
+
+bool expert_task_detail_events_enabled() {
+    return expert_task_trace_mode() == ExpertTaskTraceMode::Detail;
+}
+
+void observe_atomic_duration(
+        ExpertTaskLifecycleStats::DurationAggregate & aggregate,
+        uint64_t duration_ns) {
+    aggregate.count.fetch_add(1, std::memory_order_relaxed);
+    aggregate.total_ns.fetch_add(duration_ns, std::memory_order_relaxed);
+    uint64_t minimum = aggregate.min_ns.load(std::memory_order_relaxed);
+    while (duration_ns < minimum &&
+            !aggregate.min_ns.compare_exchange_weak(
+                    minimum, duration_ns, std::memory_order_relaxed)) {
+    }
+    uint64_t maximum = aggregate.max_ns.load(std::memory_order_relaxed);
+    while (duration_ns > maximum &&
+            !aggregate.max_ns.compare_exchange_weak(
+                    maximum, duration_ns, std::memory_order_relaxed)) {
+    }
+}
+
+void record_expert_task_event_count(
+        ExpertTaskEvent event,
+        uint64_t count,
+        const char * reason,
+        ExpertTensorStage stage = ExpertTensorStage::Unknown) {
+    ExpertTaskLifecycleStats & stats = expert_task_lifecycle_stats();
+    switch (event) {
+        case ExpertTaskEvent::Create:
+            stats.created.fetch_add(count, std::memory_order_relaxed);
+            switch (stage) {
+                case ExpertTensorStage::Early:
+                    stats.early_task_count.fetch_add(count, std::memory_order_relaxed);
+                    break;
+                case ExpertTensorStage::Late:
+                    stats.late_task_count.fetch_add(count, std::memory_order_relaxed);
+                    break;
+                case ExpertTensorStage::Unknown:
+                    stats.unknown_task_count.fetch_add(count, std::memory_order_relaxed);
+                    break;
+            }
+            break;
+        case ExpertTaskEvent::Admit:   stats.admitted.fetch_add(count, std::memory_order_relaxed); break;
+        case ExpertTaskEvent::Reject:  stats.rejected.fetch_add(count, std::memory_order_relaxed); break;
+        case ExpertTaskEvent::Enqueue: stats.enqueued.fetch_add(count, std::memory_order_relaxed); break;
+        case ExpertTaskEvent::Dequeue: stats.dequeued.fetch_add(count, std::memory_order_relaxed); break;
+        case ExpertTaskEvent::Issue:   stats.issued.fetch_add(count, std::memory_order_relaxed); break;
+        case ExpertTaskEvent::Cancel:  stats.cancelled.fetch_add(count, std::memory_order_relaxed); break;
+    }
+    if (!reason || count == 0) {
+        return;
+    }
+    if (event == ExpertTaskEvent::Reject) {
+        if (std::strcmp(reason, "pressure_budget") == 0) {
+            stats.rejected_pressure.fetch_add(count, std::memory_order_relaxed);
+        } else if (std::strcmp(reason, "benefit_below_cost") == 0) {
+            stats.rejected_value.fetch_add(count, std::memory_order_relaxed);
+        }
+    } else if (event == ExpertTaskEvent::Cancel) {
+        if (std::strcmp(reason, "pressure_changed") == 0) {
+            stats.cancelled_pressure.fetch_add(count, std::memory_order_relaxed);
+        } else if (std::strcmp(reason, "value_changed") == 0) {
+            stats.cancelled_value.fetch_add(count, std::memory_order_relaxed);
+        } else if (std::strcmp(reason, "deadline_missed") == 0) {
+            stats.cancelled_expired.fetch_add(count, std::memory_order_relaxed);
+        } else if (std::strcmp(reason, "queue_full") == 0) {
+            stats.cancelled_queue_full.fetch_add(count, std::memory_order_relaxed);
+        }
+    }
+}
+
+void write_expert_task_event(
+        const ExpertTaskLifecycleRecord & task,
+        ExpertTaskEvent event,
+        uint64_t event_ts_ns,
+        const char * reason) {
+    if (!expert_task_detail_events_enabled() ||
+            !llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_MEMORY)) {
+        return;
+    }
+    char addr_buf[32];
+    std::snprintf(addr_buf, sizeof(addr_buf), "0x%llx", (unsigned long long) task.addr);
+    std::string line;
+    line.reserve(320);
+    line += "{\"event\":\"EXPERT_TASK\",\"ts_ns\":" + std::to_string(event_ts_ns);
+    line += ",\"lifecycle_event\":\"" + std::string(expert_task_event_name(event)) + "\"";
+    line += ",\"state\":\"" + std::string(expert_task_state_name(task.state)) + "\"";
+    line += ",\"task_id\":" + std::to_string(task.task_id);
+    if (task.issue_id != 0) {
+        line += ",\"issue_id\":" + std::to_string(task.issue_id);
+        line += ",\"issue_task_count\":" + std::to_string(task.issue_task_count);
+    }
+    line += ",\"step\":" + std::to_string(task.step);
+    line += ",\"layer\":" + std::to_string(task.layer);
+    line += ",\"expert\":" + std::to_string(task.expert);
+    line += ",\"phase\":\"" + std::string(phase_name(task.phase)) + "\"";
+    line += ",\"stage\":\"" + std::string(expert_tensor_stage_name(task.stage)) + "\"";
+    line += ",\"tensor\":";
+    json_escape_append(line, task.tensor_name.c_str());
+    line += ",\"addr\":";
+    json_escape_append(line, addr_buf);
+    line += ",\"nbytes\":" + std::to_string(task.nbytes);
+    line += ",\"score\":" + std::to_string(task.score);
+    line += ",\"created_ts_ns\":" + std::to_string(task.created_ts_ns);
+    line += ",\"enqueued_ts_ns\":" + std::to_string(task.enqueued_ts_ns);
+    line += ",\"dequeued_ts_ns\":" + std::to_string(task.dequeued_ts_ns);
+    line += ",\"issued_ts_ns\":" + std::to_string(task.issued_ts_ns);
+    if (task.enqueued_ts_ns != 0 && task.dequeued_ts_ns >= task.enqueued_ts_ns) {
+        line += ",\"queue_wait_ns\":" +
+                std::to_string(task.dequeued_ts_ns - task.enqueued_ts_ns);
+    } else {
+        line += ",\"queue_wait_ns\":null";
+    }
+    if (task.returned_ts_ns != 0) {
+        line += ",\"returned_ts_ns\":" + std::to_string(task.returned_ts_ns);
+    }
+    if (reason && reason[0]) {
+        line += ",\"reason\":";
+        json_escape_append(line, reason);
+    }
+    if (event == ExpertTaskEvent::Issue) {
+        line += ",\"hint_status\":\"returned\"";
+    }
+    line += "}";
+    llm_mem_trace_write(LLM_MEM_TRACE_SINK_MEMORY, line.c_str(), line.size());
+}
+
+bool transition_expert_task(
+        ExpertTaskLifecycleRecord & task,
+        ExpertTaskEvent event,
+        const char * reason = nullptr,
+        uint64_t issued_ts_ns = 0,
+        uint64_t returned_ts_ns = 0) {
+    if (expert_task_trace_mode() == ExpertTaskTraceMode::Off) {
+        return true;
+    }
+    const bool needs_timestamp = expert_task_trace_mode() != ExpertTaskTraceMode::Off;
+    const uint64_t now = returned_ts_ns != 0 ? returned_ts_ns :
+            (needs_timestamp ? llm_mem_trace_time_ns() : 0);
+    if (!expert_task_apply_event(task.state, event)) {
+        expert_task_lifecycle_stats().invalid_transitions.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    switch (event) {
+        case ExpertTaskEvent::Create:  task.created_ts_ns = now; break;
+        case ExpertTaskEvent::Enqueue: task.enqueued_ts_ns = now; break;
+        case ExpertTaskEvent::Dequeue:
+            task.dequeued_ts_ns = now;
+            if (task.enqueued_ts_ns != 0 && now >= task.enqueued_ts_ns) {
+                observe_atomic_duration(
+                        expert_task_lifecycle_stats().queue_wait_ns[
+                                expert_tensor_stage_index(task.stage)],
+                        now - task.enqueued_ts_ns);
+            }
+            break;
+        case ExpertTaskEvent::Issue:
+            task.issued_ts_ns = issued_ts_ns != 0 ? issued_ts_ns : now;
+            task.returned_ts_ns = returned_ts_ns != 0 ? returned_ts_ns : now;
+            break;
+        case ExpertTaskEvent::Admit:
+        case ExpertTaskEvent::Reject:
+        case ExpertTaskEvent::Cancel:
+            break;
+    }
+    record_expert_task_event_count(event, 1, reason, task.stage);
+    write_expert_task_event(task, event, now, reason);
+    return true;
+}
+
+void append_atomic_stage_duration_map(
+        std::string & line,
+        const char * field,
+        const std::array<ExpertTaskLifecycleStats::DurationAggregate, 3> & aggregates) {
+    static const ExpertTensorStage stages[] = {
+        ExpertTensorStage::Early,
+        ExpertTensorStage::Late,
+        ExpertTensorStage::Unknown,
+    };
+    line += ",\"" + std::string(field) + "\":{";
+    for (size_t i = 0; i < 3; ++i) {
+        if (i != 0) {
+            line += ",";
+        }
+        const ExpertTaskLifecycleStats::DurationAggregate & aggregate = aggregates[i];
+        const uint64_t count = aggregate.count.load(std::memory_order_relaxed);
+        const uint64_t minimum = aggregate.min_ns.load(std::memory_order_relaxed);
+        line += "\"" + std::string(expert_tensor_stage_name(stages[i])) + "\":{";
+        line += "\"count\":" + std::to_string(count);
+        line += ",\"total_ns\":" +
+                std::to_string(aggregate.total_ns.load(std::memory_order_relaxed));
+        line += ",\"min_ns\":" +
+                std::to_string(count == 0 || minimum == std::numeric_limits<uint64_t>::max() ? 0 : minimum);
+        line += ",\"max_ns\":" +
+                std::to_string(aggregate.max_ns.load(std::memory_order_relaxed));
+        line += "}";
+    }
+    line += "}";
+}
+
+void write_expert_task_summary() {
+    if (!llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_MEMORY)) {
+        return;
+    }
+    const ExpertTaskLifecycleStats & stats = expert_task_lifecycle_stats();
+    const uint64_t created = stats.created.load(std::memory_order_relaxed);
+    const uint64_t rejected = stats.rejected.load(std::memory_order_relaxed);
+    const uint64_t issued = stats.issued.load(std::memory_order_relaxed);
+    const uint64_t cancelled = stats.cancelled.load(std::memory_order_relaxed);
+    const uint64_t terminal = rejected + issued + cancelled;
+    std::string line;
+    line.reserve(320);
+    line += "{\"event\":\"EXPERT_TASK_SUMMARY\",\"ts_ns\":" + std::to_string(llm_mem_trace_time_ns());
+    line += ",\"trace_mode\":\"" + std::string(expert_task_trace_mode_name()) + "\"";
+    line += ",\"detail_events_enabled\":" + std::string(expert_task_detail_events_enabled() ? "true" : "false");
+    line += ",\"created\":" + std::to_string(created);
+    line += ",\"admitted\":" + std::to_string(stats.admitted.load(std::memory_order_relaxed));
+    line += ",\"rejected\":" + std::to_string(rejected);
+    line += ",\"enqueued\":" + std::to_string(stats.enqueued.load(std::memory_order_relaxed));
+    line += ",\"dequeued\":" + std::to_string(stats.dequeued.load(std::memory_order_relaxed));
+    line += ",\"issued\":" + std::to_string(issued);
+    line += ",\"cancelled\":" + std::to_string(cancelled);
+    line += ",\"terminal\":" + std::to_string(terminal);
+    line += ",\"in_flight\":" + std::to_string(created >= terminal ? created - terminal : 0);
+    line += ",\"invalid_transitions\":" + std::to_string(stats.invalid_transitions.load(std::memory_order_relaxed));
+    line += ",\"rejected_pressure\":" + std::to_string(stats.rejected_pressure.load(std::memory_order_relaxed));
+    line += ",\"rejected_value\":" + std::to_string(stats.rejected_value.load(std::memory_order_relaxed));
+    line += ",\"cancelled_pressure\":" + std::to_string(stats.cancelled_pressure.load(std::memory_order_relaxed));
+    line += ",\"cancelled_value\":" + std::to_string(stats.cancelled_value.load(std::memory_order_relaxed));
+    line += ",\"cancelled_expired\":" + std::to_string(stats.cancelled_expired.load(std::memory_order_relaxed));
+    line += ",\"cancelled_queue_full\":" + std::to_string(stats.cancelled_queue_full.load(std::memory_order_relaxed));
+    line += ",\"issue_groups\":" + std::to_string(stats.issue_groups.load(std::memory_order_relaxed));
+    line += ",\"coalesced_issue_groups\":" + std::to_string(stats.coalesced_issue_groups.load(std::memory_order_relaxed));
+    line += ",\"same_stage_issue_groups\":" +
+            std::to_string(stats.same_stage_issue_groups.load(std::memory_order_relaxed));
+    line += ",\"cross_stage_issue_groups\":" +
+            std::to_string(stats.cross_stage_issue_groups.load(std::memory_order_relaxed));
+    line += ",\"early_task_count\":" +
+            std::to_string(stats.early_task_count.load(std::memory_order_relaxed));
+    line += ",\"late_task_count\":" +
+            std::to_string(stats.late_task_count.load(std::memory_order_relaxed));
+    line += ",\"unknown_task_count\":" +
+            std::to_string(stats.unknown_task_count.load(std::memory_order_relaxed));
+    append_atomic_stage_duration_map(line, "queue_wait_ns_by_stage", stats.queue_wait_ns);
+    line += "}";
+    llm_mem_trace_write(LLM_MEM_TRACE_SINK_MEMORY, line.c_str(), line.size());
+}
+
+void ensure_expert_task_summary_registered() {
+    // Construct the counters before registering the writer so the atexit
+    // callback observes a live stats object.
+    (void) expert_task_lifecycle_stats();
+    static const bool registered = [] {
+        std::atexit(write_expert_task_summary);
+        return true;
+    }();
+    (void) registered;
+}
+
+uint64_t next_expert_task_id() {
+    static std::atomic<uint64_t> next_id{1};
+    return next_id.fetch_add(1, std::memory_order_relaxed);
+}
+
+uint64_t next_expert_issue_id() {
+    static std::atomic<uint64_t> next_id{1};
+    return next_id.fetch_add(1, std::memory_order_relaxed);
+}
+
+ExpertFirstUseMatcher & expert_first_use_matcher() {
+    static ExpertFirstUseMatcher matcher;
+    return matcher;
+}
+
+void append_stage_duration_map(
+        std::string & line,
+        const char * field,
+        const std::array<ExpertDurationAggregate, 3> & aggregates) {
+    static const ExpertTensorStage stages[] = {
+        ExpertTensorStage::Early,
+        ExpertTensorStage::Late,
+        ExpertTensorStage::Unknown,
+    };
+    line += ",\"" + std::string(field) + "\":{";
+    for (size_t i = 0; i < 3; ++i) {
+        if (i != 0) {
+            line += ",";
+        }
+        const ExpertDurationAggregate & aggregate = aggregates[i];
+        line += "\"" + std::string(expert_tensor_stage_name(stages[i])) + "\":{";
+        line += "\"count\":" + std::to_string(aggregate.count);
+        line += ",\"total_ns\":" + std::to_string(aggregate.total_ns);
+        line += ",\"min_ns\":" + std::to_string(aggregate.min_ns);
+        line += ",\"max_ns\":" + std::to_string(aggregate.max_ns);
+        line += "}";
+    }
+    line += "}";
+}
+
+void write_expert_first_use_summary() {
+    if (!llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_MEMORY) ||
+            expert_task_trace_mode() == ExpertTaskTraceMode::Off) {
+        return;
+    }
+    const ExpertFirstUseCounters counters = expert_first_use_matcher().counters();
+    std::string line;
+    line.reserve(320);
+    line += "{\"event\":\"EXPERT_FIRST_USE_SUMMARY\",\"ts_ns\":" +
+            std::to_string(llm_mem_trace_time_ns());
+    line += ",\"semantics\":\"logical_first_use\",\"physical_load_observed\":false";
+    line += ",\"eligible_tasks\":" + std::to_string(counters.eligible_tasks);
+    line += ",\"logical_first_uses\":" + std::to_string(counters.logical_first_uses);
+    line += ",\"matched_tasks\":" + std::to_string(counters.matched_tasks);
+    line += ",\"unmatched_tasks\":" + std::to_string(counters.unmatched_tasks);
+    line += ",\"unmatched_first_uses\":" + std::to_string(counters.unmatched_first_uses);
+    line += ",\"ambiguous_matches\":" + std::to_string(counters.ambiguous_matches);
+    line += ",\"duplicate_first_use_ignored\":" +
+            std::to_string(counters.duplicate_first_use_ignored);
+    line += ",\"matcher_peak_live_tasks\":" +
+            std::to_string(counters.matcher_peak_live_tasks);
+    line += ",\"matcher_expired_tasks\":" +
+            std::to_string(counters.matcher_expired_tasks);
+    line += ",\"late_issued_tasks\":" + std::to_string(counters.late_issued_tasks);
+    line += ",\"pending_issued_tasks\":" + std::to_string(counters.pending_issued_tasks);
+    line += ",\"ignored_old_uses\":" + std::to_string(counters.ignored_old_uses);
+    append_stage_duration_map(
+            line, "create_to_first_use_ns_by_stage", counters.create_to_first_use_ns);
+    line += "}";
+    llm_mem_trace_write(LLM_MEM_TRACE_SINK_MEMORY, line.c_str(), line.size());
+}
+
+void ensure_expert_first_use_summary_registered() {
+    (void) expert_first_use_matcher();
+    static const bool registered = [] {
+        std::atexit(write_expert_first_use_summary);
+        return true;
+    }();
+    (void) registered;
+}
+
+void register_expert_task_for_first_use(const ExpertTaskLifecycleRecord & task) {
+    if (expert_task_trace_mode() == ExpertTaskTraceMode::Off) {
+        return;
+    }
+    ExpertIssuedTask issued;
+    issued.task_id = task.task_id;
+    issued.issue_id = task.issue_id;
+    issued.step = task.step;
+    issued.layer = task.layer;
+    issued.expert = task.expert;
+    issued.phase = task.phase;
+    issued.stage = task.stage;
+    issued.tensor = task.tensor_name;
+    issued.addr = task.addr;
+    issued.nbytes = task.nbytes;
+    issued.created_ts_ns = task.created_ts_ns;
+    issued.enqueued_ts_ns = task.enqueued_ts_ns;
+    issued.dequeued_ts_ns = task.dequeued_ts_ns;
+    issued.issued_ts_ns = task.issued_ts_ns;
+    expert_first_use_matcher().register_issue(std::move(issued));
+}
+
+void write_expert_first_use_event(const ExpertFirstUseMatch & match) {
+    if (!match.considered || !expert_task_detail_events_enabled() ||
+            !llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_MEMORY)) {
+        return;
+    }
+    char addr_buf[32];
+    std::snprintf(addr_buf, sizeof(addr_buf), "0x%llx", (unsigned long long) match.use.addr);
+    const auto write_one = [&](const ExpertIssuedTask * task, size_t match_index) {
+        std::string line;
+        line.reserve(480);
+        line += "{\"event\":\"EXPERT_FIRST_USE\",\"ts_ns\":" +
+                std::to_string(match.use.first_use_ts_ns);
+        line += ",\"semantics\":\"logical_first_use\",\"physical_load_observed\":false";
+        line += ",\"matched\":" + std::string(task ? "true" : "false");
+        line += ",\"match_count\":" + std::to_string(match.tasks.size());
+        line += ",\"match_index\":" + std::to_string(match_index);
+        line += ",\"ambiguous_match\":" + std::string(match.ambiguous() ? "true" : "false");
+        line += ",\"step\":" + std::to_string(match.use.step);
+        line += ",\"layer\":" + std::to_string(match.use.layer);
+        line += ",\"expert\":" + std::to_string(match.use.expert);
+        line += ",\"phase\":\"" + std::string(phase_name(match.use.phase)) + "\"";
+        line += ",\"stage\":\"" +
+                std::string(expert_tensor_stage_name(match.use.stage)) + "\"";
+        line += ",\"tensor\":";
+        json_escape_append(line, match.use.tensor.c_str());
+        line += ",\"addr\":";
+        json_escape_append(line, addr_buf);
+        line += ",\"nbytes\":" + std::to_string(match.use.nbytes);
+        line += ",\"first_use_ts_ns\":" + std::to_string(match.use.first_use_ts_ns);
+        if (task) {
+            line += ",\"task_id\":" + std::to_string(task->task_id);
+            line += ",\"issue_id\":" + std::to_string(task->issue_id);
+            line += ",\"issued_ts_ns\":" + std::to_string(task->issued_ts_ns);
+            line += ",\"create_to_first_use_ns\":" +
+                    std::to_string(match.use.first_use_ts_ns - task->created_ts_ns);
+            line += ",\"issue_to_first_use_ns\":" +
+                    std::to_string(match.use.first_use_ts_ns - task->issued_ts_ns);
+            const uint64_t queue_wait_ns = task->enqueued_ts_ns != 0 &&
+                    task->dequeued_ts_ns >= task->enqueued_ts_ns ?
+                    task->dequeued_ts_ns - task->enqueued_ts_ns : 0;
+            line += ",\"queue_wait_ns\":" + std::to_string(queue_wait_ns);
+        } else {
+            line += ",\"create_to_first_use_ns\":null";
+            line += ",\"issue_to_first_use_ns\":null";
+            line += ",\"queue_wait_ns\":null";
+            line += ",\"unmatched_reason\":";
+            json_escape_append(line, match.unmatched_reason.c_str());
+        }
+        line += "}";
+        llm_mem_trace_write(LLM_MEM_TRACE_SINK_MEMORY, line.c_str(), line.size());
+    };
+    if (match.tasks.empty()) {
+        write_one(nullptr, 0);
+        return;
+    }
+    for (size_t i = 0; i < match.tasks.size(); ++i) {
+        write_one(&match.tasks[i], i);
+    }
+}
 
 void apply_pressure_snapshot(ExpertHintTask & task, const ExpertPressureSnapshot & pressure) {
     task.pressure_level = pressure.level;
@@ -1595,19 +2135,70 @@ void fill_expert_task_meta(const ExpertHintTask & task, OsHintMeta & meta, const
     meta.predicted = task.predicted;
     meta.prediction_source_layer = task.prediction_source_layer;
     meta.token_idx = task.token_idx;
+    meta.issue_id = task.issue_id;
+    meta.issue_task_count = task.coalesced_task_count;
 }
 
 void write_expert_task_skip(const ExpertHintTask & task, const char * action, const char * trigger) {
+    // The task summary already aggregates these new reject/cancel reasons.
+    // Preserve all pre-existing OS_HINT records outside this task path.
+    if (trace_profile_is_benchmark()) {
+        return;
+    }
     OsHintMeta meta;
     fill_expert_task_meta(task, meta, "skip");
     write_os_hint_event(action, trigger ? trigger : task.trigger.c_str(), task.tensor_name.c_str(),
                         task.layer, task.expert, task.addr, task.nbytes, 0, 0, 0, 0, &meta);
 }
 
-uint64_t issue_expert_hint_task(const ExpertHintTask & task) {
+void record_expert_issue_group_stage(const ExpertHintTask & task) {
+    bool stages[3] = {false, false, false};
+    if (task.coalesced_lifecycles.empty()) {
+        stages[expert_tensor_stage_index(task.lifecycle.stage)] = true;
+    } else {
+        for (const ExpertTaskLifecycleRecord & lifecycle : task.coalesced_lifecycles) {
+            stages[expert_tensor_stage_index(lifecycle.stage)] = true;
+        }
+    }
+    const size_t distinct = (size_t) stages[0] + (size_t) stages[1] + (size_t) stages[2];
+    ExpertTaskLifecycleStats & stats = expert_task_lifecycle_stats();
+    if (distinct > 1) {
+        stats.cross_stage_issue_groups.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        stats.same_stage_issue_groups.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+uint64_t issue_expert_hint_task(ExpertHintTask & task) {
+    if (expert_task_detail_events_enabled()) {
+        task.issue_id = next_expert_issue_id();
+    }
+    if (expert_task_trace_mode() != ExpertTaskTraceMode::Off) {
+        ExpertTaskLifecycleStats & stats = expert_task_lifecycle_stats();
+        stats.issue_groups.fetch_add(1, std::memory_order_relaxed);
+        if (task.coalesced_task_count > 1) {
+            stats.coalesced_issue_groups.fetch_add(1, std::memory_order_relaxed);
+        }
+        record_expert_issue_group_stage(task);
+    }
+    const uint64_t begin = llm_mem_trace_time_ns();
+    if (expert_task_trace_mode() != ExpertTaskTraceMode::Off) {
+        const auto prepare = [&](ExpertTaskLifecycleRecord & lifecycle) {
+            lifecycle.issue_id = task.issue_id;
+            lifecycle.issue_task_count = task.coalesced_task_count;
+            lifecycle.issued_ts_ns = begin;
+            register_expert_task_for_first_use(lifecycle);
+        };
+        if (task.coalesced_lifecycles.empty()) {
+            prepare(task.lifecycle);
+        } else {
+            for (ExpertTaskLifecycleRecord & lifecycle : task.coalesced_lifecycles) {
+                prepare(lifecycle);
+            }
+        }
+    }
     OsHintMeta meta;
     fill_expert_task_meta(task, meta, "prefetch");
-    const uint64_t begin = llm_mem_trace_time_ns();
 #ifdef __linux__
     apply_madvise_hint(task.action.c_str(), MADV_WILLNEED, task.trigger.c_str(),
                        task.tensor_name.c_str(), task.layer, task.expert, task.addr, task.nbytes, &meta);
@@ -1622,6 +2213,17 @@ uint64_t issue_expert_hint_task(const ExpertHintTask & task) {
     const uint64_t end = llm_mem_trace_time_ns();
     const uint64_t duration = end >= begin ? end - begin : 0;
     expert_timing_model().observe_syscall(duration);
+    if (task.coalesced_lifecycles.empty()) {
+        transition_expert_task(task.lifecycle, ExpertTaskEvent::Issue, nullptr, begin, end);
+        if (task.coalesced_task_count > 1) {
+            record_expert_task_event_count(
+                    ExpertTaskEvent::Issue, task.coalesced_task_count - 1, nullptr);
+        }
+    } else {
+        for (ExpertTaskLifecycleRecord & lifecycle : task.coalesced_lifecycles) {
+            transition_expert_task(lifecycle, ExpertTaskEvent::Issue, nullptr, begin, end);
+        }
+    }
     return duration;
 }
 
@@ -1667,6 +2269,19 @@ std::vector<ExpertHintTask> coalesce_expert_hint_batch(std::vector<ExpertHintTas
             continue;
         }
 
+        current.coalesced_task_count += task.coalesced_task_count;
+        if (expert_task_trace_mode() != ExpertTaskTraceMode::Off) {
+            if (current.coalesced_lifecycles.empty()) {
+                current.coalesced_lifecycles.push_back(current.lifecycle);
+            }
+            if (task.coalesced_lifecycles.empty()) {
+                current.coalesced_lifecycles.push_back(std::move(task.lifecycle));
+            } else {
+                for (ExpertTaskLifecycleRecord & lifecycle : task.coalesced_lifecycles) {
+                    current.coalesced_lifecycles.push_back(std::move(lifecycle));
+                }
+            }
+        }
         const uintptr_t end = std::max(current_end, expert_task_range_end(task));
         current.nbytes = end > current.addr ? (size_t) (end - current.addr) : current.nbytes;
         if (current.expert != task.expert) {
@@ -1740,6 +2355,7 @@ struct ExpertHintQueue {
             }
             const uint64_t task_bytes = (uint64_t) task.nbytes;
             task.sequence = next_sequence++;
+            transition_expert_task(task.lifecycle, ExpertTaskEvent::Enqueue);
             if (priority_enabled && priority_heap_enabled) {
                 priority_heap.emplace_back(std::move(task));
                 auto cmp = [this](const ExpertHintTask & a, const ExpertHintTask & b) {
@@ -1855,6 +2471,10 @@ struct ExpertHintQueue {
                 batched_candidates += count;
             }
 
+            for (ExpertHintTask & task : batch) {
+                transition_expert_task(task.lifecycle, ExpertTaskEvent::Dequeue);
+            }
+
             std::vector<ExpertHintTask> ready;
             ready.reserve(batch.size());
             for (ExpertHintTask & task : batch) {
@@ -1864,12 +2484,16 @@ struct ExpertHintQueue {
                 }
                 refresh_expert_task_estimate(task);
                 if (expert_task_exceeds_pressure_budget(task, 0)) {
+                    transition_expert_task(
+                            task.lifecycle, ExpertTaskEvent::Cancel, "pressure_changed");
                     write_expert_task_skip(task, "expert_prefetch_cancel_pressure", "pressure_changed");
                     std::lock_guard<std::mutex> lock(mu);
                     cancelled_pressure++;
                     continue;
                 }
                 if (expert_task_below_value_threshold(task)) {
+                    transition_expert_task(
+                            task.lifecycle, ExpertTaskEvent::Cancel, "value_changed");
                     write_expert_task_skip(task, "expert_prefetch_cancel_value", "value_changed");
                     std::lock_guard<std::mutex> lock(mu);
                     cancelled_value++;
@@ -1877,6 +2501,8 @@ struct ExpertHintQueue {
                 }
                 if (expert_slack_enabled() && task.deadline_ts_ns != 0 &&
                         now + task.predicted_service_ns >= task.deadline_ts_ns) {
+                    transition_expert_task(
+                            task.lifecycle, ExpertTaskEvent::Cancel, "deadline_missed");
                     write_expert_task_skip(task, "expert_prefetch_cancel_expired", "deadline_missed");
                     std::lock_guard<std::mutex> lock(mu);
                     cancelled_expired++;
@@ -2149,6 +2775,7 @@ ExpertTaskGateResult prepare_expert_hint_task(ExpertHintTask & task) {
 bool submit_expert_hint_task(ExpertHintTask && task) {
     const ExpertTaskGateResult gate = prepare_expert_hint_task(task);
     if (gate == ExpertTaskGateResult::Pressure) {
+        transition_expert_task(task.lifecycle, ExpertTaskEvent::Reject, "pressure_budget");
         write_expert_task_skip(task, "expert_prefetch_skip_pressure", "pressure_budget");
         if (expert_prefetch_async_enabled()) {
             expert_hint_queue().record_cancelled_pressure();
@@ -2156,12 +2783,14 @@ bool submit_expert_hint_task(ExpertHintTask && task) {
         return false;
     }
     if (gate == ExpertTaskGateResult::Value) {
+        transition_expert_task(task.lifecycle, ExpertTaskEvent::Reject, "benefit_below_cost");
         write_expert_task_skip(task, "expert_prefetch_skip_value", "benefit_below_cost");
         if (expert_prefetch_async_enabled()) {
             expert_hint_queue().record_cancelled_value();
         }
         return false;
     }
+    transition_expert_task(task.lifecycle, ExpertTaskEvent::Admit);
     if (expert_prefetch_async_enabled()) {
         static const bool registered = [] {
             std::atexit(shutdown_expert_hint_queue);
@@ -2173,6 +2802,7 @@ bool submit_expert_hint_task(ExpertHintTask && task) {
         }
         if (!expert_prefetch_async_fallback_enabled() || expert_slack_enabled()) {
             expert_hint_queue().record_cancelled_queue_full();
+            transition_expert_task(task.lifecycle, ExpertTaskEvent::Cancel, "queue_full");
             write_expert_task_skip(task, "expert_prefetch_cancel_queue_full", "queue_full");
             return false;
         }
@@ -2221,6 +2851,23 @@ ExpertHintTask make_expert_hint_task(
     task.phase = llm_mem_trace_get_phase();
     task.step = llm_mem_trace_get_step();
     task.use_fadvise = os_hint_opt_enabled("LLM_MEM_TRACE_OPT_POSIX_FADVISE");
+    if (expert_task_trace_mode() != ExpertTaskTraceMode::Off) {
+        task.lifecycle.step = task.step;
+        task.lifecycle.layer = task.layer;
+        task.lifecycle.expert = task.expert;
+        task.lifecycle.phase = task.phase;
+        task.lifecycle.stage = classify_expert_tensor_stage(task.tensor_name.c_str());
+        task.lifecycle.tensor_name = task.tensor_name;
+        task.lifecycle.addr = task.addr;
+        task.lifecycle.nbytes = task.nbytes;
+        task.lifecycle.score = task.route_score;
+        ensure_expert_task_summary_registered();
+        ensure_expert_first_use_summary_registered();
+    }
+    if (expert_task_detail_events_enabled()) {
+        task.lifecycle.task_id = next_expert_task_id();
+    }
+    transition_expert_task(task.lifecycle, ExpertTaskEvent::Create);
     return task;
 }
 
@@ -3076,6 +3723,90 @@ bool is_layer_end_tensor(const char * name) {
     return std::strstr(name, "ffn_out") || std::strstr(name, "ffn_moe_out");
 }
 
+bool host_readable_tensor(const ggml_tensor * t) {
+    if (!t || !t->data) {
+        return false;
+    }
+    ggml_backend_buffer_t buffer = t->view_src ? t->view_src->buffer : t->buffer;
+    return buffer && ggml_backend_buffer_is_host(buffer);
+}
+
+int read_expert_id(const ggml_tensor * ids, int64_t index0, int64_t index1) {
+    const char * ptr = static_cast<const char *>(ids->data) +
+            (size_t) index0 * ids->nb[0] + (size_t) index1 * ids->nb[1];
+    if (ids->type == GGML_TYPE_I32) {
+        int32_t value = -1;
+        std::memcpy(&value, ptr, sizeof(value));
+        return value;
+    }
+    if (ids->type == GGML_TYPE_I64) {
+        int64_t value = -1;
+        std::memcpy(&value, ptr, sizeof(value));
+        return (int) value;
+    }
+    return -1;
+}
+
+void observe_expert_logical_first_use(const ggml_tensor * operation) {
+    if (expert_task_trace_mode() == ExpertTaskTraceMode::Off || !operation ||
+            operation->op != GGML_OP_MUL_MAT_ID) {
+        return;
+    }
+    ensure_expert_task_summary_registered();
+    ensure_expert_first_use_summary_registered();
+    const ggml_tensor * weights = operation->src[0];
+    const ggml_tensor * ids = operation->src[2];
+    const char * tensor_name = weights ? ggml_get_name(weights) : nullptr;
+    if (!weights || !ids || !is_expert_weight_tensor_name(tensor_name) ||
+            !host_readable_tensor(ids) ||
+            (ids->type != GGML_TYPE_I32 && ids->type != GGML_TYPE_I64)) {
+        return;
+    }
+
+    ExpertTensorInfo info;
+    info.name = tensor_name ? tensor_name : "";
+    info.layer = parse_layer_from_name(tensor_name);
+    info.addr = tensor_addr(weights);
+    info.nbytes = ggml_nbytes(weights);
+    info.n_expert = weights->ne[2];
+    info.expert_stride = (size_t) weights->nb[2];
+    if (info.layer < 0 || info.addr == 0 || info.nbytes == 0 ||
+            info.n_expert <= 0 || info.expert_stride == 0) {
+        return;
+    }
+
+    std::unordered_set<int> experts;
+    for (int64_t token = 0; token < ids->ne[1]; ++token) {
+        for (int64_t rank = 0; rank < ids->ne[0]; ++rank) {
+            const int expert = read_expert_id(ids, rank, token);
+            if (expert >= 0 && expert < info.n_expert) {
+                experts.insert(expert);
+            }
+        }
+    }
+
+    const uint64_t step = llm_mem_trace_get_step();
+    const uint64_t first_use_ts_ns = llm_mem_trace_time_ns();
+    for (int expert : experts) {
+        uintptr_t slice_addr = 0;
+        size_t slice_bytes = 0;
+        if (!expert_slice_range(info, expert, slice_addr, slice_bytes)) {
+            continue;
+        }
+        ExpertFirstUseObservation use;
+        use.step = step;
+        use.layer = info.layer;
+        use.expert = expert;
+        use.phase = llm_mem_trace_get_phase();
+        use.stage = classify_expert_tensor_stage(info.name.c_str());
+        use.tensor = info.name;
+        use.addr = slice_addr;
+        use.nbytes = slice_bytes;
+        use.first_use_ts_ns = first_use_ts_ns;
+        write_expert_first_use_event(expert_first_use_matcher().observe_first_use(std::move(use)));
+    }
+}
+
 } // namespace
 
 extern "C" void llm_mem_trace_tensor_begin(const ggml_tensor * t) {
@@ -3083,6 +3814,7 @@ extern "C" void llm_mem_trace_tensor_begin(const ggml_tensor * t) {
         return;
     }
 
+    observe_expert_logical_first_use(t);
     log_tensor_event(t, "begin");
 
     const char * name = ggml_get_name(t);

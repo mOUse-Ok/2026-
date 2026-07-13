@@ -168,3 +168,41 @@ dry-run 应显示四种方案在相邻重复轮次中的位置轮换，并打印
 - 当次 WSL 根 cgroup 的 PSI/refault 主要被判定为高或临界压力；852 条预测相关决策中，72 条实际发出 predicted hint，其余由 value/pressure gate 拒绝。
 
 以上数据证明预测、压力反馈、成本门控和指标分析链路可运行。由于本次使用 `as-is` 缓存、脏工作区、无限制根 cgroup 且没有 decode 样本，不能据此判断控制器优于 baseline，也不能把预测命中率直接写成端到端收益。下一步必须在 delegated cgroup 中执行四方案 N=8 冷缓存矩阵。
+
+## 11. Expert Prefetch 任务生命周期验证（2026-07-13）
+
+- Trace-On Release 构建、Trace-Off Release 构建和 `test-expert-task-lifecycle` 均通过；Python 分析回归共 6 项通过。
+- detail smoke 产生 26,382 个唯一任务、26,183 个 `issue_id`，其中 199 个 coalesced group 为一对二；字段缺失、非法状态迁移、重复 task ID、issue 计数不一致和 syscall 链接错误均为 0。
+- 逻辑 first-use 匹配 19,806/26,382（75.07%）；未匹配主要来自异步 hint 晚于实际使用。事件明确写入 `semantics=logical_first_use` 和 `physical_load_observed=false`，不把 `madvise` 返回解释为 page-in 完成。
+- benchmark 默认 summary 只比 off 多任务汇总记录，不写逐任务事件，也不为每条 syscall 分配 `issue_id`。
+
+使用 `as-is` 缓存、7 个 Decode token，按 summary/off 交替顺序各运行 N=3；中位数结果如下：
+
+| 指标 | off | summary | 相对变化 |
+| --- | ---: | ---: | ---: |
+| 全进程 wall time | 34.44 s | 34.62 s | +0.52% |
+| Decode throughput | 5.8447 tok/s | 5.8376 tok/s | -0.12% |
+| Decode p95 | 189.47 ms | 189.90 ms | +0.22% |
+| memory trace 字节 | 12,318,443 | 12,320,006 | +0.013% |
+
+6 次运行均为零丢事件，输出 hash 均为 `5ee568424c71ea7436b6c4c3b899ae9dde3c6bc1c48bb3da71ca254c22073b68`。一轮 summary 因 major faults 升至 159,120，wall time 达 137.72 s；该异常值保留，说明当前 16 GB 模型/8 GB 内存的 `as-is` 环境仍有明显换页噪声，正式结论需要 delegated cgroup、固定缓存条件和更多重复。
+
+同配置的 detail N=3 相对 off 中位数使 Decode 吞吐下降 11.60%、p95 增加 18.18%，memory trace 事件约为 6.48 倍。因此 detail 明确限定为 Evidence Profile，不进入性能排名。所有模式输出 hash 一致，任务 trace 未改变调度策略或模型输出。
+
+## 12. Expert Tensor Stage 与 logical first-use 时序观测（2026-07-14）
+
+实现只增加唯一 Stage 分类、Task/first-use 关联和聚合；stage 没有进入 Admission、priority、coalescing、Slack、Pressure Control、worker 数量或预取范围的任何决策表达式。Trace-On/Trace-Off Release 构建、C++ 状态机与 Stage 分类测试、Python 分析回归、shell 语法和 diff 检查均通过。
+
+`stage_timing_detail_evidence_tasks` 使用 35B MoE 模型、Evidence Profile、3 个生成 token、既有 route prefetch、async 单 worker 和 as-is 缓存。四个 sink 均 `enqueued == written` 且 `dropped == 0`。28,302 个 Task 中 EARLY=18,868、LATE=9,434、UNKNOWN=0；eligible=28,302、matched=21,444、unmatched=6,858、ambiguous=0、duplicate-first-use=0、matcher peak live=522、expired=0。28,091 个 issue group 全部为 same-stage，cross-stage=0。真实运行未出现同键重复 Task；C++ 回归通过两 Task/一次 logical first-use 的一对多语义验证，并验证 ambiguous 和 duplicate-first-use 计数。
+
+该次 Evidence 按 `(run_id, step, layer, expert)` 得到 9,434 组配对，未匹配组为 0；其中 PREFILL=8,794、DECODE=640。本次观测的 `late_after_early_count=9,434`、before=0、equal=0；总体有符号 delta p25/p50/p75/p95 为 148.62/161.96/176.57/250.45 ms，Decode 为 0.73/1.50/1.94/3.11 ms。模型同时使用 gate 和 up 两个 EARLY tensor，因此每个配对键有多条 EARLY logical first-use；分析固定采用该 stage 的最早时间戳并保留 `multiple_early_observation_groups` 诊断。以上只是一次运行中的时序结果，不构成 EARLY 必然早于 LATE 的保证。
+
+summary/off 使用相同 8-token benchmark、as-is 缓存和既有 prefetch 配置，按 off/summary 交替各 N=3。6 次运行全部零丢失，输出 hash 均为 `5ee568424c71ea7436b6c4c3b899ae9dde3c6bc1c48bb3da71ca254c22073b68`；两次 3-token detail Evidence 的输出 hash 也一致。中位数如下：
+
+| 指标 | off | summary | summary 相对 off |
+| --- | ---: | ---: | ---: |
+| 全进程 wall time | 34.88 s | 34.16 s | -2.06% |
+| Decode throughput | 6.2797 tok/s | 6.1593 tok/s | -1.92% |
+| Decode p95 | 169.13 ms | 176.11 ms | +4.13% |
+
+off 第 3 次 wall time 为 48.44 s，显示 as-is 运行仍有明显换页长尾；因此 wall time 的负增量不解释为 summary 收益。Decode 吞吐和 p95 均未达到文档中的 1%/2%建议门槛，当前 summary 只能视为功能已验证，开销仍需在固定缓存和 delegated cgroup 条件下继续测量或优化。
