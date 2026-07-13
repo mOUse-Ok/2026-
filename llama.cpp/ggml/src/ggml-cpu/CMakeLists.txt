@@ -68,6 +68,8 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         target_sources(${GGML_CPU_NAME} PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/../../trace/trace_writer.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/../../trace/tensor_trace.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../trace/expert_tensor_registry.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../trace/expert_prefetch_policy.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/../../trace/kv_trace.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/../../trace/expert_trace.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/../../trace/os_trace.cpp
