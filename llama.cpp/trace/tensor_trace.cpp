@@ -1,4 +1,7 @@
 #include "trace_event.h"
+#include "expert_prefetch_types.h"
+#include "expert_tensor_registry.h"
+#include "expert_prefetch_policy.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -665,6 +668,7 @@ bool is_expert_weight_tensor_name(const char * name) {
             std::strstr(name, "ffn_gate_up_exps.weight"));
 }
 
+/*
 struct ExpertTensorInfo {
     std::string name;
     int layer = -1;
@@ -813,14 +817,16 @@ bool expert_slice_range(const ExpertTensorInfo & info, int expert, uintptr_t & a
     nbytes = std::min(info.expert_stride, info.nbytes - offset);
     return nbytes > 0;
 }
+*/
 
+/* moved to expert_prefetch_types.h
 enum class ExpertPolicy {
     Route,
     Lru,
     Lfu,
     WindowLfu,
     LeastStale,
-};
+}; */
 
 ExpertPolicy expert_policy() {
     static const ExpertPolicy policy = [] {
@@ -845,6 +851,7 @@ ExpertPolicy expert_policy() {
     return policy;
 }
 
+/* moved to expert_prefetch_policy.cpp
 const char * expert_policy_name(ExpertPolicy policy) {
     switch (policy) {
         case ExpertPolicy::Route:      return "route";
@@ -854,14 +861,15 @@ const char * expert_policy_name(ExpertPolicy policy) {
         case ExpertPolicy::LeastStale: return "least_stale";
     }
     return "route";
-}
+} */
 
+/* moved to expert_prefetch_types.h
 enum class ExpertEvictAdvice {
     None,
     Cold,
     DontNeed,
     PageOut,
-};
+}; */
 
 ExpertEvictAdvice expert_evict_advice() {
     static const ExpertEvictAdvice advice = [] {
@@ -1001,11 +1009,12 @@ bool expert_prefetch_async_fallback_enabled() {
     return enabled;
 }
 
+/* moved to expert_prefetch_types.h
 enum class ExpertAsyncPriorityMode {
     Score,
     Deadline,
     DeadlineScore,
-};
+}; */
 
 ExpertAsyncPriorityMode expert_prefetch_async_priority_mode() {
     static const ExpertAsyncPriorityMode mode = [] {
@@ -1024,6 +1033,7 @@ ExpertAsyncPriorityMode expert_prefetch_async_priority_mode() {
     return mode;
 }
 
+/* moved to expert_prefetch_policy.cpp
 const char * expert_prefetch_async_priority_mode_name(ExpertAsyncPriorityMode mode) {
     switch (mode) {
         case ExpertAsyncPriorityMode::Score:         return "score";
@@ -1031,7 +1041,7 @@ const char * expert_prefetch_async_priority_mode_name(ExpertAsyncPriorityMode mo
         case ExpertAsyncPriorityMode::DeadlineScore: return "deadline_score";
     }
     return "score";
-}
+} */
 
 uint64_t expert_prefetch_coalesce_max_gap_bytes() {
     static const uint64_t value = env_u64_or_default("LLM_MEM_TRACE_OPT_EXPERT_COALESCE_MAX_GAP_BYTES", 0);
@@ -1053,13 +1063,15 @@ bool expert_value_gate_enabled() {
     return enabled;
 }
 
+/* moved to expert_prefetch_types.h
 enum class ExpertPressureLevel {
     Low = 0,
     Moderate = 1,
     High = 2,
     Critical = 3,
-};
+}; */
 
+/* moved to expert_prefetch_policy.cpp
 const char * expert_pressure_level_name(ExpertPressureLevel level) {
     switch (level) {
         case ExpertPressureLevel::Low:      return "low";
@@ -1068,7 +1080,7 @@ const char * expert_pressure_level_name(ExpertPressureLevel level) {
         case ExpertPressureLevel::Critical: return "critical";
     }
     return "low";
-}
+} */
 
 struct ExpertPressureSnapshot {
     ExpertPressureLevel level = ExpertPressureLevel::Low;
