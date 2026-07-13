@@ -200,6 +200,20 @@ llama_build_and_test(test-chat-auto-parser.cpp WORKING_DIRECTORY ${PROJECT_SOURC
 llama_build_and_test(test-chat-template.cpp)
 llama_build_and_test(test-json-partial.cpp)
 llama_build_and_test(test-log.cpp)
+
+if (LLAMA_MEM_TRACE)
+    add_executable(
+        test-expert-task-lifecycle
+        test-expert-task-lifecycle.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../trace/expert_tensor_stage.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../trace/expert_task_lifecycle.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../trace/expert_first_use_matcher.cpp
+    )
+    target_include_directories(test-expert-task-lifecycle PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../trace)
+    add_test(NAME test-expert-task-lifecycle COMMAND $<TARGET_FILE:test-expert-task-lifecycle>)
+    set_property(TEST test-expert-task-lifecycle PROPERTY LABELS main)
+endif()
+
 llama_build_and_test(
     test-peg-parser.cpp
     peg-parser/simple-tokenize.cpp

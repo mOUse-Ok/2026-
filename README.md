@@ -90,7 +90,7 @@ bash llama.cpp/trace/run_trace_pipeline.sh
 
 输出目录默认位于 `llama.cpp/trace_output/<RUN_NAME>/`。该目录数据量较大，已在 `.gitignore` 中排除。
 
-单次运行支持两种主要 profile：`evidence` 生成完整行为证据，`benchmark` 关闭高流量 tensor/KV 和驻留采样，用于策略性能对比。每个有效运行同时保存 manifest、缓存准备记录、GNU time 全进程指标、trace 完整性摘要和确定性输出 hash。
+单次运行支持两种主要 profile：`evidence` 生成完整行为证据，`benchmark` 关闭高流量 tensor/KV 和驻留采样，用于策略性能对比。Expert Prefetch 任务生命周期在 `evidence` 中默认使用 `detail`，在 `benchmark` 中默认只写 Task/Stage/first-use 聚合；可用 `LLM_MEM_TRACE_EXPERT_TASK_MODE=off|summary|detail` 覆盖。detail 会记录唯一 C++ 分类器给出的 `EARLY/LATE/UNKNOWN`、logical first-use 关联及时延，分析结果在 `metrics.json` 的 `expert_stage_pairing` 中按 run/phase/layer 输出。Stage 仅用于观测，不参与调度。每个有效运行同时保存 manifest、缓存准备记录、GNU time 全进程指标、trace 完整性摘要和确定性输出 hash。
 
 ## 测试与复现
 

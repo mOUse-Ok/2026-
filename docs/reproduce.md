@@ -103,6 +103,18 @@ git diff --check
 
 正式结果应分别保留 evidence run 和 benchmark run，不能用高开销全量 trace 的绝对耗时冒充无插桩性能。
 
+Expert Prefetch 任务 trace 可独立切换：
+
+| `LLM_MEM_TRACE_EXPERT_TASK_MODE` | 输出 | 用途 |
+| --- | --- | --- |
+| `off` | 不记录任务事件或任务汇总 | Trace 开销基线 |
+| `summary` | 仅任务/stage/matcher 聚合，不写逐任务事件，不分配输出用 task/issue ID | benchmark 默认值 |
+| `detail` | 完整任务事件、`issue_id`、stage 和逻辑 first-use 时序 | evidence 默认值 |
+
+benchmark profile 仍保留真实 `madvise/posix_fadvise` 调用及错误，但把高流量 skip/reject 明细聚合到 summary。进入正式性能矩阵前，应以 `off` 为基线轮换运行三种模式；建议门槛为 Decode 吞吐下降不超过 1%、Decode p95 增加不超过 2%、trace 零丢失且输出 hash 相同。`detail` 未通过门槛时只能用于 evidence，不能用于性能排名。
+
+`EXPERT_FIRST_USE_SUMMARY` 的 M1 语义检查包括 `eligible_tasks/matched_tasks/unmatched_tasks/ambiguous_matches/duplicate_first_use_ignored/matcher_peak_live_tasks/matcher_expired_tasks`。多 Token ubatch 的同键重复 Task 采用一次 logical first-use 对多 Task 的关联语义。`EXPERT_TASK_SUMMARY` 另记录 `same_stage_issue_groups/cross_stage_issue_groups`。分析结果 `metrics.json` 中的 `expert_stage_pairing` 按 `(run_id, step, layer, expert)` 输出总体、PREFILL、DECODE、逐 Layer 和未匹配原因；分析脚本不得从 tensor 名重新分类 stage。
+
 ## 7. 单次 smoke test
 
 开发中的脏工作区只能用于功能冒烟，不得写入正式报告：
