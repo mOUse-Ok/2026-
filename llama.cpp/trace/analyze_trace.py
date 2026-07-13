@@ -111,12 +111,23 @@ def load_all(trace_dir: str) -> dict[str, list[dict]]:
             if json.dumps(record, sort_keys=True) not in sampled_keys:
                 tensor_records.append(record)
 
-    return {
+    data = {
         "tensor": tensor_records,
         "kv":     load_jsonl(os.path.join(trace_dir, "kv_trace.jsonl")),
         "expert": load_jsonl(os.path.join(trace_dir, "expert_trace.jsonl")),
         "memory": load_jsonl(os.path.join(trace_dir, "memory_trace.jsonl")),
     }
+    run_id = Path(trace_dir).resolve().name
+    manifest_path = Path(trace_dir) / "run_manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        run_id = str(manifest.get("run_name") or run_id)
+    except (OSError, json.JSONDecodeError):
+        pass
+    for record in data["memory"]:
+        if record.get("event") == "EXPERT_FIRST_USE":
+            record.setdefault("run_id", run_id)
+    return data
 
 
 def load_key_tensor_events(path: str) -> list[dict]:
@@ -940,6 +951,118 @@ def plot_page_residency(data: dict[str, list[dict]], out_dir: str):
 #  Collect Key Metrics for Report
 # ─────────────────────────────────────────────
 
+def _stage_pair_stats(deltas_ns: list[int]) -> dict:
+    paired = len(deltas_ns)
+    late_after = sum(delta > 0 for delta in deltas_ns)
+    late_before = sum(delta < 0 for delta in deltas_ns)
+    equal = sum(delta == 0 for delta in deltas_ns)
+    percentiles = {
+        percentile: (float(np.percentile(deltas_ns, value)) if deltas_ns else None)
+        for percentile, value in (("p25", 25), ("p50", 50), ("p75", 75), ("p95", 95))
+    }
+    return {
+        "paired_experts": paired,
+        "late_after_early_count": late_after,
+        "late_before_early_count": late_before,
+        "equal_timestamp_count": equal,
+        "late_after_early_ratio": late_after / paired if paired else 0.0,
+        "delta_ns": percentiles,
+    }
+
+
+def collect_expert_stage_pairing(first_use_events: list[dict]) -> dict:
+    """Pair trace-provided EARLY/LATE logical first-use timestamps.
+
+    Stage is deliberately never inferred from tensor names here. Multiple detail
+    records emitted for a one-to-many Task match are collapsed back to their
+    single logical first-use observation before pairing.
+    """
+    observations: dict[tuple, dict] = {}
+    invalid_stage_records = 0
+    for record in first_use_events:
+        stage = record.get("stage")
+        if stage not in {"EARLY", "LATE", "UNKNOWN"}:
+            invalid_stage_records += 1
+            continue
+        observation_key = (
+            str(record.get("run_id", "single_run")),
+            int(record.get("step", -1)),
+            int(record.get("layer", -1)),
+            int(record.get("expert", -1)),
+            str(record.get("tensor", "")),
+            stage,
+            int(record.get("first_use_ts_ns", record.get("ts_ns", 0))),
+        )
+        observations.setdefault(observation_key, record)
+
+    groups: dict[tuple, dict[str, list[dict]]] = defaultdict(
+        lambda: {"EARLY": [], "LATE": [], "UNKNOWN": []}
+    )
+    for record in observations.values():
+        key = (
+            str(record.get("run_id", "single_run")),
+            int(record.get("step", -1)),
+            int(record.get("layer", -1)),
+            int(record.get("expert", -1)),
+        )
+        groups[key][str(record["stage"])].append(record)
+
+    overall_deltas: list[int] = []
+    phase_deltas: dict[str, list[int]] = {"PREFILL": [], "DECODE": []}
+    layer_deltas: dict[int, list[int]] = defaultdict(list)
+    unmatched_reasons: Counter[str] = Counter()
+    multiple_early_groups = 0
+    multiple_late_groups = 0
+    phase_mismatch_pairs = 0
+
+    for key, by_stage in groups.items():
+        early = by_stage["EARLY"]
+        late = by_stage["LATE"]
+        if not early and not late:
+            unmatched_reasons["unknown_stage_only"] += 1
+            continue
+        if not early:
+            unmatched_reasons["missing_early"] += 1
+            continue
+        if not late:
+            unmatched_reasons["missing_late"] += 1
+            continue
+
+        multiple_early_groups += int(len(early) > 1)
+        multiple_late_groups += int(len(late) > 1)
+        early_record = min(early, key=lambda item: int(item.get("first_use_ts_ns", item.get("ts_ns", 0))))
+        late_record = min(late, key=lambda item: int(item.get("first_use_ts_ns", item.get("ts_ns", 0))))
+        early_ts = int(early_record.get("first_use_ts_ns", early_record.get("ts_ns", 0)))
+        late_ts = int(late_record.get("first_use_ts_ns", late_record.get("ts_ns", 0)))
+        delta = late_ts - early_ts
+        overall_deltas.append(delta)
+        layer_deltas[int(key[2])].append(delta)
+
+        early_phase = str(early_record.get("phase", "UNKNOWN"))
+        late_phase = str(late_record.get("phase", "UNKNOWN"))
+        if early_phase == late_phase and early_phase in phase_deltas:
+            phase_deltas[early_phase].append(delta)
+        else:
+            phase_mismatch_pairs += 1
+
+    result = _stage_pair_stats(overall_deltas)
+    result["pairing_key"] = ["run_id", "step", "layer", "expert"]
+    result["stage_source"] = "trace_field"
+    result["by_phase"] = {
+        phase: _stage_pair_stats(phase_deltas[phase]) for phase in ("PREFILL", "DECODE")
+    }
+    result["by_layer"] = {
+        str(layer): _stage_pair_stats(layer_deltas[layer]) for layer in sorted(layer_deltas)
+    }
+    result["unmatched_reasons"] = dict(sorted(unmatched_reasons.items()))
+    result["invalid_stage_records"] = invalid_stage_records
+    result["multiple_early_observation_groups"] = multiple_early_groups
+    result["multiple_late_observation_groups"] = multiple_late_groups
+    result["phase_mismatch_pairs"] = phase_mismatch_pairs
+    result["logical_first_use_records"] = len(observations)
+    result["duplicate_match_records_collapsed"] = len(first_use_events) - invalid_stage_records - len(observations)
+    return result
+
 def collect_metrics(data: dict[str, list[dict]]) -> dict:
     """Extract key numeric metrics for the report."""
     metrics = collect_core_metrics(data["memory"])
@@ -1112,6 +1235,310 @@ def collect_metrics(data: dict[str, list[dict]]) -> dict:
         metrics["expert_controller_cancelled_total"] = sum(
             1 for r in controlled_hints if r.get("action") in controller_cancel_actions
         )
+
+    task_events = [r for r in data["memory"] if r.get("event") == "EXPERT_TASK"]
+    task_summaries = [r for r in data["memory"] if r.get("event") == "EXPERT_TASK_SUMMARY"]
+    if task_summaries:
+        metrics["expert_task_summary_events"] = len(task_summaries)
+        task_trace_modes = sorted({
+            str(r.get("trace_mode", "unknown")) for r in task_summaries
+        })
+        metrics["expert_task_trace_mode"] = ",".join(task_trace_modes)
+        metrics["expert_task_detail_events_enabled"] = 1 if any(
+            r.get("detail_events_enabled") is True for r in task_summaries
+        ) else 0
+        for field in (
+            "created",
+            "admitted",
+            "rejected",
+            "enqueued",
+            "dequeued",
+            "issued",
+            "cancelled",
+            "terminal",
+            "in_flight",
+            "invalid_transitions",
+            "rejected_pressure",
+            "rejected_value",
+            "cancelled_pressure",
+            "cancelled_value",
+            "cancelled_expired",
+            "cancelled_queue_full",
+            "issue_groups",
+            "coalesced_issue_groups",
+            "same_stage_issue_groups",
+            "cross_stage_issue_groups",
+            "early_task_count",
+            "late_task_count",
+            "unknown_task_count",
+        ):
+            metrics[f"expert_task_{field}"] = sum(int(r.get(field, 0)) for r in task_summaries)
+        metrics["expert_task_queue_wait_ns_by_stage"] = {
+            stage: {
+                field: sum(
+                    int(r.get("queue_wait_ns_by_stage", {}).get(stage, {}).get(field, 0))
+                    for r in task_summaries
+                )
+                for field in ("count", "total_ns", "min_ns", "max_ns")
+            }
+            for stage in ("EARLY", "LATE", "UNKNOWN")
+        }
+        metrics["expert_controller_cancelled_total"] = max(
+            int(metrics.get("expert_controller_cancelled_total", 0)),
+            metrics["expert_task_rejected"] + metrics["expert_task_cancelled"],
+        )
+
+    if task_events:
+        metrics["expert_task_detail_records"] = len(task_events)
+        event_counts = Counter(str(r.get("lifecycle_event", "UNKNOWN")) for r in task_events)
+        for event, count in event_counts.items():
+            key = "".join(ch if ch.isalnum() else "_" for ch in event.lower())
+            metrics[f"expert_task_trace_{key}"] = count
+        for reason, count in Counter(
+            str(r.get("reason")) for r in task_events if r.get("reason")
+        ).items():
+            key = "".join(ch if ch.isalnum() else "_" for ch in reason.lower())
+            metrics[f"expert_task_reason_{key}"] = count
+
+        required_fields = {
+            "task_id", "step", "layer", "expert", "phase", "stage",
+            "tensor", "addr", "nbytes", "score", "queue_wait_ns",
+        }
+        metrics["expert_task_records_missing_fields"] = sum(
+            1 for r in task_events if not required_fields.issubset(r)
+        )
+
+        tasks: dict[int, list[dict]] = defaultdict(list)
+        invalid_task_id_records = 0
+        for record in task_events:
+            task_id = record.get("task_id")
+            if not isinstance(task_id, int) or task_id <= 0:
+                invalid_task_id_records += 1
+                continue
+            tasks[task_id].append(record)
+        metrics["expert_task_invalid_id_records"] = invalid_task_id_records
+        metrics["expert_task_unique_ids"] = len(tasks)
+        metrics["expert_task_duplicate_create_ids"] = sum(
+            max(0, sum(1 for r in records if r.get("lifecycle_event") == "CREATE") - 1)
+            for records in tasks.values()
+        )
+        metrics["expert_task_invalid_stage_records"] = sum(
+            1 for record in task_events
+            if record.get("stage") not in {"EARLY", "LATE", "UNKNOWN"}
+        )
+        metrics["expert_task_stage_changes"] = sum(
+            int(len({record.get("stage") for record in records}) > 1)
+            for records in tasks.values()
+        )
+
+        transitions = {
+            None: {"CREATE": "CREATED"},
+            "CREATED": {"ADMIT": "ADMITTED", "REJECT": "REJECTED"},
+            "ADMITTED": {"ENQUEUE": "ENQUEUED", "ISSUE": "ISSUED", "CANCEL": "CANCELLED"},
+            "ENQUEUED": {"DEQUEUE": "DEQUEUED"},
+            "DEQUEUED": {"ISSUE": "ISSUED", "CANCEL": "CANCELLED"},
+            "REJECTED": {},
+            "ISSUED": {},
+            "CANCELLED": {},
+        }
+        terminal_states = {"REJECTED", "ISSUED", "CANCELLED"}
+        invalid_transitions = 0
+        state_mismatches = 0
+        incomplete_tasks = 0
+        timestamp_regressions = 0
+        queue_wait_ns: list[int] = []
+        create_to_issue_ns: list[int] = []
+        enqueue_to_issue_ns: list[int] = []
+        hint_return_ns: list[int] = []
+
+        for records in tasks.values():
+            state: str | None = None
+            previous_ts = 0
+            for record in records:
+                event = str(record.get("lifecycle_event", "UNKNOWN"))
+                next_state = transitions.get(state, {}).get(event)
+                if next_state is None:
+                    invalid_transitions += 1
+                    continue
+                state = next_state
+                if record.get("state") != state:
+                    state_mismatches += 1
+                ts_ns = int(record.get("ts_ns", 0))
+                if previous_ts and ts_ns < previous_ts:
+                    timestamp_regressions += 1
+                previous_ts = max(previous_ts, ts_ns)
+            if state not in terminal_states:
+                incomplete_tasks += 1
+
+            final = records[-1]
+            created_ts = int(final.get("created_ts_ns", 0))
+            enqueued_ts = int(final.get("enqueued_ts_ns", 0))
+            dequeued_ts = int(final.get("dequeued_ts_ns", 0))
+            issued_ts = int(final.get("issued_ts_ns", 0))
+            returned_ts = int(final.get("returned_ts_ns", 0))
+            if enqueued_ts and dequeued_ts >= enqueued_ts:
+                queue_wait_ns.append(dequeued_ts - enqueued_ts)
+            if created_ts and issued_ts >= created_ts:
+                create_to_issue_ns.append(issued_ts - created_ts)
+            if enqueued_ts and issued_ts >= enqueued_ts:
+                enqueue_to_issue_ns.append(issued_ts - enqueued_ts)
+            if issued_ts and returned_ts >= issued_ts:
+                hint_return_ns.append(returned_ts - issued_ts)
+
+        metrics["expert_task_trace_invalid_transitions"] = invalid_transitions
+        metrics["expert_task_trace_state_mismatches"] = state_mismatches
+        metrics["expert_task_trace_incomplete"] = incomplete_tasks
+        metrics["expert_task_trace_timestamp_regressions"] = timestamp_regressions
+        metrics["expert_task_hint_returned_records"] = sum(
+            1 for r in task_events
+            if r.get("lifecycle_event") == "ISSUE" and r.get("hint_status") == "returned"
+        )
+
+        issue_records = [r for r in task_events if r.get("lifecycle_event") == "ISSUE"]
+        issue_tasks: dict[int, list[dict]] = defaultdict(list)
+        invalid_issue_id_records = 0
+        for record in issue_records:
+            issue_id = record.get("issue_id")
+            if not isinstance(issue_id, int) or issue_id <= 0:
+                invalid_issue_id_records += 1
+                continue
+            issue_tasks[issue_id].append(record)
+        metrics["expert_task_invalid_issue_id_records"] = invalid_issue_id_records
+        metrics["expert_issue_unique_ids"] = len(issue_tasks)
+        metrics["expert_issue_coalesced_groups"] = sum(
+            1 for records in issue_tasks.values() if len(records) > 1
+        )
+        metrics["expert_issue_coalesced_tasks"] = sum(
+            len(records) for records in issue_tasks.values() if len(records) > 1
+        )
+        metrics["expert_issue_max_tasks_per_group"] = max(
+            (len(records) for records in issue_tasks.values()), default=0
+        )
+        metrics["expert_issue_task_count_mismatches"] = sum(
+            1 for records in issue_tasks.values()
+            if any(int(r.get("issue_task_count", 0)) != len(records) for r in records)
+        )
+        metrics["expert_issue_cross_stage_groups_from_detail"] = sum(
+            int(len({str(record.get("stage", "UNKNOWN")) for record in records}) > 1)
+            for records in issue_tasks.values()
+        )
+
+        linked_syscalls = [
+            r for r in os_hints
+            if is_os_hint_syscall(r) and isinstance(r.get("issue_id"), int) and r["issue_id"] > 0
+        ]
+        syscall_issue_ids = {int(r["issue_id"]) for r in linked_syscalls}
+        task_issue_ids = set(issue_tasks)
+        metrics["expert_issue_linked_syscalls"] = len(linked_syscalls)
+        metrics["expert_issue_ids_with_syscalls"] = len(syscall_issue_ids)
+        metrics["expert_issue_ids_without_syscalls"] = len(task_issue_ids - syscall_issue_ids)
+        metrics["expert_syscall_issue_ids_without_tasks"] = len(syscall_issue_ids - task_issue_ids)
+
+        def add_latency_percentiles(prefix: str, values_ns: list[int]) -> None:
+            if not values_ns:
+                return
+            metrics[f"{prefix}_p50_us"] = float(np.percentile(values_ns, 50)) / 1e3
+            metrics[f"{prefix}_p95_us"] = float(np.percentile(values_ns, 95)) / 1e3
+
+        add_latency_percentiles("expert_task_queue_wait", queue_wait_ns)
+        add_latency_percentiles("expert_task_create_to_issue", create_to_issue_ns)
+        add_latency_percentiles("expert_task_enqueue_to_issue", enqueue_to_issue_ns)
+        add_latency_percentiles("expert_task_hint_return", hint_return_ns)
+
+    first_use_events = [r for r in data["memory"] if r.get("event") == "EXPERT_FIRST_USE"]
+    first_use_summaries = [
+        r for r in data["memory"] if r.get("event") == "EXPERT_FIRST_USE_SUMMARY"
+    ]
+    if first_use_summaries:
+        metrics["expert_first_use_summary_events"] = len(first_use_summaries)
+        metrics["expert_first_use_summary_semantic_violations"] = sum(
+            1 for r in first_use_summaries
+            if r.get("semantics") != "logical_first_use" or
+            r.get("physical_load_observed") is not False
+        )
+        for field in (
+            "eligible_tasks",
+            "logical_first_uses",
+            "matched_tasks",
+            "unmatched_tasks",
+            "unmatched_first_uses",
+            "ambiguous_matches",
+            "duplicate_first_use_ignored",
+            "matcher_peak_live_tasks",
+            "matcher_expired_tasks",
+            "late_issued_tasks",
+            "pending_issued_tasks",
+            "ignored_old_uses",
+        ):
+            metrics[f"expert_first_use_{field}"] = sum(
+                int(r.get(field, 0)) for r in first_use_summaries
+            )
+        eligible = metrics["expert_first_use_eligible_tasks"]
+        uses = metrics["expert_first_use_logical_first_uses"]
+        matched = metrics["expert_first_use_matched_tasks"]
+        unmatched_uses = metrics["expert_first_use_unmatched_first_uses"]
+        metrics["expert_first_use_task_match_rate_pct"] = (
+            100.0 * matched / eligible if eligible else 0.0
+        )
+        metrics["expert_first_use_coverage_pct"] = (
+            100.0 * (uses - unmatched_uses) / uses if uses else 0.0
+        )
+        metrics["expert_first_use_create_to_first_use_ns_by_stage"] = {
+            stage: {
+                field: sum(
+                    int(r.get("create_to_first_use_ns_by_stage", {}).get(stage, {}).get(field, 0))
+                    for r in first_use_summaries
+                )
+                for field in ("count", "total_ns", "min_ns", "max_ns")
+            }
+            for stage in ("EARLY", "LATE", "UNKNOWN")
+        }
+
+    if first_use_events:
+        metrics["expert_first_use_records"] = len(first_use_events)
+        matched_first_use_events = [
+            r for r in first_use_events if r.get("matched") is True or "task_id" in r
+        ]
+        task_ids = [int(r.get("task_id", 0)) for r in matched_first_use_events]
+        issue_ids = [int(r.get("issue_id", 0)) for r in matched_first_use_events]
+        metrics["expert_first_use_unique_task_ids"] = len({value for value in task_ids if value > 0})
+        metrics["expert_first_use_unique_issue_ids"] = len({value for value in issue_ids if value > 0})
+        metrics["expert_first_use_duplicate_task_matches"] = len(task_ids) - len(set(task_ids))
+        metrics["expert_first_use_invalid_identity_records"] = sum(
+            1 for task_id, issue_id in zip(task_ids, issue_ids) if task_id <= 0 or issue_id <= 0
+        )
+        metrics["expert_first_use_semantic_violations"] = sum(
+            1 for r in first_use_events
+            if r.get("semantics") != "logical_first_use" or r.get("physical_load_observed") is not False
+        )
+        metrics["expert_first_use_invalid_stage_records"] = sum(
+            1 for record in first_use_events
+            if record.get("stage") not in {"EARLY", "LATE", "UNKNOWN"}
+        )
+        issue_to_first_use = [
+            int(r["issue_to_first_use_ns"]) for r in matched_first_use_events
+            if isinstance(r.get("issue_to_first_use_ns"), (int, float)) and
+            int(r["issue_to_first_use_ns"]) >= 0
+        ]
+        if issue_to_first_use:
+            metrics["expert_first_use_issue_to_first_use_p50_us"] = (
+                float(np.percentile(issue_to_first_use, 50)) / 1e3
+            )
+            metrics["expert_first_use_issue_to_first_use_p95_us"] = (
+                float(np.percentile(issue_to_first_use, 95)) / 1e3
+            )
+
+        issued_by_task = {
+            int(r["task_id"]): int(r.get("issue_id", 0))
+            for r in task_events
+            if r.get("lifecycle_event") == "ISSUE" and isinstance(r.get("task_id"), int)
+        }
+        metrics["expert_first_use_task_link_mismatches"] = sum(
+            1 for task_id, issue_id in zip(task_ids, issue_ids)
+            if issued_by_task.get(task_id) != issue_id
+        )
+
+        metrics["expert_stage_pairing"] = collect_expert_stage_pairing(first_use_events)
 
     async_summaries = [r for r in data["memory"] if r.get("event") == "EXPERT_ASYNC_SUMMARY"]
     if async_summaries:
