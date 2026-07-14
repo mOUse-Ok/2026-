@@ -24,6 +24,7 @@
 
 - `llama.cpp/trace/tensor_trace.cpp`：OS hint、expert slice cache、异步队列、语义与压力双反馈控制、slack 取消及跨层预测核心实现。
 - `llama.cpp/trace/analyze_trace.py`：trace 分析、指标聚合和报告生成。
+- `llama.cpp/trace/stage_scheduling_analysis.py`：M2.5 Stage inversion、no-issued 原因分类与离线 1/2/4-worker 调度模拟。
 - `llama.cpp/trace/trace_metrics.py`：STEP 延迟、trace-window faults 和尾延迟等无第三方依赖核心指标。
 - `llama.cpp/trace/simulate_expert_cache.py`：trace-driven expert cache 替换策略模拟。
 - `llama.cpp/trace/simulate_kv_cache_policy.py`：trace-driven KV cache 页面、窗口、预算和量化策略模拟。
@@ -90,7 +91,7 @@ bash llama.cpp/trace/run_trace_pipeline.sh
 
 输出目录默认位于 `llama.cpp/trace_output/<RUN_NAME>/`。该目录数据量较大，已在 `.gitignore` 中排除。
 
-单次运行支持两种主要 profile：`evidence` 生成完整行为证据，`benchmark` 关闭高流量 tensor/KV 和驻留采样，用于策略性能对比。Expert Prefetch 任务生命周期在 `evidence` 中默认使用 `detail`，在 `benchmark` 中默认只写 Task/Stage/first-use 聚合；可用 `LLM_MEM_TRACE_EXPERT_TASK_MODE=off|summary|detail` 覆盖。detail 会记录唯一 C++ 分类器给出的 `EARLY/LATE/UNKNOWN`、logical first-use 关联及时延，分析结果在 `metrics.json` 的 `expert_stage_pairing` 中按 run/phase/layer 输出。Stage 仅用于观测，不参与调度。每个有效运行同时保存 manifest、缓存准备记录、GNU time 全进程指标、trace 完整性摘要和确定性输出 hash。
+单次运行支持两种主要 profile：`evidence` 生成完整行为证据，`benchmark` 关闭高流量 tensor/KV 和驻留采样，用于策略性能对比。Expert Prefetch 任务生命周期在 `evidence` 中默认使用 `detail`，在 `benchmark` 中默认只写 Task/Stage/first-use 聚合；可用 `LLM_MEM_TRACE_EXPERT_TASK_MODE=off|summary|detail` 覆盖。detail 会记录唯一 C++ 分类器给出的 `EARLY/LATE/UNKNOWN`、logical first-use 关联及时延，分析结果在 `metrics.json` 的 `expert_stage_pairing` 中按 run/phase/layer 输出。M2.5 另生成 `analysis/stage_scheduling_opportunity.json`，使用 trace 中的真实 enqueue、service duration、deadline、score 和 sequence 离线比较 `deadline_score` 与 `stage_deadline_score`。Stage 仍只用于 trace 和离线模拟，不参与 C++ 运行时调度。每个有效运行同时保存 manifest、缓存准备记录、GNU time 全进程指标、trace 完整性摘要和确定性输出 hash。
 
 ## 测试与复现
 
@@ -105,6 +106,7 @@ python3 -m py_compile \
   llama.cpp/trace/compare_trace_runs.py \
   llama.cpp/trace/simulate_expert_cache.py \
   llama.cpp/trace/simulate_kv_cache_policy.py \
+  llama.cpp/trace/stage_scheduling_analysis.py \
   llama.cpp/trace/summarize_repeat_runs.py \
   llama.cpp/trace/prepare_model_cache.py \
   llama.cpp/trace/write_run_manifest.py \

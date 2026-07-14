@@ -82,6 +82,7 @@ python3 -m py_compile \
   llama.cpp/trace/compare_trace_runs.py \
   llama.cpp/trace/simulate_expert_cache.py \
   llama.cpp/trace/simulate_kv_cache_policy.py \
+  llama.cpp/trace/stage_scheduling_analysis.py \
   llama.cpp/trace/summarize_repeat_runs.py \
   llama.cpp/trace/prepare_model_cache.py \
   llama.cpp/trace/write_run_manifest.py \
@@ -114,6 +115,8 @@ Expert Prefetch 任务 trace 可独立切换：
 benchmark profile 仍保留真实 `madvise/posix_fadvise` 调用及错误，但把高流量 skip/reject 明细聚合到 summary。进入正式性能矩阵前，应以 `off` 为基线轮换运行三种模式；建议门槛为 Decode 吞吐下降不超过 1%、Decode p95 增加不超过 2%、trace 零丢失且输出 hash 相同。`detail` 未通过门槛时只能用于 evidence，不能用于性能排名。
 
 `EXPERT_FIRST_USE_SUMMARY` 的 M1 语义检查包括 `eligible_tasks/matched_tasks/unmatched_tasks/ambiguous_matches/duplicate_first_use_ignored/matcher_peak_live_tasks/matcher_expired_tasks`。多 Token ubatch 的同键重复 Task 采用一次 logical first-use 对多 Task 的关联语义。`EXPERT_TASK_SUMMARY` 另记录 `same_stage_issue_groups/cross_stage_issue_groups`。分析结果 `metrics.json` 中的 `expert_stage_pairing` 按 `(run_id, step, layer, expert)` 输出总体、PREFILL、DECODE、逐 Layer 和未匹配原因；分析脚本不得从 tensor 名重新分类 stage。
+
+M2.5 离线调度分析要求 detail Task 中存在真实 `sequence` 和 `deadline_ts_ns`。`analyze_trace.py` 会额外生成 `analysis/stage_scheduling_opportunity.json`；其中 `data_quality` 必须确认 `sequence_semantics=trace_sequence`、没有 deadline 代理，并报告观测到的 priority mode 和 worker 数量。若字段缺失，兼容分析会显式标记代理来源，该结果不能作为正式 M2.5 Evidence。
 
 ## 7. 单次 smoke test
 
@@ -243,6 +246,27 @@ KV policy：
 ```bash
 python3 llama.cpp/trace/simulate_kv_cache_policy.py \
   --trace-dir llama.cpp/trace_output/<run>
+```
+
+M2.5 Stage Scheduling Opportunity Analysis 使用正常 pipeline 的 detail 输出，不单独启动模型：
+
+```bash
+ALLOW_DIRTY_REPO=1 \
+RUN_NAME=stage_scheduling_opportunity_evidence \
+TRACE_PROFILE=evidence \
+CACHE_MODE=as-is \
+NUM_TOKENS_PREDICT=3 \
+CTX_SIZE=1024 \
+LLM_MEM_TRACE_OPT_EXPERT_CONTROLLER=feedback_slack \
+bash llama.cpp/trace/run_trace_pipeline.sh
+```
+
+`feedback_slack` 在此只用于采集仓库现有 `deadline_score` 配置的真实非零 deadline、sequence 和 4-worker Task。分析阶段离线重放同一批已 ISSUE Task，并输出 1/2/4-worker A/B 模拟；不会把 B 写回 C++ queue。复用已有 trace 时可执行：
+
+```bash
+python3 llama.cpp/trace/analyze_trace.py \
+  --trace-dir llama.cpp/trace_output/<detail-run> \
+  --output-dir llama.cpp/trace_output/<detail-run>/analysis
 ```
 
 ## 13. 常见问题

@@ -1497,6 +1497,8 @@ struct ExpertTaskLifecycleRecord {
     uint64_t dequeued_ts_ns = 0;
     uint64_t issued_ts_ns = 0;
     uint64_t returned_ts_ns = 0;
+    uint64_t deadline_ts_ns = 0;
+    uint64_t sequence = 0;
     uint64_t step = 0;
     int layer = -1;
     int expert = -1;
@@ -1729,6 +1731,8 @@ void write_expert_task_event(
     json_escape_append(line, addr_buf);
     line += ",\"nbytes\":" + std::to_string(task.nbytes);
     line += ",\"score\":" + std::to_string(task.score);
+    line += ",\"sequence\":" + std::to_string(task.sequence);
+    line += ",\"deadline_ts_ns\":" + std::to_string(task.deadline_ts_ns);
     line += ",\"created_ts_ns\":" + std::to_string(task.created_ts_ns);
     line += ",\"enqueued_ts_ns\":" + std::to_string(task.enqueued_ts_ns);
     line += ",\"dequeued_ts_ns\":" + std::to_string(task.dequeued_ts_ns);
@@ -2355,6 +2359,7 @@ struct ExpertHintQueue {
             }
             const uint64_t task_bytes = (uint64_t) task.nbytes;
             task.sequence = next_sequence++;
+            task.lifecycle.sequence = task.sequence;
             transition_expert_task(task.lifecycle, ExpertTaskEvent::Enqueue);
             if (priority_enabled && priority_heap_enabled) {
                 priority_heap.emplace_back(std::move(task));
@@ -2755,6 +2760,7 @@ ExpertTaskGateResult prepare_expert_hint_task(ExpertHintTask & task) {
                 task.step, task.layer, task.phase, task.enqueue_ts_ns);
         task.deadline_ts_ns = task.enqueue_ts_ns + slack;
     }
+    task.lifecycle.deadline_ts_ns = task.deadline_ts_ns;
 
     refresh_expert_task_estimate(task);
 

@@ -25,6 +25,7 @@ import numpy as np
 import pandas as pd
 
 from trace_metrics import collect_core_metrics, inference_latency_records
+from stage_scheduling_analysis import analyze_stage_scheduling_opportunity
 
 
 # ─────────────────────────────────────────────
@@ -125,8 +126,7 @@ def load_all(trace_dir: str) -> dict[str, list[dict]]:
     except (OSError, json.JSONDecodeError):
         pass
     for record in data["memory"]:
-        if record.get("event") == "EXPERT_FIRST_USE":
-            record.setdefault("run_id", run_id)
+        record.setdefault("run_id", run_id)
     return data
 
 
@@ -1302,7 +1302,8 @@ def collect_metrics(data: dict[str, list[dict]]) -> dict:
 
         required_fields = {
             "task_id", "step", "layer", "expert", "phase", "stage",
-            "tensor", "addr", "nbytes", "score", "queue_wait_ns",
+            "tensor", "addr", "nbytes", "score", "sequence", "deadline_ts_ns",
+            "queue_wait_ns",
         }
         metrics["expert_task_records_missing_fields"] = sum(
             1 for r in task_events if not required_fields.issubset(r)
@@ -1539,6 +1540,10 @@ def collect_metrics(data: dict[str, list[dict]]) -> dict:
         )
 
         metrics["expert_stage_pairing"] = collect_expert_stage_pairing(first_use_events)
+
+    metrics["expert_stage_scheduling_opportunity"] = analyze_stage_scheduling_opportunity(
+        data["memory"]
+    )
 
     async_summaries = [r for r in data["memory"] if r.get("event") == "EXPERT_ASYNC_SUMMARY"]
     if async_summaries:
@@ -2148,6 +2153,10 @@ def main():
     with open(metrics_path, "w") as f:
         json.dump(metrics, f, indent=2, default=str)
     print(f"  [OK] {metrics_path}")
+    stage_opportunity_path = os.path.join(out_dir, "stage_scheduling_opportunity.json")
+    with open(stage_opportunity_path, "w") as f:
+        json.dump(metrics["expert_stage_scheduling_opportunity"], f, indent=2, default=str)
+    print(f"  [OK] {stage_opportunity_path}")
 
     # Write a text summary
     print("\n[7/7] Writing text summary...")
