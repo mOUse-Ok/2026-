@@ -203,6 +203,15 @@ llama_build_and_test(test-log.cpp)
 
 if (LLAMA_MEM_TRACE)
     add_executable(
+        test-expert-hint-priority
+        test-expert-hint-priority.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../trace/expert_hint_priority.cpp
+    )
+    target_include_directories(test-expert-hint-priority PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../trace)
+    add_test(NAME test-expert-hint-priority COMMAND $<TARGET_FILE:test-expert-hint-priority>)
+    set_property(TEST test-expert-hint-priority PROPERTY LABELS main)
+
+    add_executable(
         test-expert-task-lifecycle
         test-expert-task-lifecycle.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../trace/expert_tensor_stage.cpp
