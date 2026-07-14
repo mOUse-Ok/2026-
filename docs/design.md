@@ -84,6 +84,16 @@ ADMITTED/DEQUEUED -> CANCEL -> CANCELLED
 
 任务 trace 只观察现有策略；stage 不参与 Task Admission、队列优先级、coalescing、Slack、Pressure Control、worker 数量或预取范围。
 
+### M2.5 离线 Stage Scheduling Opportunity Analysis
+
+M2.5 不增加运行时调度分支。detail Task 仅额外落盘现有队列的 `sequence` 与现有任务的 `deadline_ts_ns`，使离线模拟不必用文件顺序或零 deadline 代替真实字段；Admission、`ExpertHintQueue` comparator、coalescing、TTL、worker 数量、Slack、Pressure Control 和 Task 生成范围均保持原样。
+
+`no_issued_task` 原因采用显式证据白名单：只在同一 `(run_id, step, layer, expert, tensor)` 上看到明确 TTL duplicate、cache hit、policy reject/skip、queue/worker failure 或终止时仍 pending 的 Task 时才分类；其余全部保留 `other`。输出同时按 phase、stage 和 phase-stage 交叉聚合，不根据缺失事件猜测原因。
+
+Stage inversion 的计数单位是 LATE Task。对每个 LATE Task 取首个 DEQUEUE/ISSUE 事件；若同一 run、step、layer 存在已 ENQUEUE 且尚未 DEQUEUE/ISSUE 的 EARLY Task，则该 LATE Task 计为一次 inversion。`blocked_early_tasks` 是 LATE/EARLY 阻塞关系数，另输出去重后的 `unique_blocked_early_tasks`；阻塞时长为该 LATE 事件到对应 EARLY 首次 DEQUEUE/ISSUE 的差值。相同纳秒时间戳按 trace 事件顺序判定。
+
+离线模拟只纳入具有真实 ENQUEUE、ISSUE 和 RETURN 的 Task，并固定使用观测到的 ISSUE→RETURN service duration。A 策略复现现有 `deadline_score`：非零 deadline 早、score 高、sequence 小；B 策略 `stage_deadline_score` 按 step、layer、EARLY/LATE/UNKNOWN、score、sequence 排序，因此下一层 EARLY 不会越过当前层 LATE。模拟分别使用 1/2/4 workers；on-time 严格表示 ISSUE 时间早于 logical first-use。模拟只报告潜在 ISSUE 时间变化和 LATE 变晚风险，不表示物理页驻留完成，也不支持性能提升或 major fault 下降结论。
+
 ### 异步 priority queue
 
 推理线程只构造 `ExpertHintTask` 并入队，worker 执行实际系统调用。控制器使用 layer 执行时间 EWMA 估计 expert 的使用期限，并将任务按真实 `deadline_ts_ns` 和 route score 排序。worker 出队时重新计算预计服务时间；已经错过期限的任务直接取消，不回退到 decode 同步系统调用。
@@ -108,6 +118,8 @@ ADMITTED/DEQUEUED -> CANCEL -> CANCELLED
 ### 离线策略模拟
 
 `simulate_expert_cache.py` 使用已有 trace 比较不同 expert cache 预算和替换策略，避免每个候选都重跑大模型。`simulate_kv_cache_policy.py` 估算完整预留、按块提交、KV 量化、滑动窗口和预算策略的内存上界。
+
+`stage_scheduling_analysis.py` 从 detail trace 生成 `stage_scheduling_opportunity.json`，包括 no-issued 原因、总体/phase/Layer inversion，以及 `deadline_score` 与 `stage_deadline_score` 的 1/2/4-worker 对照。它不调用或修改 C++ queue。
 
 其中 `paged_blocks` 是保持完整上下文的工程候选；滑动窗口、sink-recent 和 budget-LRU 会丢弃上下文，只能作为压力测试。当前 trace 缺少 attention score，因此不能据此声称已经实现 H2O/heavy-hitter。
 
