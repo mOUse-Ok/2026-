@@ -431,7 +431,7 @@ def _deadline_score_key(job: dict[str, Any]) -> tuple[Any, ...]:
 
 
 def _stage_deadline_score_key(job: dict[str, Any]) -> tuple[Any, ...]:
-    stage_rank = {"EARLY": 0, "LATE": 1, "UNKNOWN": 2}.get(str(job.get("stage")), 2)
+    stage_rank = {"EARLY": 0, "LATE": 1}.get(str(job.get("stage")), 0)
     return (
         int(job.get("step", -1)),
         int(job.get("layer", -1)),
@@ -451,33 +451,50 @@ def simulate_task_schedule(
     if not jobs:
         return {}
 
-    key_function = _deadline_score_key if policy == "deadline_score" else _stage_deadline_score_key
     arrivals = sorted(
         jobs,
         key=lambda job: (int(job["arrival_ts_ns"]), int(job["sequence"]), int(job["task_id"])),
     )
     worker_heap = [(int(arrivals[0]["arrival_ts_ns"]), worker_id) for worker_id in range(worker_count)]
     heapq.heapify(worker_heap)
-    ready: list[tuple[tuple[Any, ...], str, int, dict[str, Any]]] = []
+    ready_known: list[tuple[tuple[Any, ...], str, int, dict[str, Any]]] = []
+    ready_legacy: list[tuple[tuple[Any, ...], str, int, dict[str, Any]]] = []
     issue_times: dict[tuple[str, int], int] = {}
     arrival_index = 0
     current_time = int(arrivals[0]["arrival_ts_ns"])
+
+    def push_ready(job: dict[str, Any]) -> None:
+        use_legacy = policy == "deadline_score" or str(job.get("stage")) not in {"EARLY", "LATE"}
+        key_function = _deadline_score_key if use_legacy else _stage_deadline_score_key
+        target = ready_legacy if use_legacy else ready_known
+        heapq.heappush(target, (key_function(job), str(job["run_id"]), int(job["task_id"]), job))
+
+    def pop_ready() -> dict[str, Any]:
+        if not ready_known:
+            return heapq.heappop(ready_legacy)[3]
+        if not ready_legacy:
+            return heapq.heappop(ready_known)[3]
+        # Runtime stage_deadline_score keeps UNKNOWN in a legacy heap and
+        # arbitrates the two heap heads with the legacy deadline_score order.
+        if _deadline_score_key(ready_legacy[0][3]) < _deadline_score_key(ready_known[0][3]):
+            return heapq.heappop(ready_legacy)[3]
+        return heapq.heappop(ready_known)[3]
 
     while len(issue_times) < len(arrivals):
         worker_free, worker_id = heapq.heappop(worker_heap)
         current_time = max(current_time, worker_free)
         while arrival_index < len(arrivals) and int(arrivals[arrival_index]["arrival_ts_ns"]) <= current_time:
             job = arrivals[arrival_index]
-            heapq.heappush(ready, (key_function(job), str(job["run_id"]), int(job["task_id"]), job))
+            push_ready(job)
             arrival_index += 1
-        if not ready:
+        if not ready_known and not ready_legacy:
             current_time = max(current_time, int(arrivals[arrival_index]["arrival_ts_ns"]))
             while arrival_index < len(arrivals) and int(arrivals[arrival_index]["arrival_ts_ns"]) <= current_time:
                 job = arrivals[arrival_index]
-                heapq.heappush(ready, (key_function(job), str(job["run_id"]), int(job["task_id"]), job))
+                push_ready(job)
                 arrival_index += 1
 
-        _, _, _, job = heapq.heappop(ready)
+        job = pop_ready()
         issue_times[job["identity"]] = current_time
         completion = current_time + max(0, int(job.get("service_ns", 0)))
         heapq.heappush(worker_heap, (completion, worker_id))

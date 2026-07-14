@@ -74,3 +74,6 @@ llmop_draft.tex
 
 # 决赛阶段本地开发日志（包含开发流水与人工复核事项，不提交云端）
 docs/final-development-log.local.md
+
+# 阶段感知、Slack 驱动、压力自适应方案草稿
+SSP_EP_complete_plan.md

@@ -199,6 +199,15 @@ class StageSchedulingAnalysisTest(unittest.TestCase):
         self.assertEqual(issue[("run", 1)], 0)
         self.assertEqual(issue[("run", 2)], 10)
 
+    def test_unknown_uses_legacy_deadline_score_fallback(self) -> None:
+        known = simulation_job(1, "EARLY", 0.9, sequence=1)
+        known["deadline_ts_ns"] = 300
+        unknown = simulation_job(2, "UNKNOWN", 0.1, sequence=2)
+        unknown["deadline_ts_ns"] = 100
+        issue = simulate_task_schedule([known, unknown], 1, "stage_deadline_score")
+        self.assertEqual(issue[("run", 2)], 0)
+        self.assertEqual(issue[("run", 1)], 10)
+
     def test_late_starvation_risk_is_reported(self) -> None:
         jobs = [simulation_job(1, "LATE", 100.0, first_use=15, sequence=1)] + [
             simulation_job(task_id, "EARLY", 1.0, first_use=100, sequence=task_id)

@@ -2,6 +2,7 @@
 #include "expert_prefetch_types.h"
 #include "expert_tensor_registry.h"
 #include "expert_prefetch_policy.h"
+#include "expert_hint_priority.h"
 #include "expert_tensor_stage.h"
 #include "expert_task_lifecycle.h"
 #include "expert_first_use_matcher.h"
@@ -1031,6 +1032,7 @@ enum class ExpertAsyncPriorityMode {
     Score,
     Deadline,
     DeadlineScore,
+    StageDeadlineScore,
 }; */
 
 ExpertAsyncPriorityMode expert_prefetch_async_priority_mode() {
@@ -1045,6 +1047,9 @@ ExpertAsyncPriorityMode expert_prefetch_async_priority_mode() {
         if (std::strcmp(value, "deadline_score") == 0) {
             return ExpertAsyncPriorityMode::DeadlineScore;
         }
+        if (std::strcmp(value, "stage_deadline_score") == 0) {
+            return ExpertAsyncPriorityMode::StageDeadlineScore;
+        }
         return ExpertAsyncPriorityMode::Score;
     }();
     return mode;
@@ -1056,6 +1061,7 @@ const char * expert_prefetch_async_priority_mode_name(ExpertAsyncPriorityMode mo
         case ExpertAsyncPriorityMode::Score:         return "score";
         case ExpertAsyncPriorityMode::Deadline:      return "deadline";
         case ExpertAsyncPriorityMode::DeadlineScore: return "deadline_score";
+        case ExpertAsyncPriorityMode::StageDeadlineScore: return "stage_deadline_score";
     }
     return "score";
 } */
@@ -1072,6 +1078,11 @@ bool expert_feedback_enabled() {
 
 bool expert_slack_enabled() {
     static const bool enabled = os_hint_opt_enabled("LLM_MEM_TRACE_OPT_EXPERT_SLACK");
+    return enabled;
+}
+
+bool expert_deadline_observation_enabled() {
+    static const bool enabled = os_hint_opt_enabled("LLM_MEM_TRACE_OPT_EXPERT_DEADLINE_OBSERVE");
     return enabled;
 }
 
@@ -1523,6 +1534,7 @@ struct ExpertHintTask {
     uint64_t cache_bytes = 0;
     uint64_t cache_capacity_bytes = 0;
     int phase = LLM_MEM_TRACE_PHASE_UNKNOWN;
+    ExpertTensorStage stage = ExpertTensorStage::Unknown;
     uint64_t step = 0;
     uint64_t sequence = 0;
     double route_score = 0.0;
@@ -1613,6 +1625,9 @@ struct ExpertTaskLifecycleStats {
     std::atomic<uint64_t> early_task_count{0};
     std::atomic<uint64_t> late_task_count{0};
     std::atomic<uint64_t> unknown_task_count{0};
+    std::array<std::atomic<uint64_t>, 3> enqueued_by_stage{};
+    std::array<std::atomic<uint64_t>, 3> issued_by_stage{};
+    std::array<std::atomic<uint64_t>, 3> late_count_by_stage{};
 
     struct DurationAggregate {
         std::atomic<uint64_t> count{0};
@@ -1672,9 +1687,17 @@ void record_expert_task_event_count(
             break;
         case ExpertTaskEvent::Admit:   stats.admitted.fetch_add(count, std::memory_order_relaxed); break;
         case ExpertTaskEvent::Reject:  stats.rejected.fetch_add(count, std::memory_order_relaxed); break;
-        case ExpertTaskEvent::Enqueue: stats.enqueued.fetch_add(count, std::memory_order_relaxed); break;
+        case ExpertTaskEvent::Enqueue:
+            stats.enqueued.fetch_add(count, std::memory_order_relaxed);
+            stats.enqueued_by_stage[expert_tensor_stage_index(stage)].fetch_add(
+                    count, std::memory_order_relaxed);
+            break;
         case ExpertTaskEvent::Dequeue: stats.dequeued.fetch_add(count, std::memory_order_relaxed); break;
-        case ExpertTaskEvent::Issue:   stats.issued.fetch_add(count, std::memory_order_relaxed); break;
+        case ExpertTaskEvent::Issue:
+            stats.issued.fetch_add(count, std::memory_order_relaxed);
+            stats.issued_by_stage[expert_tensor_stage_index(stage)].fetch_add(
+                    count, std::memory_order_relaxed);
+            break;
         case ExpertTaskEvent::Cancel:  stats.cancelled.fetch_add(count, std::memory_order_relaxed); break;
     }
     if (!reason || count == 0) {
@@ -1788,6 +1811,11 @@ bool transition_expert_task(
         case ExpertTaskEvent::Issue:
             task.issued_ts_ns = issued_ts_ns != 0 ? issued_ts_ns : now;
             task.returned_ts_ns = returned_ts_ns != 0 ? returned_ts_ns : now;
+            if (task.deadline_ts_ns != 0 && task.issued_ts_ns >= task.deadline_ts_ns) {
+                expert_task_lifecycle_stats().late_count_by_stage[
+                        expert_tensor_stage_index(task.stage)].fetch_add(
+                                1, std::memory_order_relaxed);
+            }
             break;
         case ExpertTaskEvent::Admit:
         case ExpertTaskEvent::Reject:
@@ -1825,6 +1853,26 @@ void append_atomic_stage_duration_map(
         line += ",\"max_ns\":" +
                 std::to_string(aggregate.max_ns.load(std::memory_order_relaxed));
         line += "}";
+    }
+    line += "}";
+}
+
+void append_atomic_stage_count_map(
+        std::string & line,
+        const char * field,
+        const std::array<std::atomic<uint64_t>, 3> & counts) {
+    static const ExpertTensorStage stages[] = {
+        ExpertTensorStage::Early,
+        ExpertTensorStage::Late,
+        ExpertTensorStage::Unknown,
+    };
+    line += ",\"" + std::string(field) + "\":{";
+    for (size_t i = 0; i < 3; ++i) {
+        if (i != 0) {
+            line += ",";
+        }
+        line += "\"" + std::string(expert_tensor_stage_name(stages[i])) + "\":" +
+                std::to_string(counts[i].load(std::memory_order_relaxed));
     }
     line += "}";
 }
@@ -1872,6 +1920,9 @@ void write_expert_task_summary() {
             std::to_string(stats.late_task_count.load(std::memory_order_relaxed));
     line += ",\"unknown_task_count\":" +
             std::to_string(stats.unknown_task_count.load(std::memory_order_relaxed));
+    append_atomic_stage_count_map(line, "enqueued_by_stage", stats.enqueued_by_stage);
+    append_atomic_stage_count_map(line, "issued_by_stage", stats.issued_by_stage);
+    append_atomic_stage_count_map(line, "late_count_by_stage", stats.late_count_by_stage);
     append_atomic_stage_duration_map(line, "queue_wait_ns_by_stage", stats.queue_wait_ns);
     line += "}";
     llm_mem_trace_write(LLM_MEM_TRACE_SINK_MEMORY, line.c_str(), line.size());
@@ -2315,6 +2366,7 @@ struct ExpertHintQueue {
     std::condition_variable cv;
     std::deque<ExpertHintTask> tasks;
     std::vector<ExpertHintTask> priority_heap;
+    std::vector<ExpertHintTask> legacy_priority_heap;
     std::vector<std::thread> workers;
     bool started = false;
     bool stopping = false;
@@ -2362,11 +2414,15 @@ struct ExpertHintQueue {
             task.lifecycle.sequence = task.sequence;
             transition_expert_task(task.lifecycle, ExpertTaskEvent::Enqueue);
             if (priority_enabled && priority_heap_enabled) {
-                priority_heap.emplace_back(std::move(task));
+                std::vector<ExpertHintTask> & heap =
+                        priority_mode == ExpertAsyncPriorityMode::StageDeadlineScore &&
+                                expert_hint_priority_uses_legacy_partition(task.stage) ?
+                        legacy_priority_heap : priority_heap;
+                heap.emplace_back(std::move(task));
                 auto cmp = [this](const ExpertHintTask & a, const ExpertHintTask & b) {
                     return is_higher_priority(b, a);
                 };
-                std::push_heap(priority_heap.begin(), priority_heap.end(), cmp);
+                std::push_heap(heap.begin(), heap.end(), cmp);
             } else {
                 tasks.emplace_back(std::move(task));
             }
@@ -2440,6 +2496,7 @@ struct ExpertHintQueue {
             stopping = false;
             tasks.clear();
             priority_heap.clear();
+            legacy_priority_heap.clear();
             queued_bytes = 0;
             worker_count = 0;
             priority_enabled = false;
@@ -2540,17 +2597,35 @@ struct ExpertHintQueue {
             auto cmp = [this](const ExpertHintTask & a, const ExpertHintTask & b) {
                 return is_higher_priority(b, a);
             };
-            std::pop_heap(priority_heap.begin(), priority_heap.end(), cmp);
-            task = std::move(priority_heap.back());
-            priority_heap.pop_back();
+            std::vector<ExpertHintTask> * heap = &priority_heap;
+            if (priority_mode == ExpertAsyncPriorityMode::StageDeadlineScore) {
+                if (priority_heap.empty()) {
+                    heap = &legacy_priority_heap;
+                } else if (!legacy_priority_heap.empty() &&
+                        is_higher_priority(legacy_priority_heap.front(), priority_heap.front())) {
+                    heap = &legacy_priority_heap;
+                }
+            }
+            std::pop_heap(heap->begin(), heap->end(), cmp);
+            task = std::move(heap->back());
+            heap->pop_back();
             priority_pops++;
             priority_heap_pops++;
         } else if (priority_enabled) {
-            auto best = tasks.begin();
+            auto best_known = tasks.end();
+            auto best_legacy = tasks.end();
             for (auto it = tasks.begin(); it != tasks.end(); ++it) {
-                if (is_higher_priority(*it, *best)) {
+                auto & best = priority_mode == ExpertAsyncPriorityMode::StageDeadlineScore &&
+                                expert_hint_priority_uses_legacy_partition(it->stage) ?
+                        best_legacy : best_known;
+                if (best == tasks.end() || is_higher_priority(*it, *best)) {
                     best = it;
                 }
+            }
+            auto best = best_known;
+            if (best == tasks.end() || (best_legacy != tasks.end() &&
+                    is_higher_priority(*best_legacy, *best))) {
+                best = best_legacy;
             }
             task = std::move(*best);
             tasks.erase(best);
@@ -2673,7 +2748,8 @@ struct ExpertHintQueue {
     }
 
     size_t queue_depth_unlocked() const {
-        return priority_enabled && priority_heap_enabled ? priority_heap.size() : tasks.size();
+        return priority_enabled && priority_heap_enabled ?
+                priority_heap.size() + legacy_priority_heap.size() : tasks.size();
     }
 
     bool queue_empty_unlocked() const {
@@ -2681,50 +2757,17 @@ struct ExpertHintQueue {
     }
 
     bool is_higher_priority(const ExpertHintTask & a, const ExpertHintTask & b) const {
-        switch (priority_mode) {
-            case ExpertAsyncPriorityMode::Deadline:
-                return compare_deadline(a, b);
-            case ExpertAsyncPriorityMode::DeadlineScore:
-                if (a.deadline_ts_ns != b.deadline_ts_ns) {
-                    if (a.deadline_ts_ns == 0) {
-                        return false;
-                    }
-                    if (b.deadline_ts_ns == 0) {
-                        return true;
-                    }
-                    return a.deadline_ts_ns < b.deadline_ts_ns;
-                }
-                return compare_score(a, b);
-            case ExpertAsyncPriorityMode::Score:
-                return compare_score(a, b);
-        }
-        return compare_score(a, b);
-    }
-
-    static bool compare_score(const ExpertHintTask & a, const ExpertHintTask & b) {
-        if (a.route_score != b.route_score) {
-            return a.route_score > b.route_score;
-        }
-        return a.sequence < b.sequence;
-    }
-
-    static bool compare_deadline(const ExpertHintTask & a, const ExpertHintTask & b) {
-        if (a.deadline_ts_ns != b.deadline_ts_ns) {
-            if (a.deadline_ts_ns == 0) {
-                return false;
-            }
-            if (b.deadline_ts_ns == 0) {
-                return true;
-            }
-            return a.deadline_ts_ns < b.deadline_ts_ns;
-        }
-        if (a.step != b.step) {
-            return a.step < b.step;
-        }
-        if (a.layer != b.layer) {
-            return a.layer < b.layer;
-        }
-        return a.sequence < b.sequence;
+        const auto key = [](const ExpertHintTask & task) {
+            ExpertHintPriorityKey result;
+            result.step = task.step;
+            result.layer = task.layer;
+            result.stage = task.stage;
+            result.route_score = task.route_score;
+            result.sequence = task.sequence;
+            result.deadline_ts_ns = task.deadline_ts_ns;
+            return result;
+        };
+        return expert_hint_priority_higher(key(a), key(b), priority_mode);
     }
 };
 
@@ -2755,7 +2798,11 @@ ExpertTaskGateResult prepare_expert_hint_task(ExpertHintTask & task) {
     const ExpertPressureSnapshot pressure = expert_pressure_controller().snapshot();
     apply_pressure_snapshot(task, pressure);
 
-    if (expert_slack_enabled()) {
+    const bool stage_deadline_observation = expert_prefetch_async_enabled() &&
+            expert_prefetch_async_priority_enabled() &&
+            expert_prefetch_async_priority_mode() == ExpertAsyncPriorityMode::StageDeadlineScore;
+    if (expert_slack_enabled() || expert_deadline_observation_enabled() ||
+            stage_deadline_observation) {
         const uint64_t slack = expert_timing_model().estimate_slack_ns(
                 task.step, task.layer, task.phase, task.enqueue_ts_ns);
         task.deadline_ts_ns = task.enqueue_ts_ns + slack;
@@ -2855,6 +2902,7 @@ ExpertHintTask make_expert_hint_task(
     task.prediction_source_layer = prediction_source_layer;
     task.token_idx = token_idx;
     task.phase = llm_mem_trace_get_phase();
+    task.stage = classify_expert_tensor_stage(task.tensor_name.c_str());
     task.step = llm_mem_trace_get_step();
     task.use_fadvise = os_hint_opt_enabled("LLM_MEM_TRACE_OPT_POSIX_FADVISE");
     if (expert_task_trace_mode() != ExpertTaskTraceMode::Off) {
@@ -2862,7 +2910,7 @@ ExpertHintTask make_expert_hint_task(
         task.lifecycle.layer = task.layer;
         task.lifecycle.expert = task.expert;
         task.lifecycle.phase = task.phase;
-        task.lifecycle.stage = classify_expert_tensor_stage(task.tensor_name.c_str());
+        task.lifecycle.stage = task.stage;
         task.lifecycle.tensor_name = task.tensor_name;
         task.lifecycle.addr = task.addr;
         task.lifecycle.nbytes = task.nbytes;

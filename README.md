@@ -32,6 +32,7 @@
 - `llama.cpp/trace/summarize_repeat_runs.py`：重复实验均值、标准差和变异系数聚合。
 - `llama.cpp/trace/run_trace_pipeline.sh`：单次 trace pipeline 运行入口。
 - `llama.cpp/trace/run_finalist_repeat_matrix.sh`：最终候选策略重复实验入口。
+- `llama.cpp/trace/run_stage_deadline_score_repeat_matrix.sh`：独立的 `deadline_score`/`stage_deadline_score` A/B 入口，不改 finalist 配置。
 - `llama.cpp/trace/run_cgroup_memory_matrix.sh`：Linux cgroup v2 受限物理内存实验矩阵入口，默认 dry-run。
 - `llama.cpp/trace/tests/`：指标语义、正式运行一致性和缺失指标回归测试。
 
@@ -91,7 +92,7 @@ bash llama.cpp/trace/run_trace_pipeline.sh
 
 输出目录默认位于 `llama.cpp/trace_output/<RUN_NAME>/`。该目录数据量较大，已在 `.gitignore` 中排除。
 
-单次运行支持两种主要 profile：`evidence` 生成完整行为证据，`benchmark` 关闭高流量 tensor/KV 和驻留采样，用于策略性能对比。Expert Prefetch 任务生命周期在 `evidence` 中默认使用 `detail`，在 `benchmark` 中默认只写 Task/Stage/first-use 聚合；可用 `LLM_MEM_TRACE_EXPERT_TASK_MODE=off|summary|detail` 覆盖。detail 会记录唯一 C++ 分类器给出的 `EARLY/LATE/UNKNOWN`、logical first-use 关联及时延，分析结果在 `metrics.json` 的 `expert_stage_pairing` 中按 run/phase/layer 输出。M2.5 另生成 `analysis/stage_scheduling_opportunity.json`，使用 trace 中的真实 enqueue、service duration、deadline、score 和 sequence 离线比较 `deadline_score` 与 `stage_deadline_score`。Stage 仍只用于 trace 和离线模拟，不参与 C++ 运行时调度。每个有效运行同时保存 manifest、缓存准备记录、GNU time 全进程指标、trace 完整性摘要和确定性输出 hash。
+单次运行支持两种主要 profile：`evidence` 生成完整行为证据，`benchmark` 关闭高流量 tensor/KV 和驻留采样，用于策略性能对比。Expert Prefetch 任务生命周期在 `evidence` 中默认使用 `detail`，在 `benchmark` 中默认只写 Task/Stage/first-use 聚合；可用 `LLM_MEM_TRACE_EXPERT_TASK_MODE=off|summary|detail` 覆盖。detail 会记录唯一 C++ 分类器给出的 `EARLY/LATE/UNKNOWN`、logical first-use 关联及时延，分析结果在 `metrics.json` 的 `expert_stage_pairing` 中按 run/phase/layer 输出。M2.5 另生成 `analysis/stage_scheduling_opportunity.json`，使用 trace 中的真实 enqueue、service duration、deadline、score 和 sequence 离线比较两种顺序。运行时 `stage_deadline_score` 是独立、默认关闭的 priority mode；其独立矩阵关闭 Slack/feedback/value admission，保留全部 routed Top-K，且不启用 chunk 机制。每个有效运行同时保存 manifest、缓存准备记录、GNU time 全进程指标、trace 完整性摘要和确定性输出 hash。
 
 ## 测试与复现
 
@@ -117,6 +118,7 @@ python3 -m unittest discover -s llama.cpp/trace/tests -p 'test_*.py' -v
 bash -n llama.cpp/trace/run_trace_pipeline.sh
 bash -n llama.cpp/trace/run_finalist_repeat_matrix.sh
 bash -n llama.cpp/trace/run_cgroup_memory_matrix.sh
+bash -n llama.cpp/trace/run_stage_deadline_score_repeat_matrix.sh
 ```
 
 最终矩阵 dry-run：

@@ -261,13 +261,30 @@ LLM_MEM_TRACE_OPT_EXPERT_CONTROLLER=feedback_slack \
 bash llama.cpp/trace/run_trace_pipeline.sh
 ```
 
-`feedback_slack` 在此只用于采集仓库现有 `deadline_score` 配置的真实非零 deadline、sequence 和 4-worker Task。分析阶段离线重放同一批已 ISSUE Task，并输出 1/2/4-worker A/B 模拟；不会把 B 写回 C++ queue。复用已有 trace 时可执行：
+`feedback_slack` 在此只用于采集仓库现有 `deadline_score` 配置的真实非零 deadline、sequence 和 4-worker Task。分析阶段离线重放同一批已 ISSUE Task，并输出 1/2/4-worker A/B 模拟；分析脚本本身不会修改 C++ queue。复用已有 trace 时可执行：
 
 ```bash
 python3 llama.cpp/trace/analyze_trace.py \
   --trace-dir llama.cpp/trace_output/<detail-run> \
   --output-dir llama.cpp/trace_output/<detail-run>/analysis
 ```
+
+运行时 Stage priority 使用独立矩阵，不改 `run_finalist_repeat_matrix.sh`：
+
+```bash
+# 先检查两组命令；默认不执行模型。
+REPEAT_COUNT=1 \
+bash llama.cpp/trace/run_stage_deadline_score_repeat_matrix.sh
+
+# 正式 A/B 建议 delegated cgroup、cold cache 和 N=8。
+RUN_STAGE_PRIORITY_EXECUTE=1 \
+REPEAT_COUNT=8 \
+MEMORY_MAX=6G \
+MEMORY_SWAP_MAX=2G \
+bash llama.cpp/trace/run_stage_deadline_score_repeat_matrix.sh
+```
+
+该矩阵只比较 `deadline_score` 与 `stage_deadline_score`，两组均使用全部 routed experts（`PREFETCH_TOPK=0`）、4 workers、单任务 batch、无 coalescing，并关闭 Slack/feedback/value admission 和跨层预测；不配置 Chunk 切分。两组设置 `LLM_MEM_TRACE_OPT_EXPERT_DEADLINE_OBSERVE=1` 以生成同口径 deadline，且新 mode 默认也会估计 deadline 供 UNKNOWN legacy 仲裁和 late telemetry 使用；Slack 关闭时不会据此拒绝或取消任务。正式结果须核对输出 hash、零 trace loss、每阶段 late count 及 `queue_wait_ns_by_stage` 的 `max_ns`。
 
 ## 13. 常见问题
 

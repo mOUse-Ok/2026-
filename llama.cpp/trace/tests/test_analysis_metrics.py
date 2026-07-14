@@ -200,6 +200,9 @@ class AnalysisMetricsTest(unittest.TestCase):
                 "early_task_count": 0,
                 "late_task_count": 3,
                 "unknown_task_count": 0,
+                "enqueued_by_stage": {"EARLY": 0, "LATE": 2, "UNKNOWN": 0},
+                "issued_by_stage": {"EARLY": 0, "LATE": 1, "UNKNOWN": 0},
+                "late_count_by_stage": {"EARLY": 0, "LATE": 1, "UNKNOWN": 0},
                 "queue_wait_ns_by_stage": {
                     "EARLY": {"count": 0, "total_ns": 0, "min_ns": 0, "max_ns": 0},
                     "LATE": {"count": 2, "total_ns": 80, "min_ns": 30, "max_ns": 50},
@@ -271,6 +274,12 @@ class AnalysisMetricsTest(unittest.TestCase):
         self.assertEqual(metrics["expert_task_trace_invalid_transitions"], 0)
         self.assertEqual(metrics["expert_task_trace_incomplete"], 0)
         self.assertEqual(metrics["expert_task_hint_returned_records"], 1)
+        self.assertEqual(metrics["expert_task_enqueued_by_stage"]["LATE"], 2)
+        self.assertEqual(metrics["expert_task_issued_by_stage"]["LATE"], 1)
+        self.assertEqual(metrics["expert_task_late_count_by_stage"]["LATE"], 1)
+        self.assertEqual(metrics["expert_task_queue_wait_ns_by_stage"]["LATE"]["max_ns"], 50)
+        self.assertAlmostEqual(metrics["expert_task_late_queue_wait_avg_us"], 0.04)
+        self.assertAlmostEqual(metrics["expert_task_late_queue_wait_max_us"], 0.05)
         self.assertEqual(metrics["expert_issue_unique_ids"], 1)
         self.assertEqual(metrics["expert_issue_linked_syscalls"], 1)
         self.assertEqual(metrics["expert_issue_ids_without_syscalls"], 0)
@@ -308,6 +317,9 @@ class AnalysisMetricsTest(unittest.TestCase):
             "early_task_count": 4,
             "late_task_count": 5,
             "unknown_task_count": 1,
+            "enqueued_by_stage": {"EARLY": 3, "LATE": 2, "UNKNOWN": 1},
+            "issued_by_stage": {"EARLY": 3, "LATE": 3, "UNKNOWN": 1},
+            "late_count_by_stage": {"EARLY": 0, "LATE": 2, "UNKNOWN": 1},
             "queue_wait_ns_by_stage": {
                 "EARLY": {"count": 2, "total_ns": 40, "min_ns": 10, "max_ns": 30},
                 "LATE": {"count": 1, "total_ns": 50, "min_ns": 50, "max_ns": 50},
@@ -323,9 +335,33 @@ class AnalysisMetricsTest(unittest.TestCase):
         self.assertEqual(metrics["expert_task_coalesced_issue_groups"], 2)
         self.assertEqual(metrics["expert_task_cross_stage_issue_groups"], 1)
         self.assertEqual(metrics["expert_task_early_task_count"], 4)
+        self.assertEqual(metrics["expert_task_enqueued_by_stage"]["UNKNOWN"], 1)
+        self.assertEqual(metrics["expert_task_issued_by_stage"]["EARLY"], 3)
+        self.assertEqual(metrics["expert_task_late_count_by_stage"]["LATE"], 2)
         self.assertEqual(metrics["expert_task_queue_wait_ns_by_stage"]["LATE"]["total_ns"], 50)
+        self.assertAlmostEqual(metrics["expert_task_unknown_queue_wait_max_us"], 0.0)
         self.assertEqual(metrics["expert_controller_cancelled_total"], 3)
         self.assertNotIn("expert_task_detail_records", metrics)
+
+    def test_expert_task_stage_wait_extrema_across_summaries(self) -> None:
+        def summary(minimum: int, maximum: int, total: int) -> dict:
+            return {
+                "event": "EXPERT_TASK_SUMMARY",
+                "trace_mode": "summary",
+                "queue_wait_ns_by_stage": {
+                    "EARLY": {"count": 1, "total_ns": total, "min_ns": minimum, "max_ns": maximum},
+                },
+            }
+
+        metrics = collect_metrics({
+            "memory": [summary(30, 30, 30), summary(10, 70, 70)],
+            "tensor": [],
+            "kv": [],
+            "expert": [],
+        })
+        early = metrics["expert_task_queue_wait_ns_by_stage"]["EARLY"]
+        self.assertEqual(early, {"count": 2, "total_ns": 100, "min_ns": 10, "max_ns": 70})
+        self.assertAlmostEqual(metrics["expert_task_early_queue_wait_max_us"], 0.07)
 
     def test_coalesced_issue_group_is_one_to_many(self) -> None:
         def issued(task_id: int) -> dict:

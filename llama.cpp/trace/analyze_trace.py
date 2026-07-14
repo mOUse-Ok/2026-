@@ -1273,16 +1273,36 @@ def collect_metrics(data: dict[str, list[dict]]) -> dict:
             "unknown_task_count",
         ):
             metrics[f"expert_task_{field}"] = sum(int(r.get(field, 0)) for r in task_summaries)
-        metrics["expert_task_queue_wait_ns_by_stage"] = {
-            stage: {
-                field: sum(
-                    int(r.get("queue_wait_ns_by_stage", {}).get(stage, {}).get(field, 0))
-                    for r in task_summaries
-                )
-                for field in ("count", "total_ns", "min_ns", "max_ns")
+        metrics["expert_task_queue_wait_ns_by_stage"] = {}
+        for stage in ("EARLY", "LATE", "UNKNOWN"):
+            waits = [r.get("queue_wait_ns_by_stage", {}).get(stage, {}) for r in task_summaries]
+            nonempty_mins = [
+                int(wait.get("min_ns", 0)) for wait in waits if int(wait.get("count", 0)) > 0
+            ]
+            metrics["expert_task_queue_wait_ns_by_stage"][stage] = {
+                "count": sum(int(wait.get("count", 0)) for wait in waits),
+                "total_ns": sum(int(wait.get("total_ns", 0)) for wait in waits),
+                "min_ns": min(nonempty_mins) if nonempty_mins else 0,
+                "max_ns": max((int(wait.get("max_ns", 0)) for wait in waits), default=0),
             }
-            for stage in ("EARLY", "LATE", "UNKNOWN")
-        }
+        for field in ("enqueued_by_stage", "issued_by_stage", "late_count_by_stage"):
+            metrics[f"expert_task_{field}"] = {
+                stage: sum(int(r.get(field, {}).get(stage, 0)) for r in task_summaries)
+                for stage in ("EARLY", "LATE", "UNKNOWN")
+            }
+        for stage in ("EARLY", "LATE", "UNKNOWN"):
+            stage_key = stage.lower()
+            wait = metrics["expert_task_queue_wait_ns_by_stage"][stage]
+            metrics[f"expert_task_{stage_key}_enqueued"] = metrics[
+                "expert_task_enqueued_by_stage"][stage]
+            metrics[f"expert_task_{stage_key}_issued"] = metrics[
+                "expert_task_issued_by_stage"][stage]
+            metrics[f"expert_task_{stage_key}_deadline_late_count"] = metrics[
+                "expert_task_late_count_by_stage"][stage]
+            metrics[f"expert_task_{stage_key}_queue_wait_avg_us"] = (
+                float(wait["total_ns"]) / float(wait["count"]) / 1e3 if wait["count"] else 0.0
+            )
+            metrics[f"expert_task_{stage_key}_queue_wait_max_us"] = float(wait["max_ns"]) / 1e3
         metrics["expert_controller_cancelled_total"] = max(
             int(metrics.get("expert_controller_cancelled_total", 0)),
             metrics["expert_task_rejected"] + metrics["expert_task_cancelled"],
