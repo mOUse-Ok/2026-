@@ -284,7 +284,7 @@ MEMORY_SWAP_MAX=2G \
 bash llama.cpp/trace/run_stage_deadline_score_repeat_matrix.sh
 ```
 
-该矩阵只比较 `deadline_score` 与 `stage_deadline_score`，两组均使用全部 routed experts（`PREFETCH_TOPK=0`）、4 workers、单任务 batch、无 coalescing，并关闭 Slack/feedback/value admission 和跨层预测；不配置 Chunk 切分。两组设置 `LLM_MEM_TRACE_OPT_EXPERT_DEADLINE_OBSERVE=1` 以生成同口径 deadline，且新 mode 默认也会估计 deadline 供 UNKNOWN legacy 仲裁和 late telemetry 使用；Slack 关闭时不会据此拒绝或取消任务。正式结果须核对输出 hash、零 trace loss、每阶段 late count 及 `queue_wait_ns_by_stage` 的 `max_ns`。
+该矩阵只比较 `deadline_score` 与 `stage_deadline_score`，默认分别测试 2/4 workers，并对 mode 和 worker 顺序做 repeat 级轮换；可用 `WORKER_COUNTS="2 4"` 显式覆盖。两组均使用全部 routed experts（`PREFETCH_TOPK=0`）、单任务 batch、无 coalescing，并关闭 Slack/feedback/value admission、跨层预测和 Expert TTL；不配置 Chunk 切分。两组设置 `LLM_MEM_TRACE_OPT_EXPERT_DEADLINE_OBSERVE=1` 以生成同口径 deadline，且新 mode 默认也会估计 deadline 供 UNKNOWN legacy 仲裁和 late telemetry 使用；Slack 关闭时不会据此拒绝或取消任务。正式结果须核对输出 hash、零 trace loss、每阶段 late count 及 `queue_wait_ns_by_stage` 的 `max_ns`。为输出 PSS/Swap，独立矩阵默认对两组统一启用 `smaps_rollup`；不需要该指标时可设置 `TRACE_SMAPS=0`。
 
 ## 13. 常见问题
 
