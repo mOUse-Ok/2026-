@@ -26,13 +26,18 @@ import pandas as pd
 
 from trace_metrics import collect_core_metrics, inference_latency_records
 from stage_scheduling_analysis import analyze_stage_scheduling_opportunity
+from shadow_slack_analysis import analyze_shadow_slack
 
 
 # ─────────────────────────────────────────────
 #  JSONL Parsing
 # ─────────────────────────────────────────────
 
-def load_jsonl(path: str, max_records: int | None = None) -> list[dict]:
+def load_jsonl(
+    path: str,
+    max_records: int | None = None,
+    exclude_substrings: tuple[str, ...] = (),
+) -> list[dict]:
     """Load a JSONL file, returning a list of parsed dicts.
     If max_records is set, sample uniformly to not exceed that count.
     For very large files, this avoids OOM and excessive processing time."""
@@ -59,6 +64,8 @@ def load_jsonl(path: str, max_records: int | None = None) -> list[dict]:
             # Can load all
             with open(path, "r") as f:
                 for line in f:
+                    if any(token in line for token in exclude_substrings):
+                        continue
                     line = line.strip()
                     if not line:
                         continue
@@ -73,6 +80,8 @@ def load_jsonl(path: str, max_records: int | None = None) -> list[dict]:
                 for i, line in enumerate(f):
                     # Use deterministic sampling
                     if int(i / step) != int((i - 1) / step) if i > 0 else True:
+                        if any(token in line for token in exclude_substrings):
+                            continue
                         line = line.strip()
                         if not line:
                             continue
@@ -84,6 +93,8 @@ def load_jsonl(path: str, max_records: int | None = None) -> list[dict]:
     else:
         with open(path, "r") as f:
             for line in f:
+                if any(token in line for token in exclude_substrings):
+                    continue
                 line = line.strip()
                 if not line:
                     continue
@@ -116,7 +127,10 @@ def load_all(trace_dir: str) -> dict[str, list[dict]]:
         "tensor": tensor_records,
         "kv":     load_jsonl(os.path.join(trace_dir, "kv_trace.jsonl")),
         "expert": load_jsonl(os.path.join(trace_dir, "expert_trace.jsonl")),
-        "memory": load_jsonl(os.path.join(trace_dir, "memory_trace.jsonl")),
+        "memory": load_jsonl(
+            os.path.join(trace_dir, "memory_trace.jsonl"),
+            exclude_substrings=('"event":"EXPERT_SHADOW_SLACK"',),
+        ),
     }
     run_id = Path(trace_dir).resolve().name
     manifest_path = Path(trace_dir) / "run_manifest.json"
@@ -128,6 +142,44 @@ def load_all(trace_dir: str) -> dict[str, list[dict]]:
     for record in data["memory"]:
         record.setdefault("run_id", run_id)
     return data
+
+
+class ShadowSlackEventStream:
+    """Re-iterable filtered JSONL view used by the multi-pass M4A.1 analyzer."""
+
+    def __init__(self, path: Path, run_id: str):
+        self.path = path
+        self.run_id = run_id
+
+    def __iter__(self):
+        with self.path.open("r", encoding="utf-8") as stream:
+            for line in stream:
+                if (
+                    '"event":"EXPERT_SHADOW_SLACK' not in line
+                    and '"event":"OS_HINT"' not in line
+                ):
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                record.setdefault("run_id", self.run_id)
+                yield record
+
+
+def load_shadow_slack_events(trace_dir: str):
+    """Return a streaming Shadow/OS_HINT view to avoid Detail-record OOM."""
+    path = Path(trace_dir) / "memory_trace.jsonl"
+    if not path.exists():
+        return []
+    run_id = Path(trace_dir).resolve().name
+    manifest_path = Path(trace_dir) / "run_manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        run_id = str(manifest.get("run_name") or run_id)
+    except (OSError, json.JSONDecodeError):
+        pass
+    return ShadowSlackEventStream(path, run_id)
 
 
 def load_key_tensor_events(path: str) -> list[dict]:
@@ -1063,7 +1115,10 @@ def collect_expert_stage_pairing(first_use_events: list[dict]) -> dict:
     result["duplicate_match_records_collapsed"] = len(first_use_events) - invalid_stage_records - len(observations)
     return result
 
-def collect_metrics(data: dict[str, list[dict]]) -> dict:
+def collect_metrics(
+    data: dict[str, list[dict]],
+    shadow_records=None,
+) -> dict:
     """Extract key numeric metrics for the report."""
     metrics = collect_core_metrics(data["memory"])
 
@@ -1563,6 +1618,9 @@ def collect_metrics(data: dict[str, list[dict]]) -> dict:
 
     metrics["expert_stage_scheduling_opportunity"] = analyze_stage_scheduling_opportunity(
         data["memory"]
+    )
+    metrics["expert_shadow_slack"] = analyze_shadow_slack(
+        data["memory"] if shadow_records is None else shadow_records
     )
 
     async_summaries = [r for r in data["memory"] if r.get("event") == "EXPERT_ASYNC_SUMMARY"]
@@ -2099,10 +2157,13 @@ def main():
     data = load_all(trace_dir)
     for name, records in data.items():
         print(f"      {name}: {len(records)} events")
+    shadow_records = load_shadow_slack_events(trace_dir)
+    if shadow_records:
+        print("      shadow calibration pass: streaming filtered events")
 
     # Collect metrics
     print("\n[2/7] Computing key metrics...")
-    metrics = collect_metrics(data)
+    metrics = collect_metrics(data, shadow_records=shadow_records)
 
     process_metrics_path = os.path.join(trace_dir, "process_metrics.json")
     if os.path.exists(process_metrics_path):
@@ -2177,6 +2238,10 @@ def main():
     with open(stage_opportunity_path, "w") as f:
         json.dump(metrics["expert_stage_scheduling_opportunity"], f, indent=2, default=str)
     print(f"  [OK] {stage_opportunity_path}")
+    shadow_slack_path = os.path.join(out_dir, "shadow_slack_calibration.json")
+    with open(shadow_slack_path, "w") as f:
+        json.dump(metrics["expert_shadow_slack"], f, indent=2, default=str)
+    print(f"  [OK] {shadow_slack_path}")
 
     # Write a text summary
     print("\n[7/7] Writing text summary...")

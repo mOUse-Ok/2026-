@@ -6,6 +6,8 @@
 #include "expert_tensor_stage.h"
 #include "expert_task_lifecycle.h"
 #include "expert_first_use_matcher.h"
+#include "expert_shadow_slack.h"
+#include "expert_pressure_shadow.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -283,6 +285,92 @@ bool env_bool_or_default(const char * key, bool def_value) {
     return value && value[0] ? env_truthy(value) : def_value;
 }
 
+uint64_t env_us_to_ns_or_default(const char * key, uint64_t def_us) {
+    const uint64_t value_us = env_u64_or_default(key, def_us);
+    return value_us > std::numeric_limits<uint64_t>::max() / 1000ull ?
+            std::numeric_limits<uint64_t>::max() : value_us * 1000ull;
+}
+
+const ExpertShadowConfig & expert_shadow_config() {
+    static const ExpertShadowConfig config = [] {
+        ExpertShadowConfig result;
+        const char * mode = std::getenv("LLM_MEM_TRACE_OPT_EXPERT_SLACK_MODE");
+        if (mode && mode[0]) {
+            if (std::strcmp(mode, "shadow") == 0) {
+                result.enabled = true;
+            } else if (std::strcmp(mode, "off") != 0) {
+                result.config_error = true;
+            }
+        }
+        result.window_capacity = std::min<size_t>(
+                env_size_or_default("LLM_MEM_TRACE_OPT_EXPERT_SHADOW_WINDOW", 64), 1024);
+        result.min_samples = std::min<uint64_t>(
+                env_u64_or_default("LLM_MEM_TRACE_OPT_EXPERT_SHADOW_MIN_SAMPLES", 8), 1'000'000);
+        result.ewma_alpha = env_double_or_default(
+                "LLM_MEM_TRACE_OPT_EXPERT_SHADOW_EWMA_ALPHA", 0.2);
+        result.residual_quantile = env_double_or_default(
+                "LLM_MEM_TRACE_OPT_EXPERT_SHADOW_RESIDUAL_QUANTILE", 0.25);
+        result.horizon_default_ns = env_us_to_ns_or_default(
+                "LLM_MEM_TRACE_OPT_EXPERT_SHADOW_HORIZON_DEFAULT_US", 5000);
+        result.horizon_min_ns = env_us_to_ns_or_default(
+                "LLM_MEM_TRACE_OPT_EXPERT_SHADOW_HORIZON_MIN_US", 1);
+        result.horizon_max_ns = env_us_to_ns_or_default(
+                "LLM_MEM_TRACE_OPT_EXPERT_SHADOW_HORIZON_MAX_US", 5'000'000);
+        result.worker_default_ns = env_us_to_ns_or_default(
+                "LLM_MEM_TRACE_OPT_EXPERT_SHADOW_WORKER_OCCUPIED_DEFAULT_US",
+                env_u64_or_default("LLM_MEM_TRACE_OPT_EXPERT_SHADOW_WORKER_DEFAULT_US", 50));
+        result.worker_min_ns = env_us_to_ns_or_default(
+                "LLM_MEM_TRACE_OPT_EXPERT_SHADOW_WORKER_OCCUPIED_MIN_US",
+                env_u64_or_default("LLM_MEM_TRACE_OPT_EXPERT_SHADOW_WORKER_MIN_US", 1));
+        result.worker_max_ns = env_us_to_ns_or_default(
+                "LLM_MEM_TRACE_OPT_EXPERT_SHADOW_WORKER_OCCUPIED_MAX_US",
+                env_u64_or_default(
+                        "LLM_MEM_TRACE_OPT_EXPERT_SHADOW_WORKER_MAX_US", 1'000'000));
+        result.pre_issue_default_ns = env_us_to_ns_or_default(
+                "LLM_MEM_TRACE_OPT_EXPERT_SHADOW_PRE_ISSUE_DEFAULT_US", 10);
+        result.pre_issue_min_ns = env_us_to_ns_or_default(
+                "LLM_MEM_TRACE_OPT_EXPERT_SHADOW_PRE_ISSUE_MIN_US", 1);
+        result.pre_issue_max_ns = env_us_to_ns_or_default(
+                "LLM_MEM_TRACE_OPT_EXPERT_SHADOW_PRE_ISSUE_MAX_US", 1'000'000);
+        result.syscall_service_default_ns = env_us_to_ns_or_default(
+                "LLM_MEM_TRACE_OPT_EXPERT_SHADOW_SYSCALL_SERVICE_DEFAULT_US", 40);
+        result.syscall_service_min_ns = env_us_to_ns_or_default(
+                "LLM_MEM_TRACE_OPT_EXPERT_SHADOW_SYSCALL_SERVICE_MIN_US", 1);
+        result.syscall_service_max_ns = env_us_to_ns_or_default(
+                "LLM_MEM_TRACE_OPT_EXPERT_SHADOW_SYSCALL_SERVICE_MAX_US", 1'000'000);
+        const double throughput_mib_s = std::max(0.001, env_double_or_default(
+                "LLM_MEM_TRACE_OPT_EXPERT_SHADOW_THROUGHPUT_DEFAULT_MIB_S", 512.0));
+        result.throughput_default_bytes_per_ns =
+                throughput_mib_s * 1024.0 * 1024.0 / 1e9;
+        result.max_pending_tasks = std::min<size_t>(
+                env_size_or_default("LLM_MEM_TRACE_OPT_EXPERT_SHADOW_MAX_PENDING", 8192), 65536);
+        result.max_first_use_keys = std::min<size_t>(env_size_or_default(
+                "LLM_MEM_TRACE_OPT_EXPERT_SHADOW_MAX_FIRST_USE_KEYS", 65536), 262144);
+        result.max_estimator_cells = std::min<size_t>(
+                env_size_or_default("LLM_MEM_TRACE_OPT_EXPERT_SHADOW_MAX_CELLS", 4096), 16384);
+        result.max_residual_cells = std::min<size_t>(env_size_or_default(
+                "LLM_MEM_TRACE_OPT_EXPERT_SHADOW_MAX_RESIDUAL_CELLS", 4096), 16384);
+        result.step_retention = std::min<uint64_t>(
+                env_u64_or_default("LLM_MEM_TRACE_OPT_EXPERT_SHADOW_STEP_RETENTION", 2), 64);
+        return result;
+    }();
+    return config;
+}
+
+bool expert_shadow_enabled() {
+    return expert_shadow_config().enabled;
+}
+
+bool expert_shadow_summary_requested() {
+    const ExpertShadowConfig & config = expert_shadow_config();
+    return config.enabled || config.config_error;
+}
+
+ExpertShadowSlack & expert_shadow_slack() {
+    static ExpertShadowSlack shadow(expert_shadow_config());
+    return shadow;
+}
+
 bool contains_substring_token(const char * name, const char * start, size_t len) {
     if (!name || !start || len == 0) {
         return false;
@@ -504,6 +592,9 @@ void apply_madvise_hint(
     errno = 0;
     const int rc = madvise(reinterpret_cast<void *>(start), len, advice);
     const int err = rc == 0 ? 0 : errno;
+    llm_pressure_shadow::record_hint_call(
+            meta && meta->has_trace_context ? meta->step : llm_mem_trace_get_step(),
+            len);
     write_os_hint_event(action, trigger, tensor_name, layer, expert, addr, nbytes, len, rc, err, 0, meta);
 #else
     (void) action; (void) advice; (void) trigger; (void) tensor_name; (void) layer; (void) expert; (void) addr; (void) nbytes; (void) meta;
@@ -587,6 +678,9 @@ void apply_posix_fadvise_hint(
     }
     const int rc = posix_fadvise(fd, (off_t) file_offset, (off_t) advise_len, POSIX_FADV_WILLNEED);
     close(fd);
+    llm_pressure_shadow::record_hint_call(
+            meta && meta->has_trace_context ? meta->step : llm_mem_trace_get_step(),
+            advise_len);
     write_os_hint_event(action, trigger, tensor_name, layer, expert, addr, nbytes, advise_len, rc == 0 ? 0 : -1, rc, file_offset, meta);
 #else
     (void) action; (void) trigger; (void) tensor_name; (void) layer; (void) expert; (void) addr; (void) nbytes; (void) meta;
@@ -2102,6 +2196,544 @@ void write_expert_first_use_event(const ExpertFirstUseMatch & match) {
     }
 }
 
+void append_shadow_error_aggregate(
+        std::string & line, const ExpertShadowErrorAggregate & aggregate) {
+    line += "{\"count\":" + std::to_string(aggregate.count);
+    line += ",\"absolute_error_sum_ns\":" +
+            std::to_string(aggregate.absolute_error_sum_ns);
+    line += ",\"signed_error_sum_ns\":" + std::to_string(aggregate.signed_error_sum_ns);
+    line += ",\"true_positive\":" + std::to_string(aggregate.true_positive);
+    line += ",\"true_negative\":" + std::to_string(aggregate.true_negative);
+    line += ",\"false_positive\":" + std::to_string(aggregate.false_positive);
+    line += ",\"false_negative\":" + std::to_string(aggregate.false_negative);
+    line += ",\"warmup\":" + std::to_string(aggregate.warmup);
+    line += ",\"fallback\":" + std::to_string(aggregate.fallback);
+    line += ",\"clipped\":" + std::to_string(aggregate.clipped);
+    line += ",\"mature_exact\":" + std::to_string(aggregate.mature_exact);
+    line += ",\"absolute_error_histogram\":[";
+    for (size_t i = 0; i < aggregate.absolute_error_histogram.size(); ++i) {
+        if (i != 0) {
+            line += ",";
+        }
+        line += std::to_string(aggregate.absolute_error_histogram[i]);
+    }
+    line += "]";
+    line += ",\"calibration\":[";
+    for (size_t i = 0; i < aggregate.calibration.size(); ++i) {
+        if (i != 0) {
+            line += ",";
+        }
+        line += "{\"total\":" + std::to_string(aggregate.calibration[i].total);
+        line += ",\"on_time\":" + std::to_string(aggregate.calibration[i].on_time) + "}";
+    }
+    line += "]}";
+}
+
+void append_shadow_duration_aggregate(
+        std::string & line, const ExpertShadowDurationAggregate & aggregate) {
+    line += "{\"count\":" + std::to_string(aggregate.count);
+    line += ",\"absolute_error_sum_ns\":" +
+            std::to_string(aggregate.absolute_error_sum_ns);
+    line += ",\"signed_error_sum_ns\":" + std::to_string(aggregate.signed_error_sum_ns);
+    line += ",\"warmup\":" + std::to_string(aggregate.warmup);
+    line += ",\"fallback\":" + std::to_string(aggregate.fallback) + "}";
+}
+
+void append_shadow_target_aggregate(
+        std::string & line, const ExpertShadowTargetAggregate & aggregate) {
+    line += "{\"count\":" + std::to_string(aggregate.count);
+    line += ",\"unavailable\":" + std::to_string(aggregate.unavailable);
+    line += ",\"absolute_error_sum_ns\":" +
+            std::to_string(aggregate.absolute_error_sum_ns);
+    line += ",\"signed_error_sum_ns\":" +
+            std::to_string(aggregate.signed_error_sum_ns);
+    line += ",\"true_positive\":" + std::to_string(aggregate.true_positive);
+    line += ",\"true_negative\":" + std::to_string(aggregate.true_negative);
+    line += ",\"false_positive\":" + std::to_string(aggregate.false_positive);
+    line += ",\"false_negative\":" + std::to_string(aggregate.false_negative);
+    line += ",\"warmup\":" + std::to_string(aggregate.warmup);
+    line += ",\"fallback\":" + std::to_string(aggregate.fallback);
+    line += ",\"mature_exact\":" + std::to_string(aggregate.mature_exact);
+    line += ",\"calibration\":[";
+    for (size_t i = 0; i < aggregate.calibration.size(); ++i) {
+        if (i != 0) {
+            line += ",";
+        }
+        line += "{\"total\":" + std::to_string(aggregate.calibration[i].total);
+        line += ",\"on_time\":" + std::to_string(aggregate.calibration[i].on_time) + "}";
+    }
+    line += "]}";
+}
+
+void write_expert_shadow_observations(
+        const std::vector<ExpertShadowTaskObservation> & observations) {
+    if (!expert_shadow_enabled() || !expert_task_detail_events_enabled() ||
+            !llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_MEMORY)) {
+        return;
+    }
+    for (const ExpertShadowTaskObservation & observation : observations) {
+        char addr_buf[32];
+        std::snprintf(
+                addr_buf, sizeof(addr_buf), "0x%llx",
+                (unsigned long long) observation.addr);
+        std::string line;
+        line.reserve(32768);
+        line += "{\"event\":\"EXPERT_SHADOW_SLACK\",\"ts_ns\":" +
+                std::to_string(std::max(observation.returned_ts_ns, observation.first_use_ts_ns));
+        line += ",\"schema_version\":2";
+        line += ",\"semantics\":\"logical_first_use\",\"physical_load_observed\":false";
+        line += ",\"issue_target\":\"issue_ts < logical_first_use_ts\"";
+        line += ",\"return_target\":\"final_enabled_hint_return_ts < logical_first_use_ts\"";
+        line += ",\"task_id\":" + std::to_string(observation.task_id);
+        line += ",\"issue_id\":" + std::to_string(observation.issue_id);
+        line += ",\"issue_task_count\":" + std::to_string(observation.issue_task_count);
+        line += ",\"step\":" + std::to_string(observation.step);
+        line += ",\"layer\":" + std::to_string(observation.layer);
+        line += ",\"expert\":" + std::to_string(observation.expert);
+        line += ",\"phase\":\"" + std::string(phase_name(observation.phase)) + "\"";
+        line += ",\"stage\":\"" +
+                std::string(expert_tensor_stage_name(observation.stage)) + "\"";
+        line += ",\"tensor\":";
+        json_escape_append(line, observation.tensor.c_str());
+        line += ",\"addr\":";
+        json_escape_append(line, addr_buf);
+        line += ",\"nbytes\":" + std::to_string(observation.nbytes);
+        line += ",\"issued_nbytes\":" + std::to_string(observation.issued_nbytes);
+        line += ",\"prediction_ts_ns\":" + std::to_string(observation.prediction_ts_ns);
+        line += ",\"enqueued_ts_ns\":" + std::to_string(observation.enqueued_ts_ns);
+        line += ",\"dequeued_ts_ns\":" + std::to_string(observation.dequeued_ts_ns);
+        line += ",\"issue_ts_ns\":" + std::to_string(observation.issue_ts_ns);
+        line += ",\"issued_ts_ns\":" + std::to_string(observation.issue_ts_ns);
+        line += ",\"returned_ts_ns\":" + std::to_string(observation.returned_ts_ns);
+        line += ",\"first_use_ts_ns\":" + std::to_string(observation.first_use_ts_ns);
+        line += ",\"queue_depth_before_enqueue\":" +
+                std::to_string(observation.queue_depth_before_enqueue);
+        line += ",\"queued_bytes_before_enqueue\":" +
+                std::to_string(observation.queued_bytes_before_enqueue);
+        line += ",\"active_workers\":" + std::to_string(observation.active_workers);
+        if (observation.has_actual_queue_wait) {
+            line += ",\"actual_queue_wait_ns\":" +
+                    std::to_string(observation.actual_queue_wait_ns);
+        } else {
+            line += ",\"actual_queue_wait_ns\":null";
+        }
+        if (observation.first_use_ts_ns >= observation.prediction_ts_ns) {
+            line += ",\"actual_first_use_horizon_ns\":" +
+                    std::to_string(observation.first_use_ts_ns - observation.prediction_ts_ns);
+        } else {
+            line += ",\"actual_first_use_horizon_ns\":null";
+        }
+        if (observation.has_actual_pre_issue_overhead) {
+            line += ",\"actual_pre_issue_overhead_ns\":" +
+                    std::to_string(observation.actual_pre_issue_overhead_ns);
+        } else {
+            line += ",\"actual_pre_issue_overhead_ns\":null";
+        }
+        if (observation.has_actual_hint_syscall_service) {
+            line += ",\"actual_hint_syscall_service_ns\":" +
+                    std::to_string(observation.actual_hint_syscall_service_ns);
+        } else {
+            line += ",\"actual_hint_syscall_service_ns\":null";
+        }
+        if (observation.has_actual_worker_occupied) {
+            line += ",\"actual_worker_occupied_ns\":" +
+                    std::to_string(observation.actual_worker_occupied_ns);
+        } else {
+            line += ",\"actual_worker_occupied_ns\":null";
+        }
+        if (observation.has_actual_issue_slack) {
+            line += ",\"actual_issue_slack_ns\":" +
+                    std::to_string(observation.actual_issue_slack_ns);
+            line += ",\"issue_on_time\":" + std::string(
+                    observation.actual_issue_slack_ns > 0 ? "true" : "false");
+        } else {
+            line += ",\"actual_issue_slack_ns\":null,\"issue_on_time\":null";
+        }
+        if (observation.has_actual_return_slack) {
+            line += ",\"actual_return_slack_ns\":" +
+                    std::to_string(observation.actual_return_slack_ns);
+            line += ",\"return_on_time\":" + std::string(
+                    observation.actual_return_slack_ns > 0 ? "true" : "false");
+        } else {
+            line += ",\"actual_return_slack_ns\":null,\"return_on_time\":null";
+        }
+        line += ",\"coalesced\":" + std::string(observation.coalesced ? "true" : "false");
+        line += ",\"finalized\":" + std::string(observation.finalized ? "true" : "false");
+        line += ",\"causality_error\":" +
+                std::string(observation.causality_error ? "true" : "false");
+        if (!observation.unavailable_reason.empty()) {
+            line += ",\"unavailable_reason\":";
+            json_escape_append(line, observation.unavailable_reason.c_str());
+        } else {
+            line += ",\"unavailable_reason\":null";
+        }
+        line += ",\"predictions\":[";
+        for (size_t i = 0; i < observation.predictions.size(); ++i) {
+            if (i != 0) {
+                line += ",";
+            }
+            const ExpertShadowPrediction & prediction = observation.predictions[i];
+            line += "{\"predicted_first_use_ts_ns\":" +
+                    std::to_string(prediction.predicted_first_use_ts_ns);
+            line += ",\"predicted_first_use_horizon_ns\":" +
+                    std::to_string(prediction.predicted_first_use_horizon_ns);
+            line += ",\"raw_predicted_first_use_horizon_ns\":" +
+                    std::to_string(prediction.raw_predicted_first_use_horizon_ns);
+            line += ",\"residual_adjustment_ns\":" +
+                    std::to_string(prediction.residual_adjustment_ns);
+            line += ",\"predicted_queue_wait_ns\":" +
+                    std::to_string(prediction.predicted_queue_wait_ns);
+            line += ",\"predicted_pre_issue_overhead_ns\":" +
+                    std::to_string(prediction.predicted_pre_issue_overhead_ns);
+            line += ",\"predicted_hint_syscall_service_ns\":" +
+                    std::to_string(prediction.predicted_hint_syscall_service_ns);
+            line += ",\"predicted_worker_occupied_ns\":" +
+                    std::to_string(prediction.predicted_worker_occupied_ns);
+            line += ",\"predicted_issue_slack_ns\":" +
+                    std::to_string(prediction.predicted_issue_slack_ns);
+            line += ",\"predicted_return_slack_ns\":" +
+                    std::to_string(prediction.predicted_return_slack_ns);
+            line += ",\"estimator_sample_count\":" +
+                    std::to_string(prediction.estimator_sample_count);
+            line += ",\"estimator_effective_sample_count\":" +
+                    std::to_string(prediction.estimator_effective_sample_count);
+            line += ",\"residual_sample_count\":" +
+                    std::to_string(prediction.residual_sample_count);
+            line += ",\"residual_effective_sample_count\":" +
+                    std::to_string(prediction.residual_effective_sample_count);
+            line += ",\"queue_sample_count\":" +
+                    std::to_string(prediction.queue_sample_count);
+            line += ",\"worker_sample_count\":" +
+                    std::to_string(prediction.worker_sample_count);
+            line += ",\"pre_issue_sample_count\":" +
+                    std::to_string(prediction.pre_issue_sample_count);
+            line += ",\"syscall_service_sample_count\":" +
+                    std::to_string(prediction.syscall_service_sample_count);
+            line += ",\"estimator_warmup\":" +
+                    std::string(prediction.estimator_warmup ? "true" : "false");
+            line += ",\"queue_warmup\":" +
+                    std::string(prediction.queue_warmup ? "true" : "false");
+            line += ",\"worker_warmup\":" +
+                    std::string(prediction.worker_warmup ? "true" : "false");
+            line += ",\"pre_issue_warmup\":" +
+                    std::string(prediction.pre_issue_warmup ? "true" : "false");
+            line += ",\"syscall_service_warmup\":" +
+                    std::string(prediction.syscall_service_warmup ? "true" : "false");
+            line += ",\"residual_warmup\":" +
+                    std::string(prediction.residual_warmup ? "true" : "false");
+            line += ",\"deadline_model\":\"" +
+                    std::string(expert_shadow_grouping_name(prediction.grouping)) + "_" +
+                    expert_shadow_estimator_name(prediction.estimator) + "\"";
+            line += ",\"queue_model\":\"" +
+                    std::string(expert_shadow_queue_model_name(prediction.queue_model)) + "\"";
+            line += ",\"calibration_model\":\"" + std::string(
+                    expert_shadow_calibration_model_name(prediction.calibration_model)) + "\"";
+            line += ",\"fallback_level\":\"" +
+                    std::string(expert_shadow_fallback_name(prediction.fallback_level)) + "\"";
+            line += ",\"queue_fallback_level\":\"" +
+                    std::string(expert_shadow_fallback_name(prediction.queue_fallback_level)) + "\"";
+            line += ",\"worker_fallback_level\":\"" +
+                    std::string(expert_shadow_fallback_name(prediction.worker_fallback_level)) + "\"";
+            line += ",\"pre_issue_fallback_level\":\"" + std::string(
+                    expert_shadow_fallback_name(prediction.pre_issue_fallback_level)) + "\"";
+            line += ",\"syscall_service_fallback_level\":\"" + std::string(
+                    expert_shadow_fallback_name(
+                            prediction.syscall_service_fallback_level)) + "\"";
+            line += ",\"residual_fallback_level\":\"" + std::string(
+                    expert_shadow_fallback_name(prediction.residual_fallback_level)) + "\"";
+            line += ",\"stage\":\"" +
+                    std::string(expert_tensor_stage_name(observation.stage)) + "\"";
+            line += ",\"phase\":\"" + std::string(phase_name(observation.phase)) + "\"";
+            line += ",\"layer\":" + std::to_string(observation.layer);
+            line += ",\"prediction_available\":" +
+                    std::string(prediction.prediction_available ? "true" : "false");
+            line += ",\"issue_prediction_available\":" +
+                    std::string(prediction.issue_prediction_available ? "true" : "false");
+            line += ",\"return_prediction_available\":" +
+                    std::string(prediction.return_prediction_available ? "true" : "false");
+            if (!prediction.prediction_available) {
+                line += ",\"prediction_unavailable_reason\":\"";
+                line += observation.active_workers == 0 ? "no_active_worker" :
+                        (prediction.queue_model ==
+                                 ExpertShadowQueueModel::QueuedBytesIssueThroughput &&
+                         prediction.queue_sample_count == 0 ?
+                                 "no_throughput_sample" : "unavailable");
+                line += "\"";
+            } else {
+                line += ",\"prediction_unavailable_reason\":null";
+            }
+            line += ",\"clipped_low\":" +
+                    std::string(prediction.clipped_low ? "true" : "false");
+            line += ",\"clipped_high\":" +
+                    std::string(prediction.clipped_high ? "true" : "false") + "}";
+        }
+        line += "]}";
+        llm_mem_trace_write(LLM_MEM_TRACE_SINK_MEMORY, line.c_str(), line.size());
+    }
+}
+
+void write_expert_shadow_summary() {
+    if (!expert_shadow_summary_requested() ||
+            !llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_MEMORY)) {
+        return;
+    }
+    const ExpertShadowSummary summary = expert_shadow_slack().summary();
+    const ExpertShadowConfig & config = summary.config;
+    std::string line;
+    line.reserve(65536);
+    line += "{\"event\":\"EXPERT_SHADOW_SLACK_SUMMARY\",\"ts_ns\":" +
+            std::to_string(llm_mem_trace_time_ns());
+    line += ",\"schema_version\":2";
+    line += ",\"mode\":\"" + std::string(config.enabled ? "shadow" : "off") + "\"";
+    line += ",\"config_error\":" + std::string(config.config_error ? "true" : "false");
+    line += ",\"semantics\":\"logical_first_use\",\"physical_load_observed\":false";
+    line += ",\"targets\":{\"issue\":{\"prediction\":\"first_use_horizon - queue_wait - pre_issue_overhead\",\"actual_label\":\"issue_ts < logical_first_use_ts\"},\"return\":{\"prediction\":\"first_use_horizon - queue_wait - pre_issue_overhead - hint_syscall_service\",\"actual_label\":\"final_enabled_hint_return_ts < logical_first_use_ts\"}}";
+    line += ",\"window_capacity\":" + std::to_string(config.window_capacity);
+    line += ",\"min_samples\":" + std::to_string(config.min_samples);
+    line += ",\"ewma_alpha\":" + std::to_string(config.ewma_alpha);
+    line += ",\"residual_quantile\":" + std::to_string(config.residual_quantile);
+    line += ",\"horizon_default_ns\":" + std::to_string(config.horizon_default_ns);
+    line += ",\"horizon_min_ns\":" + std::to_string(config.horizon_min_ns);
+    line += ",\"horizon_max_ns\":" + std::to_string(config.horizon_max_ns);
+    line += ",\"worker_occupied_default_ns\":" + std::to_string(config.worker_default_ns);
+    line += ",\"worker_occupied_min_ns\":" + std::to_string(config.worker_min_ns);
+    line += ",\"worker_occupied_max_ns\":" + std::to_string(config.worker_max_ns);
+    line += ",\"pre_issue_default_ns\":" + std::to_string(config.pre_issue_default_ns);
+    line += ",\"pre_issue_min_ns\":" + std::to_string(config.pre_issue_min_ns);
+    line += ",\"pre_issue_max_ns\":" + std::to_string(config.pre_issue_max_ns);
+    line += ",\"syscall_service_default_ns\":" +
+            std::to_string(config.syscall_service_default_ns);
+    line += ",\"syscall_service_min_ns\":" +
+            std::to_string(config.syscall_service_min_ns);
+    line += ",\"syscall_service_max_ns\":" +
+            std::to_string(config.syscall_service_max_ns);
+    line += ",\"throughput_default_bytes_per_ns\":" +
+            std::to_string(config.throughput_default_bytes_per_ns);
+    line += ",\"max_pending_tasks\":" + std::to_string(config.max_pending_tasks);
+    line += ",\"max_first_use_keys\":" + std::to_string(config.max_first_use_keys);
+    line += ",\"max_estimator_cells\":" + std::to_string(config.max_estimator_cells);
+    line += ",\"max_residual_cells\":" + std::to_string(config.max_residual_cells);
+    line += ",\"step_retention\":" + std::to_string(config.step_retention);
+    line += ",\"absolute_error_histogram_bounds_ns\":[100000,500000,1000000,5000000,20000000,100000000]";
+    line += ",\"calibration_bucket_labels\":[\"< -5 ms\",\"[-5 ms, -2 ms)\",\"[-2 ms, -1 ms)\",\"[-1 ms, -0.5 ms)\",\"[-0.5 ms, 0]\",\"(0, 0.5 ms]\",\"(0.5 ms, 1 ms]\",\"(1 ms, 2 ms]\",\"(2 ms, 5 ms]\",\"> 5 ms\"]";
+    line += ",\"eligible_tasks\":" + std::to_string(summary.eligible_tasks);
+    line += ",\"predicted_tasks\":" + std::to_string(summary.predicted_tasks);
+    line += ",\"unavailable_tasks\":" + std::to_string(summary.unavailable_tasks);
+    line += ",\"finalized_tasks\":" + std::to_string(summary.finalized_tasks);
+    line += ",\"expired_tasks\":" + std::to_string(summary.expired_tasks);
+    line += ",\"capacity_expired_tasks\":" +
+            std::to_string(summary.capacity_expired_tasks);
+    line += ",\"pending_tasks\":" + std::to_string(summary.pending_tasks);
+    line += ",\"peak_live_tasks\":" + std::to_string(summary.peak_live_tasks);
+    line += ",\"duplicate_task_ids\":" + std::to_string(summary.duplicate_task_ids);
+    line += ",\"logical_first_uses\":" + std::to_string(summary.logical_first_uses);
+    line += ",\"unmatched_first_uses\":" +
+            std::to_string(summary.unmatched_first_uses);
+    line += ",\"ambiguous_first_uses\":" +
+            std::to_string(summary.ambiguous_first_uses);
+    line += ",\"duplicate_first_uses\":" +
+            std::to_string(summary.duplicate_first_uses);
+    line += ",\"stage_mismatch_tasks\":" +
+            std::to_string(summary.stage_mismatch_tasks);
+    line += ",\"address_mismatch_tasks\":" +
+            std::to_string(summary.address_mismatch_tasks);
+    line += ",\"first_use_key_capacity_skips\":" +
+            std::to_string(summary.first_use_key_capacity_skips);
+    line += ",\"causality_errors\":" + std::to_string(summary.causality_errors);
+    line += ",\"issue_groups_observed\":" +
+            std::to_string(summary.issue_groups_observed);
+    line += ",\"worker_duration_observations\":" +
+            std::to_string(summary.worker_duration_observations);
+    line += ",\"estimator_cells\":" + std::to_string(summary.estimator_cells);
+    line += ",\"estimator_capacity_skips\":" +
+            std::to_string(summary.estimator_capacity_skips);
+    line += ",\"residual_cells\":" + std::to_string(summary.residual_cells);
+    line += ",\"residual_capacity_skips\":" +
+            std::to_string(summary.residual_capacity_skips);
+    line += ",\"expired_without_issue\":" +
+            std::to_string(summary.expired_without_issue);
+    line += ",\"expired_without_first_use\":" +
+            std::to_string(summary.expired_without_first_use);
+    static const char * phase_names[] = {"UNKNOWN", "PREFILL", "DECODE"};
+    static const ExpertTensorStage stages[] = {
+        ExpertTensorStage::Early,
+        ExpertTensorStage::Late,
+        ExpertTensorStage::Unknown,
+    };
+    line += ",\"finalized_by_phase\":{";
+    for (size_t i = 0; i < 3; ++i) {
+        if (i != 0) {
+            line += ",";
+        }
+        line += "\"" + std::string(phase_names[i]) + "\":" +
+                std::to_string(summary.finalized_by_phase[i]);
+    }
+    line += "},\"finalized_by_stage\":{";
+    for (size_t i = 0; i < 3; ++i) {
+        if (i != 0) {
+            line += ",";
+        }
+        line += "\"" + std::string(expert_tensor_stage_name(stages[i])) + "\":" +
+                std::to_string(summary.finalized_by_stage[i]);
+    }
+    line += "},\"queue_models\":[";
+    static const ExpertShadowQueueModel queue_models[] = {
+        ExpertShadowQueueModel::QueueDepthWorkerEwma,
+        ExpertShadowQueueModel::QueuedBytesIssueThroughput,
+    };
+    for (size_t i = 0; i < 2; ++i) {
+        if (i != 0) {
+            line += ",";
+        }
+        line += "{\"queue_model\":\"" +
+                std::string(expert_shadow_queue_model_name(queue_models[i])) + "\",\"error\":";
+        append_shadow_duration_aggregate(line, summary.queue_models[i]);
+        line += "}";
+    }
+    line += "],\"pre_issue_model\":";
+    append_shadow_duration_aggregate(line, summary.pre_issue_model);
+    line += ",\"hint_syscall_service_model\":";
+    append_shadow_duration_aggregate(line, summary.syscall_service_model);
+    line += ",\"worker_occupied_model\":";
+    append_shadow_duration_aggregate(line, summary.worker_occupied_model);
+    static const char * worker_bucket_names[] = {
+        "le_64k", "le_256k", "le_1m", "le_4m", "le_16m", "gt_16m",
+    };
+    line += ",\"pre_issue_duration_buckets\":[";
+    for (size_t i = 0; i < summary.pre_issue_buckets.size(); ++i) {
+        if (i != 0) {
+            line += ",";
+        }
+        line += "{\"bucket\":\"" + std::string(worker_bucket_names[i]) + "\"";
+        line += ",\"count\":" + std::to_string(summary.pre_issue_buckets[i].count);
+        line += ",\"window_count\":" +
+                std::to_string(summary.pre_issue_buckets[i].window_count);
+        line += ",\"ewma_ns\":" + std::to_string(summary.pre_issue_buckets[i].ewma_ns) + "}";
+    }
+    line += "],\"pre_issue_duration_global\":{\"count\":" +
+            std::to_string(summary.pre_issue_global.count);
+    line += ",\"window_count\":" + std::to_string(summary.pre_issue_global.window_count);
+    line += ",\"ewma_ns\":" + std::to_string(summary.pre_issue_global.ewma_ns) + "}";
+    line += ",\"hint_syscall_service_duration_buckets\":[";
+    for (size_t i = 0; i < summary.syscall_service_buckets.size(); ++i) {
+        if (i != 0) {
+            line += ",";
+        }
+        line += "{\"bucket\":\"" + std::string(worker_bucket_names[i]) + "\"";
+        line += ",\"count\":" +
+                std::to_string(summary.syscall_service_buckets[i].count);
+        line += ",\"window_count\":" +
+                std::to_string(summary.syscall_service_buckets[i].window_count);
+        line += ",\"ewma_ns\":" +
+                std::to_string(summary.syscall_service_buckets[i].ewma_ns) + "}";
+    }
+    line += "],\"hint_syscall_service_duration_global\":{\"count\":" +
+            std::to_string(summary.syscall_service_global.count);
+    line += ",\"window_count\":" +
+            std::to_string(summary.syscall_service_global.window_count);
+    line += ",\"ewma_ns\":" + std::to_string(summary.syscall_service_global.ewma_ns) + "}";
+    line += ",\"worker_occupied_duration_buckets\":[";
+    for (size_t i = 0; i < summary.worker_buckets.size(); ++i) {
+        if (i != 0) {
+            line += ",";
+        }
+        line += "{\"bucket\":\"" + std::string(worker_bucket_names[i]) + "\"";
+        line += ",\"count\":" + std::to_string(summary.worker_buckets[i].count);
+        line += ",\"window_count\":" + std::to_string(summary.worker_buckets[i].window_count);
+        line += ",\"ewma_ns\":" + std::to_string(summary.worker_buckets[i].ewma_ns) + "}";
+    }
+    line += "],\"worker_occupied_duration_global\":{\"count\":" +
+            std::to_string(summary.worker_global.count);
+    line += ",\"window_count\":" + std::to_string(summary.worker_global.window_count);
+    line += ",\"ewma_ns\":" + std::to_string(summary.worker_global.ewma_ns) + "}";
+    line += ",\"throughput_sample_count\":" +
+            std::to_string(summary.throughput_sample_count);
+    line += ",\"throughput_ewma_bytes_per_ns\":" +
+            std::to_string(summary.throughput_ewma_bytes_per_ns);
+    line += ",\"candidates\":[";
+    for (size_t i = 0; i < summary.candidates.size(); ++i) {
+        if (i != 0) {
+            line += ",";
+        }
+        const ExpertShadowCandidateSummary & candidate = summary.candidates[i];
+        line += "{\"deadline_model\":\"" +
+                std::string(expert_shadow_grouping_name(candidate.grouping)) + "_" +
+                expert_shadow_estimator_name(candidate.estimator) + "\"";
+        line += ",\"queue_model\":\"" +
+                std::string(expert_shadow_queue_model_name(candidate.queue_model)) + "\"";
+        line += ",\"calibration_model\":\"" + std::string(
+                expert_shadow_calibration_model_name(candidate.calibration_model)) + "\"";
+        line += ",\"eligible\":" + std::to_string(candidate.eligible);
+        line += ",\"unavailable\":" + std::to_string(candidate.unavailable);
+        line += ",\"first_use_error\":";
+        append_shadow_error_aggregate(line, candidate.overall);
+        line += ",\"first_use_by_phase\":{";
+        for (size_t j = 0; j < 3; ++j) {
+            if (j != 0) {
+                line += ",";
+            }
+            line += "\"" + std::string(phase_names[j]) + "\":";
+            append_shadow_error_aggregate(line, candidate.by_phase[j]);
+        }
+        line += "},\"first_use_by_stage\":{";
+        for (size_t j = 0; j < 3; ++j) {
+            if (j != 0) {
+                line += ",";
+            }
+            line += "\"" + std::string(expert_tensor_stage_name(stages[j])) + "\":";
+            append_shadow_error_aggregate(line, candidate.by_stage[j]);
+        }
+        line += "},\"issue_target\":{\"overall\":";
+        append_shadow_target_aggregate(line, candidate.issue_overall);
+        line += ",\"by_phase\":{";
+        for (size_t j = 0; j < 3; ++j) {
+            if (j != 0) {
+                line += ",";
+            }
+            line += "\"" + std::string(phase_names[j]) + "\":";
+            append_shadow_target_aggregate(line, candidate.issue_by_phase[j]);
+        }
+        line += "},\"by_stage\":{";
+        for (size_t j = 0; j < 3; ++j) {
+            if (j != 0) {
+                line += ",";
+            }
+            line += "\"" + std::string(expert_tensor_stage_name(stages[j])) + "\":";
+            append_shadow_target_aggregate(line, candidate.issue_by_stage[j]);
+        }
+        line += "}},\"return_target\":{\"overall\":";
+        append_shadow_target_aggregate(line, candidate.return_overall);
+        line += ",\"by_phase\":{";
+        for (size_t j = 0; j < 3; ++j) {
+            if (j != 0) {
+                line += ",";
+            }
+            line += "\"" + std::string(phase_names[j]) + "\":";
+            append_shadow_target_aggregate(line, candidate.return_by_phase[j]);
+        }
+        line += "},\"by_stage\":{";
+        for (size_t j = 0; j < 3; ++j) {
+            if (j != 0) {
+                line += ",";
+            }
+            line += "\"" + std::string(expert_tensor_stage_name(stages[j])) + "\":";
+            append_shadow_target_aggregate(line, candidate.return_by_stage[j]);
+        }
+        line += "}}}";
+    }
+    line += "]}";
+    llm_mem_trace_write(LLM_MEM_TRACE_SINK_MEMORY, line.c_str(), line.size());
+}
+
+void ensure_expert_shadow_summary_registered() {
+    (void) expert_shadow_slack();
+    static const bool registered = [] {
+        std::atexit(write_expert_shadow_summary);
+        return true;
+    }();
+    (void) registered;
+}
+
 void apply_pressure_snapshot(ExpertHintTask & task, const ExpertPressureSnapshot & pressure) {
     task.pressure_level = pressure.level;
     task.memory_current_bytes = pressure.memory_current_bytes;
@@ -2225,7 +2857,8 @@ void record_expert_issue_group_stage(const ExpertHintTask & task) {
 }
 
 uint64_t issue_expert_hint_task(ExpertHintTask & task) {
-    if (expert_task_detail_events_enabled()) {
+    llm_pressure_shadow::record_issue(task.step, task.nbytes);
+    if (expert_task_detail_events_enabled() || expert_shadow_enabled()) {
         task.issue_id = next_expert_issue_id();
     }
     if (expert_task_trace_mode() != ExpertTaskTraceMode::Off) {
@@ -2279,6 +2912,24 @@ uint64_t issue_expert_hint_task(ExpertHintTask & task) {
             transition_expert_task(lifecycle, ExpertTaskEvent::Issue, nullptr, begin, end);
         }
     }
+    if (expert_shadow_enabled()) {
+        ExpertShadowIssueInput input;
+        input.issue_id = task.issue_id;
+        input.issue_task_count = task.coalesced_task_count;
+        input.issue_ts_ns = begin;
+        input.returned_ts_ns = end;
+        input.issued_nbytes = task.nbytes;
+        if (task.coalesced_lifecycles.empty()) {
+            input.task_ids.push_back(task.lifecycle.task_id);
+        } else {
+            input.task_ids.reserve(task.coalesced_lifecycles.size());
+            for (const ExpertTaskLifecycleRecord & lifecycle : task.coalesced_lifecycles) {
+                input.task_ids.push_back(lifecycle.task_id);
+            }
+        }
+        write_expert_shadow_observations(
+                expert_shadow_slack().observe_issue_group(std::move(input)));
+    }
     return duration;
 }
 
@@ -2325,7 +2976,7 @@ std::vector<ExpertHintTask> coalesce_expert_hint_batch(std::vector<ExpertHintTas
         }
 
         current.coalesced_task_count += task.coalesced_task_count;
-        if (expert_task_trace_mode() != ExpertTaskTraceMode::Off) {
+        if (expert_task_trace_mode() != ExpertTaskTraceMode::Off || expert_shadow_enabled()) {
             if (current.coalesced_lifecycles.empty()) {
                 current.coalesced_lifecycles.push_back(current.lifecycle);
             }
@@ -2394,6 +3045,7 @@ struct ExpertHintQueue {
     uint64_t worker_batches = 0;
     uint64_t batched_candidates = 0;
     uint64_t coalesced_syscalls_saved = 0;
+    std::atomic<uint64_t> busy_workers{0};
 
     ~ExpertHintQueue() {
         shutdown();
@@ -2413,6 +3065,25 @@ struct ExpertHintQueue {
             task.sequence = next_sequence++;
             task.lifecycle.sequence = task.sequence;
             transition_expert_task(task.lifecycle, ExpertTaskEvent::Enqueue);
+            if (expert_shadow_enabled()) {
+                ExpertShadowTaskInput input;
+                input.task_id = task.lifecycle.task_id;
+                input.step = task.step;
+                input.layer = task.layer;
+                input.expert = task.expert;
+                input.phase = task.phase;
+                input.stage = task.stage;
+                input.tensor = task.tensor_name;
+                input.addr = task.addr;
+                input.nbytes = task.nbytes;
+                input.prediction_ts_ns = task.lifecycle.enqueued_ts_ns != 0 ?
+                        task.lifecycle.enqueued_ts_ns : llm_mem_trace_time_ns();
+                input.enqueued_ts_ns = input.prediction_ts_ns;
+                input.queue_depth_before_enqueue = queue_depth_unlocked();
+                input.queued_bytes_before_enqueue = queued_bytes;
+                input.active_workers = worker_count;
+                (void) expert_shadow_slack().register_task(std::move(input));
+            }
             if (priority_enabled && priority_heap_enabled) {
                 std::vector<ExpertHintTask> & heap =
                         priority_mode == ExpertAsyncPriorityMode::StageDeadlineScore &&
@@ -2499,6 +3170,7 @@ struct ExpertHintQueue {
             legacy_priority_heap.clear();
             queued_bytes = 0;
             worker_count = 0;
+            busy_workers.store(0, std::memory_order_relaxed);
             priority_enabled = false;
             priority_heap_enabled = false;
             priority_mode = ExpertAsyncPriorityMode::Score;
@@ -2508,6 +3180,7 @@ struct ExpertHintQueue {
     void run() {
         for (;;) {
             std::vector<ExpertHintTask> batch;
+            const bool pressure_shadow_on = llm_pressure_shadow::enabled();
             {
                 std::unique_lock<std::mutex> lock(mu);
                 cv.wait(lock, [&] { return stopping || !queue_empty_unlocked(); });
@@ -2531,10 +3204,19 @@ struct ExpertHintQueue {
                 }
                 worker_batches++;
                 batched_candidates += count;
+                if (pressure_shadow_on) {
+                    busy_workers.fetch_add(1, std::memory_order_relaxed);
+                }
             }
 
             for (ExpertHintTask & task : batch) {
                 transition_expert_task(task.lifecycle, ExpertTaskEvent::Dequeue);
+                if (expert_shadow_enabled()) {
+                    const uint64_t dequeued_ts_ns = task.lifecycle.dequeued_ts_ns != 0 ?
+                            task.lifecycle.dequeued_ts_ns : llm_mem_trace_time_ns();
+                    expert_shadow_slack().observe_dequeue(
+                            task.lifecycle.task_id, dequeued_ts_ns);
+                }
             }
 
             std::vector<ExpertHintTask> ready;
@@ -2548,6 +3230,10 @@ struct ExpertHintQueue {
                 if (expert_task_exceeds_pressure_budget(task, 0)) {
                     transition_expert_task(
                             task.lifecycle, ExpertTaskEvent::Cancel, "pressure_changed");
+                    if (expert_shadow_enabled()) {
+                        expert_shadow_slack().expire_task(
+                                task.lifecycle.task_id, "pressure_changed");
+                    }
                     write_expert_task_skip(task, "expert_prefetch_cancel_pressure", "pressure_changed");
                     std::lock_guard<std::mutex> lock(mu);
                     cancelled_pressure++;
@@ -2556,6 +3242,10 @@ struct ExpertHintQueue {
                 if (expert_task_below_value_threshold(task)) {
                     transition_expert_task(
                             task.lifecycle, ExpertTaskEvent::Cancel, "value_changed");
+                    if (expert_shadow_enabled()) {
+                        expert_shadow_slack().expire_task(
+                                task.lifecycle.task_id, "value_changed");
+                    }
                     write_expert_task_skip(task, "expert_prefetch_cancel_value", "value_changed");
                     std::lock_guard<std::mutex> lock(mu);
                     cancelled_value++;
@@ -2565,6 +3255,10 @@ struct ExpertHintQueue {
                         now + task.predicted_service_ns >= task.deadline_ts_ns) {
                     transition_expert_task(
                             task.lifecycle, ExpertTaskEvent::Cancel, "deadline_missed");
+                    if (expert_shadow_enabled()) {
+                        expert_shadow_slack().expire_task(
+                                task.lifecycle.task_id, "deadline_missed");
+                    }
                     write_expert_task_skip(task, "expert_prefetch_cancel_expired", "deadline_missed");
                     std::lock_guard<std::mutex> lock(mu);
                     cancelled_expired++;
@@ -2579,6 +3273,9 @@ struct ExpertHintQueue {
                 task.predicted_service_ns = expert_timing_model().predicted_transfer_ns(task.nbytes) +
                                             expert_timing_model().predicted_syscall_ns();
                 issue_expert_hint_task(task);
+            }
+            if (pressure_shadow_on) {
+                busy_workers.fetch_sub(1, std::memory_order_relaxed);
             }
             {
                 std::lock_guard<std::mutex> lock(mu);
@@ -2776,6 +3473,36 @@ ExpertHintQueue & expert_hint_queue() {
     return queue;
 }
 
+llm_pressure_shadow::QueueSnapshot pressure_shadow_queue_snapshot() {
+    ExpertHintQueue & queue = expert_hint_queue();
+    llm_pressure_shadow::QueueSnapshot snapshot;
+    snapshot.configured_worker_count = expert_prefetch_async_workers();
+    std::lock_guard<std::mutex> lock(queue.mu);
+    snapshot.started = queue.started;
+    snapshot.stopping = queue.stopping;
+    snapshot.status = !queue.started ?
+            llm_pressure_shadow::Status::NotStarted :
+            (queue.stopping ?
+             llm_pressure_shadow::Status::Stopping :
+             llm_pressure_shadow::Status::Available);
+    if (queue.started) {
+        snapshot.queue_depth = queue.queue_depth_unlocked();
+        snapshot.queued_bytes = queue.queued_bytes;
+        snapshot.worker_count = queue.worker_count;
+        snapshot.busy_workers = std::min<uint64_t>(
+                queue.busy_workers.load(std::memory_order_relaxed), queue.worker_count);
+    }
+    return snapshot;
+}
+
+struct PressureShadowQueueProviderRegistration {
+    PressureShadowQueueProviderRegistration() {
+        llm_pressure_shadow::set_queue_snapshot_provider(pressure_shadow_queue_snapshot);
+    }
+};
+
+PressureShadowQueueProviderRegistration pressure_shadow_queue_provider_registration;
+
 void shutdown_expert_hint_queue() {
     expert_hint_queue().shutdown();
 }
@@ -2905,7 +3632,7 @@ ExpertHintTask make_expert_hint_task(
     task.stage = classify_expert_tensor_stage(task.tensor_name.c_str());
     task.step = llm_mem_trace_get_step();
     task.use_fadvise = os_hint_opt_enabled("LLM_MEM_TRACE_OPT_POSIX_FADVISE");
-    if (expert_task_trace_mode() != ExpertTaskTraceMode::Off) {
+    if (expert_task_trace_mode() != ExpertTaskTraceMode::Off || expert_shadow_enabled()) {
         task.lifecycle.step = task.step;
         task.lifecycle.layer = task.layer;
         task.lifecycle.expert = task.expert;
@@ -2915,10 +3642,15 @@ ExpertHintTask make_expert_hint_task(
         task.lifecycle.addr = task.addr;
         task.lifecycle.nbytes = task.nbytes;
         task.lifecycle.score = task.route_score;
-        ensure_expert_task_summary_registered();
-        ensure_expert_first_use_summary_registered();
+        if (expert_task_trace_mode() != ExpertTaskTraceMode::Off) {
+            ensure_expert_task_summary_registered();
+            ensure_expert_first_use_summary_registered();
+        }
     }
-    if (expert_task_detail_events_enabled()) {
+    if (expert_shadow_summary_requested()) {
+        ensure_expert_shadow_summary_registered();
+    }
+    if (expert_task_detail_events_enabled() || expert_shadow_enabled()) {
         task.lifecycle.task_id = next_expert_task_id();
     }
     transition_expert_task(task.lifecycle, ExpertTaskEvent::Create);
@@ -3802,12 +4534,17 @@ int read_expert_id(const ggml_tensor * ids, int64_t index0, int64_t index1) {
 }
 
 void observe_expert_logical_first_use(const ggml_tensor * operation) {
-    if (expert_task_trace_mode() == ExpertTaskTraceMode::Off || !operation ||
+    if ((!expert_shadow_enabled() && expert_task_trace_mode() == ExpertTaskTraceMode::Off) || !operation ||
             operation->op != GGML_OP_MUL_MAT_ID) {
         return;
     }
-    ensure_expert_task_summary_registered();
-    ensure_expert_first_use_summary_registered();
+    if (expert_task_trace_mode() != ExpertTaskTraceMode::Off) {
+        ensure_expert_task_summary_registered();
+        ensure_expert_first_use_summary_registered();
+    }
+    if (expert_shadow_summary_requested()) {
+        ensure_expert_shadow_summary_registered();
+    }
     const ggml_tensor * weights = operation->src[0];
     const ggml_tensor * ids = operation->src[2];
     const char * tensor_name = weights ? ggml_get_name(weights) : nullptr;
@@ -3857,7 +4594,24 @@ void observe_expert_logical_first_use(const ggml_tensor * operation) {
         use.addr = slice_addr;
         use.nbytes = slice_bytes;
         use.first_use_ts_ns = first_use_ts_ns;
-        write_expert_first_use_event(expert_first_use_matcher().observe_first_use(std::move(use)));
+        if (expert_shadow_enabled()) {
+            ExpertShadowFirstUseInput shadow_use;
+            shadow_use.step = use.step;
+            shadow_use.layer = use.layer;
+            shadow_use.expert = use.expert;
+            shadow_use.phase = use.phase;
+            shadow_use.stage = use.stage;
+            shadow_use.tensor = use.tensor;
+            shadow_use.addr = use.addr;
+            shadow_use.nbytes = use.nbytes;
+            shadow_use.first_use_ts_ns = use.first_use_ts_ns;
+            write_expert_shadow_observations(
+                    expert_shadow_slack().observe_first_use(std::move(shadow_use)));
+        }
+        if (expert_task_trace_mode() != ExpertTaskTraceMode::Off) {
+            write_expert_first_use_event(
+                    expert_first_use_matcher().observe_first_use(std::move(use)));
+        }
     }
 }
 

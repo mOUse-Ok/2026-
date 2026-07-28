@@ -250,3 +250,149 @@ summary 不保存 task-level 分位数、Stage inversion 和分阶段 issue-afte
 系统侧没有净收益。w2 的 wall/Decode mean/throughput 为 -1.73%/-0.81%/+0.78%，但 Decode p95/p99 为 +2.04%/+4.32%，Major Fault +8.74%（8/8 配对增加）；w4 为 -0.38%/-0.75%/+0.72%，p95/p99 改善 3.61%/3.67%，但 p50 +1.12%、Major Fault +3.41%（6/8 配对增加）。RSS/PSS/Swap 变化很小，hint calls 和 issued bytes 完全相同，证明没有减少 Routed Expert Top-K 或 Task 范围。
 
 M2.5 正确预测了 EARLY 提前、LATE 变晚和 2/4 workers 下 LATE logical first-use 仍基本 on-time 的方向，但显著低估了真实长 Decode workload 的等待重排幅度。由于 inversion/EARLY 的机制收益伴随稳定 LATE 退化，且没有 Major Fault、Decode latency 或 throughput 的一致净收益，M3B 最终结论为：**保留为实验基线**。本阶段停止，不进入 M4。
+
+## 16. M4A Stage-conditioned Shadow Slack（2026-07-16）
+
+本轮只实现独立 Shadow 预测、Trace/Summary 记录和离线校准。现有
+`ExpertTimingModel`、Task 状态机、Admission、Cancel、Comparator、队列元素、
+Task/Top-K 范围、worker/batch/coalescing、TTL 和 Hint 调用路径均未改写；主
+Evidence 固定使用原有 `deadline_score`，active Slack、feedback、value gate
+和 cross-layer prediction 全部关闭。
+
+最终入口只保留独立的 `LLM_MEM_TRACE_OPT_EXPERT_SLACK_MODE=off|shadow`，默认
+为 off。曾加入的 `controller=shadow_slack` 流水线便利预设已删除，避免该入口
+同时选择 async/prefetch 基线。最终 Evidence 原本就显式固定
+`controller=off`、`deadline_score` 和独立 Shadow 开关，因此删除预设不改变
+既有 Evidence 的二进制或运行语义；没有重跑 1.6 GiB Detail，只对已有 trace
+重新执行离线聚合和完整性验证。
+
+Trace-On/Trace-Off Release 构建通过；Trace-Off 二进制未链接
+`ExpertShadowSlack`。`test-expert-shadow-slack`、生命周期/Stage 测试和
+Comparator 测试通过，31 项 Python 回归通过；全部 trace Python 语法、shell
+语法和 `git diff --check` 通过。queue-started 的真实推理退出与 queue-not-started
+的 `llama-cli --version` 退出均成功。
+
+最终 Detail Evidence 使用同一 Trace-On binary
+`fa81a880063b8f33db1df03c46533c1847078a34cc4cca7a427d9586726e4d20`、
+固定 35B 模型、seed=1234、80 个预测 token、cold cache、4 workers 和
+`deadline_score`。102,222/102,222 个 Shadow Task 完整有效，18 个候选全部
+保留；PREFILL/DECODE=26,382/75,840，EARLY/LATE/UNKNOWN=68,148/34,074/0。
+semantic、causality、invalid record/prediction、duplicate、unmatched、expired、
+capacity skip 和 shutdown pending 均为 0；matcher peak live=768，estimator
+cell=248。Queue paired-common 为 102,221。
+
+Detail 全量生命周期复核读取 511,110 条 Task event：CREATE/ADMIT/ENQUEUE/
+DEQUEUE/ISSUE 各 102,222，unique Task/Issue 均为 102,222。duplicate create、
+非法迁移、state mismatch、未终止 Task、时间戳逆序、issue task-count mismatch、
+无 syscall 的 issue ID、无 Task 的 syscall issue ID 和 Hint error 全部为 0；
+102,222 个 syscall issue ID 全部正确链接。coalesced=0、non-coalesced=102,222，
+syscall success/failure/unavailable=102,222/0/0。
+
+完整分组 `phase_layer_stage_p25 + Queue A` 的 operational MAE/p95 为
+32.938/203.963 ms，mature coverage 97.42%；DECODE 为 2.984/6.177 ms，
+PREFILL 为 119.047/236.897 ms。EARLY 为 22.475/151.347 ms，LATE 为
+53.864/234.127 ms，UNKNOWN 本次无真实样本。与同 estimator 的无 Stage
+`phase_layer_p25` paired 比较，MAE/p95 分别改善 1.756/14.162 ms，FP rate
+下降 0.0486，balanced accuracy 增加 0.0295；所有 EWMA/median/p25 的完整
+分组均降低 MAE 和 p95。`phase_stage` 虽将 MAE 降至约 14–15 ms，却把
+specificity 降至 0.0099–0.1261，balanced accuracy 仅 0.5015–0.5518，不能
+称为胜出。
+
+Queue A/B paired MAE/p95 分别为 1.697/10.723 ms 和 4.438/31.563 ms，
+本次 Queue A 更准；Worker DEQUEUE→RETURN 模型 MAE/p95 为 0.135/0.372 ms。
+完整 p25 + Queue A 的 TP/TN/FP/FN 为 82,698/3,606/1,827/14,091，precision/
+recall/specificity/balanced accuracy 为 0.9784/0.8544/0.6637/0.7591。
+负 Slack 三个 calibration 桶的实际 on-time rate 仍为 74.95%、98.03% 和
+84.90%，说明 Slack 符号尚不能可靠区分 on-time/late；Layer 2 的 MAE
+45.657 ms、Layer 32 的 p95 246.729 ms 是该候选最不稳定的 Layer 指标，
+Layer 39 最稳定（MAE/p95 2.073/7.158 ms）。
+
+Summary off/shadow 按交替顺序各 N=3，80-token、cold-cache。三对运行的
+Task created/admitted/enqueued/dequeued/issued 都是 102,222，reject/cancel/
+invalid transition 都是 0；Hint count=102,222、advised=44,589.023 MiB、错误=0，
+规范化 action/range multiset 和输出 hash 均一致，所有 sink 零丢失。输出
+hash 固定为 `d99750009ddfde17273e731cc232cc02477cca34559bf2f1633a008cbffd493d`。
+off/shadow 中位数 wall 为 49.69/44.42 s，Decode mean/p50/p95/p99 为
+177.81/170.91/238.54/274.74 ms 与 187.81/181.87/236.67/281.78 ms，throughput
+为 5.624/5.324 tok/s，Trace bytes 为 43,581,390/47,521,640。样本间换页噪声
+明显，wall 的负差不解释为收益，Decode mean、p50、p99 和 throughput 也不
+支持已证明低开销的结论。
+
+本次 cold-cache 准备全部成功，但仓库因未提交的 M4A 实现为 dirty，当前
+环境没有可用 delegated cgroup（manifest 中 `memory.max`/`memory.swap.max`
+均为 `max`）。因此上述 Detail 足以给出负面的模型决策：**不建议进入 M4B**；
+Summary N=3 只证明行为等价和记录链路，不能替代 clean commit、受控 cgroup
+下的正式开销复测。M4A 到此停止，未实现任何 Active Control。
+
+完整机器可读结果保存在
+`llama.cpp/trace_output/shadow_slack/final_summary/m4a_final_report.json`，全部
+18 个候选的 Detail 聚合保存在同目录 `detail_model_comparison.json`，人类可读
+结构化报告为同目录 `m4a_summary.md`。三对等价性与第一对附带的全量 lifecycle/
+syscall linkage 结果保存在 `equivalence_r1.json`～`equivalence_r3.json`。
+
+## 17. M4A.1 Shadow Slack 语义对齐与在线校准（2026-07-16）
+
+本轮仍为 Shadow-only。实现将 DEQUEUE→RETURN 拆为 pre-issue、syscall service
+和 worker occupied，并把 Issue/Return 预测、实际 Slack、confusion matrix 与
+calibration 完全分开；新增 causal historical-residual p25 后，候选矩阵由 18
+扩展为 36。现有 Comparator、Admission、Reject、Cancel、Task/Top-K 集合、
+Hint 行为、pressure/value gate、worker 调度和模型输出均未由 Shadow 读取或
+修改。
+
+Trace-On `llama-cli`、Trace-Off `llama-cli` 和 `test-expert-shadow-slack` 构建
+通过；Trace-Off `libggml-cpu` 未发现 `ExpertShadowSlack` 符号。定向 CTest、
+7 项 Shadow 定向测试和完整 31 项 Python 回归、Python 语法与 shell 语法均通过。C++ 用例覆盖
+36 候选顺序、Issue=`H-Q-P`、Return=`H-Q-P-S`、严格 `<` 标签、分量拆分、
+coalesced group、phase/stage/size 隔离、fallback/mature 边界和“先预测、后用
+当前结果更新 residual”的无未来信息约束。
+
+Evidence 使用同一 35B 模型、prompt、seed=1234、80 个预测 token、cold cache、
+`deadline_score`、controller=off，并分别运行 workers=2 和 workers=4。两组
+Detail 各有 102,222 个 finalized Task，合并后为 204,444；PREFILL/DECODE
+各为 52,764/151,680，EARLY/LATE 各为 136,296/68,148。semantic violation、
+causality error、timestamp regression、缺失时间分量、syscall failure、
+multi-syscall 和 coalesced issue group 全部为 0；36 个候选完整，Queue paired
+common=204,444。
+
+workers=2/4 各执行一对 Summary off/on。两对的 Task lifecycle 字段、102,222
+个 Hint 的规范化 multiset 和输出 hash 全部相等，四个 sink 均
+`enqueued == written` 且 `dropped == 0`；两组完整 Detail 的 102,222 条 Shadow
+记录也分别通过 lifecycle/syscall linkage 和双目标公式复核，target alignment
+error=0。所有运行输出 hash 均为
+`d99750009ddfde17273e731cc232cc02477cca34559bf2f1633a008cbffd493d`。
+
+重点候选 `phase_layer_stage_p25 + Queue A + residual_quantile` 的合并
+first-use MAE 为 26.077 ms。Issue 的 overall/Decode predicted-late precision
+为 35.64%/38.80%，Return 为 36.08%/38.76%；Issue Decode 在 workers=2/4
+的 operational precision 分别只有 39.22%/9.40%，Return 为 39.32%/12.14%；
+排除 fallback 后的 mature-only precision 分别为 39.48%/9.40% 和
+39.51%/12.32%。该候选 204,444 个样本中 mature/fallback=152,418/52,026。
+全部 36 个候选中，没有任何候选在 workers=2 和 workers=4 的 mature Decode
+负阈值上同时达到 90% precision 且具有非零覆盖。该候选 Issue/Return 的十档
+on-time calibration 都有 3 次相邻反向；更严格负阈值的 precision 也不单调。
+
+raw Queue A 的 9 个 first-use 模型均完成 Issue 8 组和 Return 16 组 Oracle，
+每个组合均保留 Overall、PREFILL/DECODE、EARLY/LATE、workers=2/4 以及
+unavailable/fallback/mature 口径。
+`phase_layer_stage_p25` 的 full oracle 在 Overall、PREFILL、DECODE 上 MAE 均为
+0。单项替换显示主要误差源始终是 first-use：Issue PREFILL/DECODE 的 MAE
+改善为 111.936/2.967 ms，Return 为 111.739/2.954 ms；queue wait 对 PREFILL
+有约 1.5 ms 改善，pre-issue 与 syscall service 贡献很小，Decode 中 queue
+单项替换因误差抵消略微变差。Oracle 仅用于离线诊断，未进入在线预测。
+
+合并 Queue A/B 的 MAE/p95 分别为 6.412/8.620 ms 与 4.729/15.796 ms：Queue B
+的平均误差较低而 Queue A 的 p95 较低，因此保留两者，不宣称单一 Queue 全面
+胜出。pre-issue、syscall service、worker occupied 模型 MAE 分别为
+0.120/0.119/0.227 ms。实际时间中 first-use horizon 的 p95 为 220.525 ms，
+queue wait 为 25.032 ms，pre-issue/syscall service 为 0.089/0.290 ms。
+
+当前用户级 systemd bus 不可用，无法建立 delegated cgroup；manifest 中没有
+正式 memory/swap 隔离。因此 Summary 只用于工程等价性，不宣称性能收益。
+M4A.1 工程验收为**通过**，模型结论为**需要继续改进 Shadow**；Decode-only
+控制候选数为 0，**不进入 M4B**，没有实现任何 Active Control。
+
+人类报告、完整机器 JSON 与全模型/Oracle JSON 分别保存在：
+
+- `llama.cpp/trace_output/m4a1_shadow_slack_20260716_report/M4A1_shadow_slack_report.md`；
+- `llama.cpp/trace_output/m4a1_shadow_slack_20260716_report/M4A1_shadow_slack_full.json`；
+- `llama.cpp/trace_output/m4a1_shadow_slack_20260716_report/detail_model_comparison.json`。

@@ -49,9 +49,18 @@ def cgroup_values() -> dict[str, str | None]:
         "memory.swap.current",
         "memory.swap.max",
         "memory.swap.peak",
+        "memory.events",
+        "memory.events.local",
+        "memory.stat",
         "memory.pressure",
     )
-    return {name: read_text(directory / name) if directory else None for name in names}
+    values = {name: read_text(directory / name) if directory else None for name in names}
+    values["source_path"] = str(directory) if directory else None
+    try:
+        values["source_inode"] = str(directory.stat().st_ino) if directory else None
+    except OSError:
+        values["source_inode"] = None
+    return values
 
 
 def git_output(project: Path, *args: str) -> str | None:

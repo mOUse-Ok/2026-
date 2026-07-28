@@ -71,3 +71,9 @@ llmop_draft.tex
 
 # 本地文档和实验临时产物
 /local-only/
+
+# 本地项目学习材料
+/learn/
+
+# docs 下的 codex 目录
+/docs/codex/

@@ -84,6 +84,71 @@ ADMITTED/DEQUEUED -> CANCEL -> CANCELLED
 
 Stage 分类本身不参与 Task Admission、coalescing、Slack、Pressure Control、worker 数量或预取范围；只有显式选择 `stage_deadline_score` 时，它才参与队列优先级，其他 priority mode 行为保持不变。
 
+### M4A Stage-conditioned Shadow Slack 旁路观测
+
+M4A 新增独立、默认关闭的 `ExpertShadowSlack`，只在
+`LLM_MEM_TRACE_OPT_EXPERT_SLACK_MODE=shadow` 时运行。预测锚点固定为成功
+ENQUEUE，在现有队列锁内、Task 插入前冻结时间戳、queue depth、queued
+bytes 和 worker 数；Shadow 结果不写入 Task、deadline、heap、comparator、
+Admission、Cancel、coalescing 或 Hint 参数。Shadow 自身只使用一把独立锁，
+调用顺序固定为 `queue.mu -> shadow.mu`，写 Trace 时已经释放 Shadow 锁。
+
+First-use horizon 并行保留 `phase_layer`、`phase_stage` 和
+`phase_layer_stage` 三种分组，每组同时计算 EWMA、有界窗口 median 和 p25；
+PREFILL/DECODE、EARLY/LATE/UNKNOWN 及包含 Layer 的模型严格隔离。Queue wait
+同时记录 `queue_depth * worker EWMA / active_workers` 与
+`queued_bytes / issue throughput`，Worker 模型按原始 Task 大小 bucket 预测
+DEQUEUE 到最后一个已启用 Hint RETURN 的占用时间。最终
+`predicted_issue_slack_ns` 使用有符号饱和算术，主标签仍严格是
+`issue_ts_ns < first_use_ts_ns`；RETURN、Slack 和 logical first-use 均不表示
+page-in 完成或物理驻留。
+
+Shadow 使用独立 matcher，以 `(step, layer, expert, tensor)`、相同 C++ Stage、
+地址区间重叠和 `prediction_ts_ns <= first_use_ts_ns` 关联，因而不会像既有
+first-use matcher 一样丢掉 ISSUE 晚于 first-use 的负样本。每个 Task 最多写
+一条 detail 事件，包含固定顺序的 18 个候选；summary 只保留固定直方图、
+calibration 桶和 phase/stage 聚合。在线状态上限为 8,192 个 pending Task、
+65,536 个 first-use key、4,096 个 estimator cell、每 cell 64 个样本和 2 个
+step 的保留窗口；容量、过期、mismatch、因果错误和 shutdown pending 都有
+独立计数。退出顺序固定为异步队列先 drain，再写 Shadow summary，最后析构
+Shadow；queue 未启动路径也不依赖该顺序。
+
+### M4A.1 Shadow Slack 语义对齐与在线校准
+
+M4A.1 将原 M4A 的单一 Slack 拆成两个不可混用的 Shadow 目标。Issue Slack
+只预测 `first_use_horizon - queue_wait - pre_issue_overhead`，实际标签只允许
+`issue_ts < logical_first_use_ts`；Return Slack 再减
+`hint_syscall_service`，实际标签只允许
+`final_enabled_hint_return_ts < logical_first_use_ts`。两者分别维护 error、
+confusion matrix、十档 threshold calibration、coverage、warmup、fallback 和
+mature-exact 计数；ISSUE/RETURN 都不解释为 page-in 完成，RETURN 也不表示
+页面已经驻留。
+
+Worker 时间按因果事件拆成 ENQUEUE→DEQUEUE queue wait、DEQUEUE→ISSUE
+pre-issue、ISSUE→RETURN syscall service 和 DEQUEUE→RETURN worker occupied。
+Queue A 仍需要前序任务占用 worker 的完整 occupied duration，但当前 Task 的
+Issue 公式只减 pre-issue，Return 公式才额外减 syscall service。四个分量分别
+建模、记录和校验，不再用一个 DEQUEUE→RETURN 预测冒充 Issue duration。
+
+First-use 仍比较三种 grouping 与 EWMA/median/p25，并为每个组合新增 raw 和
+`raw + historical residual p25` 两个版本，共 36 个完整候选。残差 cell 按
+phase/stage/layer 隔离，只接受当前 Task 之前已经成熟的 raw Queue A 样本；
+预测先冻结，当前真实结果随后才更新 horizon 与 residual history，进程退出后
+不保留状态。残差 cell 与 horizon cell 都有 4,096 上限，每 cell 窗口固定为
+64，容量不足和 fallback 不会被标记为成熟预测。
+
+离线分析对 raw Queue A 的 9 个 first-use 模型计算 Issue 的 8 个 H/Q/P Oracle
+组合和 Return 的 16 个 H/Q/P/S 组合，并按 PREFILL/DECODE、EARLY/LATE 和
+workers=2/4 分层；每个组合保留 unavailable/fallback/mature 口径。Oracle 只用于
+误差归因，绝不写回运行时。分类同时报告以 late 为关注对象的 precision、
+recall、F1、false-reject candidate rate、late prevalence 和负阈值 coverage，
+并显式分层 workers=2/4；每个 phase/stage/worker 与交叉分层同时保留
+operational、mature-only 和 fallback-only，控制候选筛查只读取 mature-only。
+`run_shadow_slack_evidence.sh` 固定 controller=off、
+active Slack/feedback/value/cross-layer gate 全关、`deadline_score` 不变；Shadow
+仍不参与 Comparator、Admission、Cancel、Task 集合、Hint 范围或其他 Active
+Control。
+
 ### M2.5 离线 Stage Scheduling Opportunity Analysis
 
 M2.5 阶段本身只增加离线分析；detail Task 额外落盘现有队列的 `sequence` 与现有任务的 `deadline_ts_ns`，使模拟不必用文件顺序或零 deadline 代替真实字段。后续运行时实现以独立、默认关闭的 `stage_deadline_score` mode 落地，不改变原有三种 mode。
