@@ -83,6 +83,23 @@ def cpu_model() -> str | None:
     return platform.processor() or None
 
 
+def cpuinfo_value(name: str) -> str | None:
+    text = read_text(Path("/proc/cpuinfo"))
+    if text:
+        prefix = name.lower()
+        for line in text.splitlines():
+            if line.lower().startswith(prefix) and ":" in line:
+                return line.split(":", 1)[1].strip()
+    return None
+
+
+def cpu_affinity() -> list[int] | None:
+    try:
+        return sorted(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        return None
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", required=True, type=Path)
@@ -122,6 +139,15 @@ def main() -> None:
             "SEED",
             "GPU_LAYERS",
             "TRACE_PROFILE",
+            "OMP_NUM_THREADS",
+            "OMP_DYNAMIC",
+            "OPENBLAS_NUM_THREADS",
+            "MKL_NUM_THREADS",
+            "MKL_DYNAMIC",
+            "BLIS_NUM_THREADS",
+            "NUMEXPR_NUM_THREADS",
+            "LC_ALL",
+            "LANG",
         }
     }
 
@@ -162,7 +188,9 @@ def main() -> None:
             "platform": platform.platform(),
             "kernel": platform.release(),
             "cpu": cpu_model(),
+            "microcode": cpuinfo_value("microcode"),
             "logical_cpus": os.cpu_count(),
+            "cpu_affinity": cpu_affinity(),
         },
         "experiment": {
             "trace_profile": args.trace_profile,

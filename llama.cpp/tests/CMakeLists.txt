@@ -202,6 +202,19 @@ llama_build_and_test(test-json-partial.cpp)
 llama_build_and_test(test-log.cpp)
 
 if (LLAMA_MEM_TRACE)
+    find_package(Threads REQUIRED)
+
+    add_executable(
+        test-router-tensor-observation-sync
+        test-router-tensor-observation-sync.cpp
+    )
+    target_link_libraries(test-router-tensor-observation-sync PRIVATE Threads::Threads)
+    add_test(
+        NAME test-router-tensor-observation-sync
+        COMMAND $<TARGET_FILE:test-router-tensor-observation-sync>
+    )
+    set_property(TEST test-router-tensor-observation-sync PROPERTY LABELS main)
+
     add_executable(
         test-expert-hint-priority
         test-expert-hint-priority.cpp
@@ -210,6 +223,32 @@ if (LLAMA_MEM_TRACE)
     target_include_directories(test-expert-hint-priority PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../trace)
     add_test(NAME test-expert-hint-priority COMMAND $<TARGET_FILE:test-expert-hint-priority>)
     set_property(TEST test-expert-hint-priority PROPERTY LABELS main)
+
+    add_executable(
+        test-expert-max-wait-protection
+        test-expert-max-wait-protection.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../trace/expert_hint_priority.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../trace/expert_max_wait_protection.cpp
+    )
+    target_include_directories(test-expert-max-wait-protection PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../trace)
+    add_test(NAME test-expert-max-wait-protection COMMAND $<TARGET_FILE:test-expert-max-wait-protection>)
+    set_property(TEST test-expert-max-wait-protection PROPERTY LABELS main)
+
+    add_executable(
+        test-expert-queue-overhead-observation
+        test-expert-queue-overhead-observation.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../trace/expert_queue_overhead_observation.cpp
+    )
+    target_include_directories(
+        test-expert-queue-overhead-observation
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../trace
+    )
+    target_link_libraries(test-expert-queue-overhead-observation PRIVATE Threads::Threads)
+    add_test(
+        NAME test-expert-queue-overhead-observation
+        COMMAND $<TARGET_FILE:test-expert-queue-overhead-observation>
+    )
+    set_property(TEST test-expert-queue-overhead-observation PROPERTY LABELS main)
 
     add_executable(
         test-expert-task-lifecycle

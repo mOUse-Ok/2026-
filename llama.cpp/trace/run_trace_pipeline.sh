@@ -162,6 +162,78 @@ case "$PRESSURE_SHADOW_MODE" in
         ;;
 esac
 
+m6b1_require_explicit_value() {
+    local name="$1"
+    local expected="$2"
+    if [ -z "${!name+x}" ] || [ -z "${!name}" ]; then
+        echo "ERROR: max_wait_protection requires explicit $name=$expected" >&2
+        exit 1
+    fi
+    if [ "${!name}" != "$expected" ]; then
+        echo "ERROR: max_wait_protection requires $name=$expected (got ${!name})" >&2
+        exit 1
+    fi
+}
+
+m6b1_validate_us() {
+    local name="$1"
+    local allow_zero="$2"
+    local value canonical
+    if [ -z "${!name+x}" ] || [ -z "${!name}" ]; then
+        echo "ERROR: max_wait_protection requires explicit non-empty $name" >&2
+        exit 1
+    fi
+    value="${!name}"
+    if [[ ! "$value" =~ ^[0-9]+$ ]]; then
+        echo "ERROR: $name must be an unsigned decimal integer in microseconds" >&2
+        exit 1
+    fi
+    canonical="$value"
+    while [ "${#canonical}" -gt 1 ] && [ "${canonical:0:1}" = "0" ]; do
+        canonical="${canonical:1}"
+    done
+    if [ "$allow_zero" != "1" ] && [ "$canonical" = "0" ]; then
+        echo "ERROR: $name must be greater than zero" >&2
+        exit 1
+    fi
+    # floor(UINT64_MAX / 1000): larger microsecond values cannot be represented in ns.
+    if [ "${#canonical}" -gt 17 ] || {
+        [ "${#canonical}" -eq 17 ] && [[ "$canonical" > "18446744073709551" ]]
+    }; then
+        echo "ERROR: $name overflows uint64_t when converted to nanoseconds" >&2
+        exit 1
+    fi
+}
+
+if [ "${LLM_MEM_TRACE_OPT_EXPERT_ASYNC_PRIORITY_MODE:-$CONTROLLER_PRIORITY_MODE}" = "max_wait_protection" ]; then
+    m6b1_validate_us LLM_MEM_TRACE_OPT_EXPERT_MAX_WAIT_THRESHOLD_US 0
+    m6b1_validate_us LLM_MEM_TRACE_OPT_EXPERT_URGENT_GUARD_US 1
+
+    m6b1_require_explicit_value LLM_MEM_TRACE_OPT_EXPERT_CONTROLLER off
+    m6b1_require_explicit_value LLM_MEM_TRACE_OPT_EXPERT_FEEDBACK 0
+    m6b1_require_explicit_value LLM_MEM_TRACE_OPT_EXPERT_SLACK 0
+    m6b1_require_explicit_value LLM_MEM_TRACE_OPT_EXPERT_VALUE_GATE 0
+    m6b1_require_explicit_value LLM_MEM_TRACE_OPT_EXPERT_CROSS_LAYER_PREDICT 0
+    m6b1_require_explicit_value LLM_MEM_TRACE_OPT_EXPERT_SLACK_MODE off
+    m6b1_require_explicit_value LLM_MEM_TRACE_PRESSURE_SHADOW_MODE off
+
+    m6b1_require_explicit_value LLM_MEM_TRACE_OPT_EXPERT_DEADLINE_OBSERVE 1
+    m6b1_require_explicit_value LLM_MEM_TRACE_OPT_EXPERT_ASYNC 1
+    m6b1_require_explicit_value LLM_MEM_TRACE_OPT_EXPERT_ASYNC_PRIORITY 1
+    m6b1_require_explicit_value LLM_MEM_TRACE_OPT_EXPERT_ASYNC_PRIORITY_HEAP 0
+    m6b1_require_explicit_value LLM_MEM_TRACE_OPT_EXPERT_ASYNC_BATCH 1
+    m6b1_require_explicit_value LLM_MEM_TRACE_OPT_EXPERT_ASYNC_BATCH_WAIT_US 0
+    m6b1_require_explicit_value LLM_MEM_TRACE_OPT_EXPERT_ASYNC_BATCH_COALESCE 0
+    m6b1_require_explicit_value LLM_MEM_TRACE_OPT_EXPERT_COALESCE 0
+    m6b1_require_explicit_value LLM_MEM_TRACE_OPT_EXPERT_PREFETCH_TOPK 0
+
+    m6b1_require_explicit_value LLM_MEM_TRACE_OPT_EXPERT_POLICY route
+    m6b1_require_explicit_value LLM_MEM_TRACE_OPT_EXPERT_TTL_STEPS 0
+    m6b1_require_explicit_value LLM_MEM_TRACE_OPT_EXPERT_ROUTE_HINT_TTL_STEPS 0
+    m6b1_require_explicit_value LLM_MEM_TRACE_OPT_EXPERT_ASYNC_QUEUE 131072
+    m6b1_require_explicit_value LLM_MEM_TRACE_OPT_EXPERT_ASYNC_FALLBACK 1
+fi
+
 # ------------------------------------------------------------------
 # Step 0: Check prerequisites
 # ------------------------------------------------------------------
@@ -258,6 +330,7 @@ export LLM_MEM_TRACE_OPT_EXPERT_ASYNC_WORKERS="${LLM_MEM_TRACE_OPT_EXPERT_ASYNC_
 export LLM_MEM_TRACE_OPT_EXPERT_ASYNC_PRIORITY="${LLM_MEM_TRACE_OPT_EXPERT_ASYNC_PRIORITY:-$CONTROLLER_PRIORITY}"
 export LLM_MEM_TRACE_OPT_EXPERT_ASYNC_PRIORITY_MODE="${LLM_MEM_TRACE_OPT_EXPERT_ASYNC_PRIORITY_MODE:-$CONTROLLER_PRIORITY_MODE}"
 export LLM_MEM_TRACE_OPT_EXPERT_ASYNC_PRIORITY_HEAP="${LLM_MEM_TRACE_OPT_EXPERT_ASYNC_PRIORITY_HEAP:-$CONTROLLER_PRIORITY_HEAP}"
+export LLM_MEM_TRACE_OPT_EXPERT_DEADLINE_OBSERVE="${LLM_MEM_TRACE_OPT_EXPERT_DEADLINE_OBSERVE:-0}"
 export LLM_MEM_TRACE_OPT_EXPERT_CONTROLLER="$EXPERT_CONTROLLER"
 export LLM_MEM_TRACE_OPT_EXPERT_FEEDBACK="${LLM_MEM_TRACE_OPT_EXPERT_FEEDBACK:-$CONTROLLER_FEEDBACK}"
 export LLM_MEM_TRACE_OPT_EXPERT_SLACK="${LLM_MEM_TRACE_OPT_EXPERT_SLACK:-$CONTROLLER_SLACK}"

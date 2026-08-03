@@ -73,6 +73,10 @@ bool expert_hint_priority_higher(
                 return compare_deadline_score(a, b);
             }
             return compare_known_stage(a, b);
+        case ExpertAsyncPriorityMode::MaxWaitProtection:
+            // The dequeue policy applies the dynamic class ordering. Keep the
+            // frozen legacy key available as the within-class comparator.
+            return compare_deadline_score(a, b);
     }
     return compare_score(a, b);
 }

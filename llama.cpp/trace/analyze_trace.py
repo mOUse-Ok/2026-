@@ -1654,6 +1654,275 @@ def collect_metrics(
         metrics["expert_async_batch_size"] = max(int(r.get("batch_size", 1)) for r in async_summaries)
         metrics["expert_async_batch_wait_us"] = max(int(r.get("batch_wait_us", 0)) for r in async_summaries)
 
+    queue_overhead_summaries = [
+        r for r in data["memory"]
+        if r.get("event") == "EXPERT_QUEUE_OVERHEAD_SUMMARY"
+    ]
+    queue_overhead_selections = [
+        r for r in data["memory"]
+        if r.get("event") == "EXPERT_QUEUE_OVERHEAD_SELECTION"
+    ]
+    if not queue_overhead_summaries:
+        metrics["expert_queue_overhead_available"] = False
+        metrics["expert_queue_overhead_unavailable_reason"] = (
+            "no_expert_queue_overhead_summary"
+        )
+    else:
+        metrics["expert_queue_overhead_available"] = True
+        metrics["expert_queue_overhead_summary_events"] = len(
+            queue_overhead_summaries
+        )
+        metrics["expert_queue_overhead_modes"] = ",".join(sorted({
+            str(r.get("mode")) for r in queue_overhead_summaries if r.get("mode")
+        }))
+        for field in (
+            "selection_count",
+            "batch_count",
+            "condition_wait_count",
+            "condition_reacquire_count",
+            "spurious_or_repeat_wake_count",
+            "clock_read_count",
+            "clock_regression_count",
+            "clock_equality_count",
+            "overflow_count",
+            "detail_event_count",
+        ):
+            metrics[f"expert_queue_overhead_{field}"] = sum(
+                int(r.get(field, 0)) for r in queue_overhead_summaries
+            )
+        metrics["expert_queue_overhead_schema_violations"] = sum(
+            1 for r in queue_overhead_summaries
+            if r.get("schema_version") != "m6b2.1-queue-overhead-v1"
+            or r.get("mode") not in {"summary", "detail"}
+            or r.get("semantics") != "direct_queue_selection_measurement"
+            or r.get("physical_load_observed") is not False
+        )
+        metrics["expert_queue_overhead_priority_modes"] = ",".join(sorted({
+            str(r.get("priority_mode"))
+            for r in queue_overhead_summaries
+            if r.get("priority_mode")
+        }))
+        metrics["expert_queue_overhead_workers"] = sorted({
+            int(r.get("workers", 0)) for r in queue_overhead_summaries
+        })
+        metrics["expert_queue_overhead_by_priority_mode_phase"] = [
+            group
+            for summary in queue_overhead_summaries
+            for group in summary.get("by_priority_mode_phase", [])
+            if isinstance(group, dict)
+        ]
+        aggregate_names = (
+            "mutex_acquire_wait_ns",
+            "mutex_hold_ns",
+            "queue_scan_ns",
+            "queue_scan_candidates",
+        )
+        for name in aggregate_names:
+            aggregates = [
+                summary.get("global", {}).get(name, {})
+                for summary in queue_overhead_summaries
+            ]
+            count = sum(int(item.get("count", 0)) for item in aggregates)
+            total = sum(
+                int(item.get("total", 0))
+                for item in aggregates
+                if item.get("total") is not None
+            )
+            metrics[f"expert_queue_overhead_{name}_count"] = count
+            metrics[f"expert_queue_overhead_{name}_total"] = total
+            metrics[f"expert_queue_overhead_{name}_mean"] = (
+                float(total) / count if count else None
+            )
+            values_min = [
+                int(item["min"]) for item in aggregates
+                if item.get("min") is not None
+            ]
+            values_max = [
+                int(item["max"]) for item in aggregates
+                if item.get("max") is not None
+            ]
+            metrics[f"expert_queue_overhead_{name}_min"] = (
+                min(values_min) if values_min else None
+            )
+            metrics[f"expert_queue_overhead_{name}_max"] = (
+                max(values_max) if values_max else None
+            )
+            metrics[f"expert_queue_overhead_{name}_unavailable_count"] = sum(
+                int(item.get("unavailable_count", 0)) for item in aggregates
+            )
+            metrics[f"expert_queue_overhead_{name}_regression_count"] = sum(
+                int(item.get("clock_regression_count", 0))
+                for item in aggregates
+            )
+
+        metrics["expert_queue_overhead_selection_events"] = len(
+            queue_overhead_selections
+        )
+        metrics["expert_queue_overhead_selection_semantic_violations"] = sum(
+            1 for r in queue_overhead_selections
+            if r.get("schema_version") != "m6b2.1-queue-overhead-v1"
+            or r.get("semantics") != "direct_queue_selection_measurement"
+            or r.get("physical_load_observed") is not False
+        )
+        decision_ids = [
+            r.get("decision_id") for r in queue_overhead_selections
+        ]
+        metrics["expert_queue_overhead_duplicate_decision_ids"] = (
+            len(decision_ids) - len(set(decision_ids))
+        )
+        dequeued_task_ids = {
+            int(task["task_id"])
+            for task in task_events
+            if task.get("lifecycle_event") == "DEQUEUE"
+            and isinstance(task.get("task_id"), int)
+        }
+        metrics["expert_queue_overhead_winner_link_mismatches"] = sum(
+            1 for r in queue_overhead_selections
+            if not isinstance(r.get("winner_task_id"), int)
+            or int(r["winner_task_id"]) not in dequeued_task_ids
+        )
+        summary_detail_expected = sum(
+            int(r.get("selection_count", 0))
+            for r in queue_overhead_summaries
+            if r.get("mode") == "detail"
+        )
+        metrics["expert_queue_overhead_summary_detail_mismatch"] = abs(
+            summary_detail_expected - len(queue_overhead_selections)
+        )
+        if async_summaries:
+            metrics["expert_queue_overhead_priority_pop_mismatch"] = abs(
+                metrics["expert_queue_overhead_selection_count"]
+                - metrics["expert_async_priority_pops"]
+            )
+
+    max_wait_summaries = [
+        r for r in data["memory"] if r.get("event") == "EXPERT_MAX_WAIT_SUMMARY"
+    ]
+    max_wait_selections = [
+        r for r in data["memory"] if r.get("event") == "EXPERT_MAX_WAIT_SELECTION"
+    ]
+    if max_wait_summaries:
+        metrics["expert_max_wait_summary_events"] = len(max_wait_summaries)
+        metrics["expert_max_wait_modes"] = ",".join(sorted({
+            str(r.get("mode")) for r in max_wait_summaries if r.get("mode")
+        }))
+        for field in (
+            "protection_eligible_count",
+            "protection_eligible_decisions",
+            "protection_selected_count",
+            "urgent_selected_count",
+            "normal_selected_count",
+            "protected_wait_count",
+            "protected_wait_total_ns",
+            "threshold_overshoot_count",
+            "threshold_overshoot_total_ns",
+            "protected_over_normal_count",
+            "missing_deadline_count",
+            "missing_enqueue_timestamp_count",
+            "enqueue_time_regression_count",
+            "selection_count",
+        ):
+            metrics[f"expert_max_wait_{field}"] = sum(
+                int(r.get(field, 0)) for r in max_wait_summaries
+            )
+        for field in (
+            "protection_still_waiting_count",
+            "protection_still_waiting_max",
+            "protected_wait_max_ns",
+            "threshold_overshoot_max_ns",
+        ):
+            metrics[f"expert_max_wait_{field}"] = max(
+                int(r.get(field, 0)) for r in max_wait_summaries
+            )
+        metrics["expert_max_wait_threshold_us"] = max(
+            int(r.get("threshold_us", 0)) for r in max_wait_summaries
+        )
+        metrics["expert_max_wait_urgent_guard_us"] = max(
+            int(r.get("urgent_guard_us", 0)) for r in max_wait_summaries
+        )
+        protected_count = metrics["expert_max_wait_protected_wait_count"]
+        protected_total = metrics["expert_max_wait_protected_wait_total_ns"]
+        metrics["expert_max_wait_protected_wait_mean_ns"] = (
+            float(protected_total) / protected_count if protected_count else 0.0
+        )
+        overshoot_count = metrics["expert_max_wait_threshold_overshoot_count"]
+        overshoot_total = metrics["expert_max_wait_threshold_overshoot_total_ns"]
+        metrics["expert_max_wait_threshold_overshoot_mean_ns"] = (
+            float(overshoot_total) / overshoot_count if overshoot_count else 0.0
+        )
+        metrics["expert_max_wait_summary_semantic_violations"] = sum(
+            1 for r in max_wait_summaries
+            if r.get("mode") != "max_wait_protection"
+            or r.get("semantics") != "queue_selection"
+            or r.get("physical_load_observed") is not False
+            or r.get("protection_eligible_semantics") != "candidate_observations"
+        )
+
+    if max_wait_selections:
+        metrics["expert_max_wait_selection_events"] = len(max_wait_selections)
+        task_ids = [r.get("task_id") for r in max_wait_selections]
+        metrics["expert_max_wait_duplicate_selection_task_ids"] = (
+            len(task_ids) - len(set(task_ids))
+        )
+        metrics["expert_max_wait_selection_semantic_violations"] = sum(
+            1 for r in max_wait_selections
+            if r.get("semantics") != "queue_selection"
+            or r.get("physical_load_observed") is not False
+        )
+        classification_mismatches = 0
+        timestamp_mismatches = 0
+        dequeued_by_task = {
+            int(task["task_id"]): int(task.get("dequeued_ts_ns", 0))
+            for task in task_events
+            if task.get("lifecycle_event") == "DEQUEUE"
+            and isinstance(task.get("task_id"), int)
+        }
+        for record in max_wait_selections:
+            decision_ts = int(record.get("decision_ts_ns", 0))
+            enqueued_ts = int(record.get("enqueued_ts_ns", 0))
+            deadline_ts = int(record.get("deadline_ts_ns", 0))
+            threshold_ns = int(record.get("threshold_ns", 0))
+            urgent_guard_ns = int(record.get("urgent_guard_ns", 0))
+            waiting = record.get("waiting_ns")
+            actual_class = str(record.get("class", ""))
+            actual_reason = str(record.get("reason", ""))
+
+            if enqueued_ts == 0:
+                expected_class = "normal"
+                expected_reason = "missing_enqueue_fallback"
+                expected_waiting = None
+            elif decision_ts < enqueued_ts:
+                expected_class = "normal"
+                expected_reason = "enqueue_time_regression_fallback"
+                expected_waiting = None
+            else:
+                expected_waiting = decision_ts - enqueued_ts
+                urgent_limit = min((1 << 64) - 1, decision_ts + urgent_guard_ns)
+                if deadline_ts != 0 and deadline_ts <= urgent_limit:
+                    expected_class = "urgent"
+                    expected_reason = "deadline_within_guard"
+                elif expected_waiting >= threshold_ns:
+                    expected_class = "protected"
+                    expected_reason = "waiting_at_or_above_threshold"
+                else:
+                    expected_class = "normal"
+                    expected_reason = "legacy_normal"
+
+            if (actual_class != expected_class or actual_reason != expected_reason
+                    or waiting != expected_waiting):
+                classification_mismatches += 1
+            dequeued_ts = dequeued_by_task.get(int(record.get("task_id", 0)), 0)
+            if enqueued_ts and expected_waiting is not None and not (
+                    enqueued_ts <= decision_ts and
+                    (dequeued_ts == 0 or decision_ts <= dequeued_ts)):
+                timestamp_mismatches += 1
+        metrics["expert_max_wait_classification_mismatches"] = classification_mismatches
+        metrics["expert_max_wait_timestamp_mismatches"] = timestamp_mismatches
+        if max_wait_summaries:
+            metrics["expert_max_wait_summary_selection_mismatch"] = abs(
+                metrics["expert_max_wait_selection_count"] - len(max_wait_selections)
+            )
+
     route_hint_summaries = [r for r in data["memory"] if r.get("event") == "EXPERT_ROUTE_HINT_SUMMARY"]
     if route_hint_summaries:
         metrics["expert_route_hint_summary_events"] = len(route_hint_summaries)

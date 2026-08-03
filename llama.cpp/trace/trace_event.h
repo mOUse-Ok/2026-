@@ -51,6 +51,7 @@ void llm_mem_trace_prefetch_expert_layer(int layer, int token_idx, const int * e
 void llm_mem_trace_kv_set_rows(const struct ggml_tensor * t);
 void llm_mem_trace_kv_reuse(uint32_t n_tokens, uint32_t reused);
 
+int  llm_mem_trace_moe_weights_requires_sync(const struct ggml_tensor * t);
 void llm_mem_trace_moe_weights(const struct ggml_tensor * t);
 
 void llm_mem_trace_memory_sample(const char * reason);
@@ -86,6 +87,7 @@ static inline void llm_mem_trace_prefetch_expert_layer(int layer, int token_idx,
 static inline void llm_mem_trace_kv_set_rows(const struct ggml_tensor * t) { (void) t; }
 static inline void llm_mem_trace_kv_reuse(uint32_t n_tokens, uint32_t reused) { (void) n_tokens; (void) reused; }
 
+static inline int llm_mem_trace_moe_weights_requires_sync(const struct ggml_tensor * t) { (void) t; return 0; }
 static inline void llm_mem_trace_moe_weights(const struct ggml_tensor * t) { (void) t; }
 
 static inline void llm_mem_trace_memory_sample(const char * reason) { (void) reason; }

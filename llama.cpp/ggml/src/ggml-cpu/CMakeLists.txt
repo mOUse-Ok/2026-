@@ -71,6 +71,8 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
             ${CMAKE_CURRENT_SOURCE_DIR}/../../trace/expert_tensor_registry.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/../../trace/expert_prefetch_policy.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/../../trace/expert_hint_priority.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../trace/expert_max_wait_protection.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../trace/expert_queue_overhead_observation.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/../../trace/expert_tensor_stage.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/../../trace/expert_task_lifecycle.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/../../trace/expert_first_use_matcher.cpp

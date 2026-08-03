@@ -3,6 +3,8 @@
 #include "expert_tensor_registry.h"
 #include "expert_prefetch_policy.h"
 #include "expert_hint_priority.h"
+#include "expert_max_wait_protection.h"
+#include "expert_queue_overhead_observation.h"
 #include "expert_tensor_stage.h"
 #include "expert_task_lifecycle.h"
 #include "expert_first_use_matcher.h"
@@ -25,6 +27,7 @@
 #include <cstring>
 #include <deque>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -127,6 +130,30 @@ bool env_truthy(const char * value) {
         return false;
     }
     return !(value[0] == '0' && value[1] == '\0');
+}
+
+bool router_score_diagnostic_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("LLM_MEM_TRACE_ROUTER_SCORE_DIAGNOSTIC");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+uint64_t f64_bits(double value) {
+    uint64_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+void append_f64_bits(std::string & line, double value) {
+    char buffer[24];
+    std::snprintf(
+            buffer,
+            sizeof(buffer),
+            "0x%016llx",
+            (unsigned long long) f64_bits(value));
+    json_escape_append(line, buffer);
 }
 
 bool trace_profile_is_benchmark() {
@@ -1144,6 +1171,9 @@ ExpertAsyncPriorityMode expert_prefetch_async_priority_mode() {
         if (std::strcmp(value, "stage_deadline_score") == 0) {
             return ExpertAsyncPriorityMode::StageDeadlineScore;
         }
+        if (std::strcmp(value, "max_wait_protection") == 0) {
+            return ExpertAsyncPriorityMode::MaxWaitProtection;
+        }
         return ExpertAsyncPriorityMode::Score;
     }();
     return mode;
@@ -1848,6 +1878,10 @@ void write_expert_task_event(
     json_escape_append(line, addr_buf);
     line += ",\"nbytes\":" + std::to_string(task.nbytes);
     line += ",\"score\":" + std::to_string(task.score);
+    if (router_score_diagnostic_enabled()) {
+        line += ",\"score_f64_bits\":";
+        append_f64_bits(line, task.score);
+    }
     line += ",\"sequence\":" + std::to_string(task.sequence);
     line += ",\"deadline_ts_ns\":" + std::to_string(task.deadline_ts_ns);
     line += ",\"created_ts_ns\":" + std::to_string(task.created_ts_ns);
@@ -3012,9 +3046,377 @@ std::vector<ExpertHintTask> coalesce_expert_hint_batch(std::vector<ExpertHintTas
     return merged;
 }
 
+[[noreturn]] void expert_max_wait_config_fatal(const char * message) {
+    std::fprintf(stderr, "ERROR: invalid max_wait_protection configuration: %s\n", message);
+    std::abort();
+}
+
+ExpertMaxWaitConfig load_expert_max_wait_config(
+        bool priority_enabled,
+        bool priority_heap_enabled) {
+    if (!expert_prefetch_async_enabled()) {
+        expert_max_wait_config_fatal("LLM_MEM_TRACE_OPT_EXPERT_ASYNC must be 1");
+    }
+    if (!priority_enabled) {
+        expert_max_wait_config_fatal("LLM_MEM_TRACE_OPT_EXPERT_ASYNC_PRIORITY must be 1");
+    }
+    if (priority_heap_enabled) {
+        expert_max_wait_config_fatal("LLM_MEM_TRACE_OPT_EXPERT_ASYNC_PRIORITY_HEAP must be 0");
+    }
+    if (expert_prefetch_async_batch_size() != 1) {
+        expert_max_wait_config_fatal("LLM_MEM_TRACE_OPT_EXPERT_ASYNC_BATCH must be 1");
+    }
+    if (expert_prefetch_async_batch_wait_us() != 0) {
+        expert_max_wait_config_fatal("LLM_MEM_TRACE_OPT_EXPERT_ASYNC_BATCH_WAIT_US must be 0");
+    }
+    if (!expert_deadline_observation_enabled()) {
+        expert_max_wait_config_fatal("LLM_MEM_TRACE_OPT_EXPERT_DEADLINE_OBSERVE must be 1");
+    }
+
+    ExpertMaxWaitConfig config;
+    if (!expert_max_wait_parse_us(
+                std::getenv("LLM_MEM_TRACE_OPT_EXPERT_MAX_WAIT_THRESHOLD_US"),
+                false,
+                config.threshold_us,
+                config.threshold_ns)) {
+        expert_max_wait_config_fatal(
+                "LLM_MEM_TRACE_OPT_EXPERT_MAX_WAIT_THRESHOLD_US must be an explicit positive integer");
+    }
+    if (!expert_max_wait_parse_us(
+                std::getenv("LLM_MEM_TRACE_OPT_EXPERT_URGENT_GUARD_US"),
+                true,
+                config.urgent_guard_us,
+                config.urgent_guard_ns)) {
+        expert_max_wait_config_fatal(
+                "LLM_MEM_TRACE_OPT_EXPERT_URGENT_GUARD_US must be an explicit non-negative integer");
+    }
+    return config;
+}
+
+[[noreturn]] void expert_queue_overhead_config_fatal(const char * message) {
+    std::fprintf(stderr, "ERROR: invalid queue overhead observation configuration: %s\n", message);
+    std::abort();
+}
+
+ExpertQueueOverheadMode load_expert_queue_overhead_mode() {
+    ExpertQueueOverheadMode mode = ExpertQueueOverheadMode::Off;
+    if (!expert_queue_overhead_parse_mode(
+                std::getenv("LLM_MEM_TRACE_QUEUE_OVERHEAD_MODE"), mode)) {
+        expert_queue_overhead_config_fatal(
+                "LLM_MEM_TRACE_QUEUE_OVERHEAD_MODE must be off, summary, or detail");
+    }
+    if (mode != ExpertQueueOverheadMode::Off &&
+            !llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_MEMORY)) {
+        expert_queue_overhead_config_fatal(
+                "summary/detail requires the Memory Trace sink");
+    }
+    return mode;
+}
+
+ExpertMaxWaitKey expert_max_wait_key(const ExpertHintTask & task) {
+    ExpertMaxWaitKey result;
+    result.priority.step = task.step;
+    result.priority.layer = task.layer;
+    result.priority.stage = task.stage;
+    result.priority.route_score = task.route_score;
+    result.priority.sequence = task.sequence;
+    result.priority.deadline_ts_ns = task.deadline_ts_ns;
+    result.enqueued_ts_ns = task.lifecycle.enqueued_ts_ns;
+    return result;
+}
+
+struct ExpertMaxWaitSelectionMeta {
+    bool valid = false;
+    uint64_t decision_ts_ns = 0;
+    uint64_t enqueued_ts_ns = 0;
+    ExpertMaxWaitDecision decision;
+    uint64_t protected_candidate_count = 0;
+    bool normal_competitor_present = false;
+};
+
+struct ExpertPrioritySelectionMeta {
+    bool valid = false;
+    uint64_t decision_ts_ns = 0;
+    uint64_t candidate_count = 0;
+    ExpertAsyncPriorityMode mode = ExpertAsyncPriorityMode::Score;
+};
+
+struct ExpertQueueScanMeta {
+    bool available = false;
+    const char * strategy = "unavailable";
+    uint64_t candidates = 0;
+    uint64_t start_ts_ns = 0;
+    uint64_t end_ts_ns = 0;
+    uint64_t clock_read_count = 0;
+};
+
+struct ExpertQueueOverheadDetailMeta {
+    ExpertQueueOverheadBatchSample batch;
+    ExpertQueueOverheadSelectionSample selection;
+};
+
+void append_checked_duration_json(
+        std::string & line,
+        const ExpertQueueCheckedDuration & duration) {
+    if (duration.available) {
+        line += std::to_string(duration.value_ns);
+    } else {
+        line += "null";
+    }
+}
+
+void write_expert_queue_overhead_selection(
+        const ExpertQueueOverheadDetailMeta & meta) {
+    const ExpertQueueOverheadBatchSample & batch = meta.batch;
+    const ExpertQueueOverheadSelectionSample & selection = meta.selection;
+    const ExpertQueueCheckedDuration acquire = expert_queue_checked_duration(
+            batch.lock_wait_start_ts_ns, batch.lock_acquired_ts_ns);
+    const ExpertQueueCheckedDuration hold = expert_queue_checked_duration(
+            batch.lock_acquired_ts_ns, batch.lock_release_ts_ns);
+    ExpertQueueCheckedDuration scan;
+    if (selection.queue_scan_available) {
+        scan = expert_queue_checked_duration(
+                selection.scan_start_ts_ns, selection.scan_end_ts_ns);
+    }
+
+    const char * configured_run_id = std::getenv("LLM_MEM_TRACE_RUN_ID");
+    std::string line;
+    line.reserve(1024);
+    line += "{\"event\":\"EXPERT_QUEUE_OVERHEAD_SELECTION\",\"ts_ns\":" +
+            std::to_string(llm_mem_trace_time_ns());
+    line += ",\"schema_version\":\"m6b2.1-queue-overhead-v1\"";
+    line += ",\"run_id\":";
+    json_escape_append(line, configured_run_id && configured_run_id[0] ?
+            configured_run_id : "missing_run_id");
+    line += ",\"semantics\":\"direct_queue_selection_measurement\"";
+    line += ",\"decision_id\":" + std::to_string(selection.decision_id);
+    line += ",\"batch_id\":" + std::to_string(selection.batch_id);
+    line += ",\"batch_slot\":" + std::to_string(selection.batch_slot);
+    line += ",\"worker_id\":" + std::to_string(selection.worker_id);
+    line += ",\"phase\":";
+    json_escape_append(line, phase_name(selection.phase));
+    line += ",\"step\":" + std::to_string(selection.step);
+    line += ",\"priority_mode\":";
+    json_escape_append(line, expert_prefetch_async_priority_mode_name(selection.priority_mode));
+    line += ",\"selection_strategy\":";
+    json_escape_append(line, selection.selection_strategy);
+    line += ",\"queue_depth_before\":" + std::to_string(selection.queue_depth_before);
+    line += ",\"queue_scan_candidates\":" +
+            std::to_string(selection.queue_scan_candidates);
+    line += ",\"lock_wait_start_ts_ns\":" +
+            std::to_string(batch.lock_wait_start_ts_ns);
+    line += ",\"lock_acquired_ts_ns\":" +
+            std::to_string(batch.lock_acquired_ts_ns);
+    line += ",\"lock_release_ts_ns\":" +
+            std::to_string(batch.lock_release_ts_ns);
+    line += ",\"scan_start_ts_ns\":" + std::to_string(selection.scan_start_ts_ns);
+    line += ",\"scan_end_ts_ns\":" + std::to_string(selection.scan_end_ts_ns);
+    line += ",\"mutex_acquire_wait_ns\":";
+    append_checked_duration_json(line, acquire);
+    line += ",\"mutex_hold_ns\":";
+    append_checked_duration_json(line, hold);
+    line += ",\"queue_scan_ns\":";
+    append_checked_duration_json(line, scan);
+    line += ",\"winner_task_id\":" + std::to_string(selection.winner_task_id);
+    line += ",\"winner_class\":";
+    json_escape_append(line, selection.winner_class);
+    line += ",\"batch_decision_ts_ns\":" +
+            std::to_string(selection.batch_decision_ts_ns);
+    line += ",\"clock_read_count\":" + std::to_string(
+            batch.clock_read_count + selection.clock_read_count + 1);
+    line += ",\"condition_reacquire_count\":" +
+            std::to_string(batch.condition_reacquire_count);
+    line += ",\"error_flags\":[";
+    bool needs_comma = false;
+    auto append_error = [&](const char * error) {
+        if (needs_comma) {
+            line += ',';
+        }
+        json_escape_append(line, error);
+        needs_comma = true;
+    };
+    if (acquire.regression) append_error("mutex_acquire_clock_regression");
+    if (hold.regression) append_error("mutex_hold_clock_regression");
+    if (!selection.queue_scan_available) append_error("queue_scan_unavailable");
+    if (scan.regression) append_error("queue_scan_clock_regression");
+    line += "]";
+    line += ",\"physical_load_observed\":false}";
+    llm_mem_trace_write(LLM_MEM_TRACE_SINK_MEMORY, line.c_str(), line.size());
+}
+
+void append_queue_overhead_aggregate(
+        std::string & line,
+        const ExpertQueueBoundedAggregate & aggregate) {
+    line += "{\"count\":" + std::to_string(aggregate.count);
+    line += ",\"total\":";
+    if (aggregate.count != 0) {
+        line += std::to_string(aggregate.total);
+    } else {
+        line += "null";
+    }
+    line += ",\"mean\":";
+    if (aggregate.count != 0) {
+        line += std::to_string(
+                static_cast<double>(aggregate.total) /
+                static_cast<double>(aggregate.count));
+    } else {
+        line += "null";
+    }
+    line += ",\"min\":";
+    line += aggregate.count != 0 ? std::to_string(aggregate.min) : "null";
+    line += ",\"max\":";
+    line += aggregate.count != 0 ? std::to_string(aggregate.max) : "null";
+    line += ",\"p50_bucket_upper_bound\":";
+    line += aggregate.count != 0 ?
+            std::to_string(aggregate.quantile_bucket_upper(0.50)) : "null";
+    line += ",\"p95_bucket_upper_bound\":";
+    line += aggregate.count != 0 ?
+            std::to_string(aggregate.quantile_bucket_upper(0.95)) : "null";
+    line += ",\"p99_bucket_upper_bound\":";
+    line += aggregate.count != 0 ?
+            std::to_string(aggregate.quantile_bucket_upper(0.99)) : "null";
+    line += ",\"zero_count\":" + std::to_string(aggregate.zero_count);
+    line += ",\"unavailable_count\":" + std::to_string(aggregate.unavailable_count);
+    line += ",\"clock_regression_count\":" +
+            std::to_string(aggregate.regression_count);
+    line += ",\"overflow_count\":" + std::to_string(aggregate.overflow_count);
+    if (aggregate.count == 0) {
+        line += ",\"empty_reason\":";
+        json_escape_append(line, aggregate.unavailable_count != 0 ?
+                "unavailable" : "no_samples");
+    }
+    line += ",\"quantile_semantics\":\"bucket_upper_bound\"";
+    line += ",\"histogram_schema\":\"zero_then_log2_upper_bound\"";
+    line += ",\"histogram\":[";
+    for (size_t i = 0; i < aggregate.buckets.size(); ++i) {
+        if (i != 0) {
+            line += ',';
+        }
+        line += std::to_string(aggregate.buckets[i]);
+    }
+    line += "]}";
+}
+
+uint64_t queue_overhead_cell_overflow_count(const ExpertQueueOverheadCell & cell) {
+    return cell.mutex_acquire_wait_ns.overflow_count +
+            cell.mutex_hold_ns.overflow_count +
+            cell.queue_scan_ns.overflow_count +
+            cell.queue_scan_candidates.overflow_count;
+}
+
+uint64_t queue_overhead_cell_regression_count(const ExpertQueueOverheadCell & cell) {
+    return cell.mutex_acquire_wait_ns.regression_count +
+            cell.mutex_hold_ns.regression_count +
+            cell.queue_scan_ns.regression_count;
+}
+
+uint64_t queue_overhead_cell_zero_count(const ExpertQueueOverheadCell & cell) {
+    return cell.mutex_acquire_wait_ns.zero_count +
+            cell.mutex_hold_ns.zero_count +
+            cell.queue_scan_ns.zero_count;
+}
+
+bool queue_overhead_cell_has_samples(const ExpertQueueOverheadCell & cell) {
+    return cell.mutex_acquire_wait_ns.count != 0 ||
+            cell.mutex_acquire_wait_ns.unavailable_count != 0 ||
+            cell.mutex_hold_ns.count != 0 ||
+            cell.mutex_hold_ns.unavailable_count != 0 ||
+            cell.queue_scan_ns.count != 0 ||
+            cell.queue_scan_ns.unavailable_count != 0 ||
+            cell.queue_scan_candidates.count != 0 ||
+            cell.queue_scan_candidates.unavailable_count != 0;
+}
+
+void append_queue_overhead_cell(
+        std::string & line,
+        const ExpertQueueOverheadCell & cell) {
+    line += "{\"mutex_acquire_wait_ns\":";
+    append_queue_overhead_aggregate(line, cell.mutex_acquire_wait_ns);
+    line += ",\"mutex_hold_ns\":";
+    append_queue_overhead_aggregate(line, cell.mutex_hold_ns);
+    line += ",\"queue_scan_ns\":";
+    append_queue_overhead_aggregate(line, cell.queue_scan_ns);
+    line += ",\"queue_scan_candidates\":";
+    append_queue_overhead_aggregate(line, cell.queue_scan_candidates);
+    line += "}";
+}
+
+void write_expert_priority_selection(
+        const ExpertHintTask & task,
+        const ExpertPrioritySelectionMeta & meta) {
+    if (!meta.valid || !router_score_diagnostic_enabled() ||
+            !expert_task_detail_events_enabled() ||
+            !llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_MEMORY)) {
+        return;
+    }
+
+    std::string line;
+    line.reserve(384);
+    line += "{\"event\":\"EXPERT_PRIORITY_SELECTION\",\"ts_ns\":" +
+            std::to_string(llm_mem_trace_time_ns());
+    line += ",\"semantics\":\"queue_selection_diagnostic\"";
+    line += ",\"physical_load_observed\":false";
+    line += ",\"mode\":";
+    json_escape_append(line, expert_prefetch_async_priority_mode_name(meta.mode));
+    line += ",\"task_id\":" + std::to_string(task.lifecycle.task_id);
+    line += ",\"decision_ts_ns\":" + std::to_string(meta.decision_ts_ns);
+    line += ",\"candidate_count\":" + std::to_string(meta.candidate_count);
+    line += ",\"deadline_ts_ns\":" + std::to_string(task.deadline_ts_ns);
+    line += ",\"route_score\":" + std::to_string(task.route_score);
+    line += ",\"route_score_f64_bits\":";
+    append_f64_bits(line, task.route_score);
+    line += ",\"sequence\":" + std::to_string(task.sequence);
+    line += "}";
+    llm_mem_trace_write(LLM_MEM_TRACE_SINK_MEMORY, line.c_str(), line.size());
+}
+
+void write_expert_max_wait_selection(
+        const ExpertHintTask & task,
+        const ExpertMaxWaitSelectionMeta & meta,
+        const ExpertMaxWaitConfig & config) {
+    if (!meta.valid || !expert_task_detail_events_enabled() ||
+            !llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_MEMORY)) {
+        return;
+    }
+
+    std::string line;
+    line.reserve(512);
+    line += "{\"event\":\"EXPERT_MAX_WAIT_SELECTION\",\"ts_ns\":" +
+            std::to_string(llm_mem_trace_time_ns());
+    line += ",\"semantics\":\"queue_selection\"";
+    line += ",\"physical_load_observed\":false";
+    line += ",\"task_id\":" + std::to_string(task.lifecycle.task_id);
+    line += ",\"decision_ts_ns\":" + std::to_string(meta.decision_ts_ns);
+    line += ",\"enqueued_ts_ns\":" + std::to_string(meta.enqueued_ts_ns);
+    line += ",\"waiting_ns\":";
+    if (meta.decision.waiting_available) {
+        line += std::to_string(meta.decision.waiting_ns);
+    } else {
+        line += "null";
+    }
+    line += ",\"threshold_us\":" + std::to_string(config.threshold_us);
+    line += ",\"threshold_ns\":" + std::to_string(config.threshold_ns);
+    line += ",\"urgent_guard_us\":" + std::to_string(config.urgent_guard_us);
+    line += ",\"urgent_guard_ns\":" + std::to_string(config.urgent_guard_ns);
+    line += ",\"class\":\"" +
+            std::string(expert_max_wait_class_name(meta.decision.task_class)) + "\"";
+    line += ",\"reason\":\"" +
+            std::string(expert_max_wait_reason_name(meta.decision.reason)) + "\"";
+    line += ",\"deadline_ts_ns\":" + std::to_string(task.deadline_ts_ns);
+    line += ",\"route_score\":" + std::to_string(task.route_score);
+    line += ",\"sequence\":" + std::to_string(task.sequence);
+    line += ",\"protected_candidate_count\":" +
+            std::to_string(meta.protected_candidate_count);
+    line += ",\"normal_competitor_present\":" +
+            std::string(meta.normal_competitor_present ? "true" : "false");
+    line += "}";
+    llm_mem_trace_write(LLM_MEM_TRACE_SINK_MEMORY, line.c_str(), line.size());
+}
+
 struct ExpertHintQueue {
     std::mutex mu;
     std::condition_variable cv;
+    std::unique_ptr<std::condition_variable_any> observed_cv;
     std::deque<ExpertHintTask> tasks;
     std::vector<ExpertHintTask> priority_heap;
     std::vector<ExpertHintTask> legacy_priority_heap;
@@ -3026,6 +3428,11 @@ struct ExpertHintQueue {
     bool priority_enabled = false;
     bool priority_heap_enabled = false;
     ExpertAsyncPriorityMode priority_mode = ExpertAsyncPriorityMode::Score;
+    ExpertMaxWaitConfig max_wait_config;
+    ExpertQueueOverheadMode queue_overhead_mode = ExpertQueueOverheadMode::Off;
+    std::unique_ptr<ExpertQueueOverheadObserver> queue_overhead_observer;
+    uint64_t queue_overhead_next_batch_id = 0;
+    uint64_t queue_overhead_next_decision_id = 0;
     uint64_t next_sequence = 0;
     uint64_t enqueued_tasks = 0;
     uint64_t issued_tasks = 0;
@@ -3045,6 +3452,24 @@ struct ExpertHintQueue {
     uint64_t worker_batches = 0;
     uint64_t batched_candidates = 0;
     uint64_t coalesced_syscalls_saved = 0;
+    uint64_t max_wait_eligible_count = 0;
+    uint64_t max_wait_eligible_decisions = 0;
+    uint64_t max_wait_selected_protected = 0;
+    uint64_t max_wait_selected_urgent = 0;
+    uint64_t max_wait_selected_normal = 0;
+    uint64_t max_wait_still_waiting = 0;
+    uint64_t max_wait_still_waiting_max = 0;
+    uint64_t max_wait_protected_wait_count = 0;
+    uint64_t max_wait_protected_wait_total_ns = 0;
+    uint64_t max_wait_protected_wait_max_ns = 0;
+    uint64_t max_wait_overshoot_count = 0;
+    uint64_t max_wait_overshoot_total_ns = 0;
+    uint64_t max_wait_overshoot_max_ns = 0;
+    uint64_t max_wait_protected_over_normal = 0;
+    uint64_t max_wait_missing_deadline = 0;
+    uint64_t max_wait_missing_enqueue_timestamp = 0;
+    uint64_t max_wait_enqueue_time_regression = 0;
+    uint64_t max_wait_selection_count = 0;
     std::atomic<uint64_t> busy_workers{0};
 
     ~ExpertHintQueue() {
@@ -3055,6 +3480,7 @@ struct ExpertHintQueue {
         if (!ensure_started()) {
             return false;
         }
+        ExpertQueueOverheadMode notify_mode = ExpertQueueOverheadMode::Off;
         {
             std::lock_guard<std::mutex> lock(mu);
             if (queue_depth_unlocked() >= capacity) {
@@ -3101,8 +3527,13 @@ struct ExpertHintQueue {
             queued_bytes += task_bytes;
             max_queued_bytes = std::max(max_queued_bytes, queued_bytes);
             max_queue_depth = std::max<uint64_t>(max_queue_depth, (uint64_t) queue_depth_unlocked());
+            notify_mode = queue_overhead_mode;
         }
-        cv.notify_one();
+        if (notify_mode == ExpertQueueOverheadMode::Off) {
+            cv.notify_one();
+        } else {
+            observed_cv->notify_one();
+        }
         return true;
     }
 
@@ -3115,18 +3546,38 @@ struct ExpertHintQueue {
         priority_enabled = expert_prefetch_async_priority_enabled();
         priority_heap_enabled = priority_enabled && expert_prefetch_async_priority_heap_enabled();
         priority_mode = expert_prefetch_async_priority_mode();
+        queue_overhead_mode = load_expert_queue_overhead_mode();
+        if (priority_mode == ExpertAsyncPriorityMode::MaxWaitProtection) {
+            max_wait_config = load_expert_max_wait_config(
+                    priority_enabled, priority_heap_enabled);
+        }
         stopping = false;
         const size_t n_workers = std::min<size_t>(expert_prefetch_async_workers(), 16);
         worker_count = n_workers;
+        queue_overhead_next_batch_id = 0;
+        queue_overhead_next_decision_id = 0;
         try {
+            if (queue_overhead_mode != ExpertQueueOverheadMode::Off) {
+                observed_cv.reset(new std::condition_variable_any());
+                queue_overhead_observer.reset(new ExpertQueueOverheadObserver());
+                queue_overhead_observer->reset(
+                        queue_overhead_mode,
+                        n_workers,
+                        expert_prefetch_async_batch_size(),
+                        llm_mem_trace_time_ns);
+            }
             workers.reserve(n_workers);
             for (size_t i = 0; i < n_workers; ++i) {
-                workers.emplace_back([this] { run(); });
+                workers.emplace_back([this, i] { run(i); });
             }
         } catch (...) {
             start_fail_fallbacks++;
             stopping = true;
-            cv.notify_all();
+            if (queue_overhead_mode == ExpertQueueOverheadMode::Off) {
+                cv.notify_all();
+            } else if (observed_cv) {
+                observed_cv->notify_all();
+            }
             for (std::thread & worker : workers) {
                 if (worker.joinable()) {
                     worker.join();
@@ -3138,6 +3589,10 @@ struct ExpertHintQueue {
             priority_enabled = false;
             priority_heap_enabled = false;
             priority_mode = ExpertAsyncPriorityMode::Score;
+            max_wait_config = {};
+            queue_overhead_mode = ExpertQueueOverheadMode::Off;
+            queue_overhead_observer.reset();
+            observed_cv.reset();
             started = false;
             return false;
         }
@@ -3146,14 +3601,20 @@ struct ExpertHintQueue {
     }
 
     void shutdown() {
+        ExpertQueueOverheadMode notify_mode = ExpertQueueOverheadMode::Off;
         {
             std::lock_guard<std::mutex> lock(mu);
             if (!started) {
                 return;
             }
             stopping = true;
+            notify_mode = queue_overhead_mode;
         }
-        cv.notify_all();
+        if (notify_mode == ExpertQueueOverheadMode::Off) {
+            cv.notify_all();
+        } else {
+            observed_cv->notify_all();
+        }
         for (std::thread & worker : workers) {
             if (worker.joinable()) {
                 worker.join();
@@ -3174,14 +3635,22 @@ struct ExpertHintQueue {
             priority_enabled = false;
             priority_heap_enabled = false;
             priority_mode = ExpertAsyncPriorityMode::Score;
+            max_wait_config = {};
+            queue_overhead_mode = ExpertQueueOverheadMode::Off;
+            queue_overhead_next_batch_id = 0;
+            queue_overhead_next_decision_id = 0;
+            queue_overhead_observer.reset();
+            observed_cv.reset();
         }
     }
 
-    void run() {
+    void run(size_t worker_id) {
         for (;;) {
             std::vector<ExpertHintTask> batch;
+            std::vector<ExpertPrioritySelectionMeta> priority_selections;
+            ExpertMaxWaitSelectionMeta max_wait_selection;
             const bool pressure_shadow_on = llm_pressure_shadow::enabled();
-            {
+            if (queue_overhead_mode == ExpertQueueOverheadMode::Off) {
                 std::unique_lock<std::mutex> lock(mu);
                 cv.wait(lock, [&] { return stopping || !queue_empty_unlocked(); });
                 if (queue_empty_unlocked()) {
@@ -3199,18 +3668,180 @@ struct ExpertHintQueue {
                 }
                 const size_t count = std::min(batch_limit, queue_depth_unlocked());
                 batch.reserve(count);
-                for (size_t i = 0; i < count; ++i) {
-                    batch.emplace_back(pop_one_unlocked());
+                priority_selections.reserve(count);
+                if (priority_mode == ExpertAsyncPriorityMode::MaxWaitProtection) {
+                    batch.emplace_back(pop_one_max_wait_unlocked<false>(
+                            max_wait_selection, nullptr));
+                    priority_selections.emplace_back();
+                } else {
+                    for (size_t i = 0; i < count; ++i) {
+                        ExpertPrioritySelectionMeta selection;
+                        batch.emplace_back(pop_one_unlocked<false>(&selection, nullptr));
+                        priority_selections.emplace_back(selection);
+                    }
                 }
                 worker_batches++;
                 batched_candidates += count;
                 if (pressure_shadow_on) {
                     busy_workers.fetch_add(1, std::memory_order_relaxed);
                 }
+            } else {
+                ExpertQueueOverheadBatchSample batch_sample;
+                std::vector<ExpertQueueOverheadSelectionSample> selection_samples;
+                selection_samples.reserve(expert_prefetch_async_batch_size());
+                ExpertQueueObservedLock lock(mu, llm_mem_trace_time_ns);
+                uint64_t reacquire_count = 0;
+                uint64_t condition_wait_count = 0;
+
+                const uint64_t first_wait_lock_count = lock.lock_count();
+                observed_cv->wait(lock, [&] { return stopping || !queue_empty_unlocked(); });
+                const uint64_t first_wait_reacquires =
+                        lock.lock_count() - first_wait_lock_count;
+                if (first_wait_reacquires != 0) {
+                    ++condition_wait_count;
+                    reacquire_count += first_wait_reacquires;
+                }
+                if (queue_empty_unlocked()) {
+                    const bool should_stop = stopping;
+                    const uint64_t repeat_wake_count =
+                            first_wait_reacquires > 0 ?
+                            first_wait_reacquires - 1 : 0;
+                    lock.unlock();
+                    queue_overhead_observer->record_idle_wait_exit(
+                            first_wait_reacquires != 0 ? 1 : 0,
+                            first_wait_reacquires,
+                            repeat_wake_count,
+                            lock.clock_read_count());
+                    if (should_stop) {
+                        break;
+                    }
+                    continue;
+                }
+
+                const size_t batch_limit = expert_prefetch_async_batch_size();
+                const uint64_t wait_us = expert_prefetch_async_batch_wait_us();
+                if (!stopping && wait_us > 0 && batch_limit > 1 &&
+                        queue_depth_unlocked() < batch_limit) {
+                    const uint64_t batch_wait_lock_count = lock.lock_count();
+                    observed_cv->wait_for(lock, std::chrono::microseconds(wait_us), [&] {
+                        return stopping || queue_depth_unlocked() >= batch_limit;
+                    });
+                    const uint64_t batch_wait_reacquires =
+                            lock.lock_count() - batch_wait_lock_count;
+                    if (batch_wait_reacquires != 0) {
+                        ++condition_wait_count;
+                        reacquire_count += batch_wait_reacquires;
+                    }
+                }
+
+                const size_t count = std::min(batch_limit, queue_depth_unlocked());
+                const uint64_t batch_id = queue_overhead_next_batch_id++;
+                uint64_t batch_decision_ts_ns = 0;
+                bool legacy_decision_clock = false;
+                if (priority_mode != ExpertAsyncPriorityMode::MaxWaitProtection) {
+                    batch_decision_ts_ns = llm_mem_trace_time_ns();
+                    legacy_decision_clock = true;
+                }
+                batch.reserve(count);
+                priority_selections.reserve(count);
+                if (priority_mode == ExpertAsyncPriorityMode::MaxWaitProtection) {
+                    ExpertQueueScanMeta scan;
+                    const uint64_t queue_depth_before = queue_depth_unlocked();
+                    batch.emplace_back(pop_one_max_wait_unlocked<true>(
+                            max_wait_selection, &scan));
+                    priority_selections.emplace_back();
+                    batch_decision_ts_ns = max_wait_selection.decision_ts_ns;
+
+                    ExpertQueueOverheadSelectionSample sample;
+                    sample.decision_id = queue_overhead_next_decision_id++;
+                    sample.batch_id = batch_id;
+                    sample.batch_slot = 0;
+                    sample.worker_id = worker_id;
+                    sample.phase = batch.back().phase;
+                    sample.step = batch.back().step;
+                    sample.priority_mode = priority_mode;
+                    sample.selection_strategy = scan.strategy;
+                    sample.queue_depth_before = queue_depth_before;
+                    sample.queue_scan_candidates = scan.candidates;
+                    sample.queue_scan_available = scan.available;
+                    sample.scan_start_ts_ns = scan.start_ts_ns;
+                    sample.scan_end_ts_ns = scan.end_ts_ns;
+                    sample.winner_task_id = batch.back().lifecycle.task_id;
+                    sample.winner_class =
+                            expert_max_wait_class_name(max_wait_selection.decision.task_class);
+                    sample.batch_decision_ts_ns = batch_decision_ts_ns;
+                    sample.clock_read_count = scan.clock_read_count;
+                    selection_samples.emplace_back(sample);
+                } else {
+                    for (size_t i = 0; i < count; ++i) {
+                        ExpertPrioritySelectionMeta selection;
+                        ExpertQueueScanMeta scan;
+                        const uint64_t queue_depth_before = queue_depth_unlocked();
+                        batch.emplace_back(pop_one_unlocked<true>(&selection, &scan));
+                        priority_selections.emplace_back(selection);
+
+                        ExpertQueueOverheadSelectionSample sample;
+                        sample.decision_id = queue_overhead_next_decision_id++;
+                        sample.batch_id = batch_id;
+                        sample.batch_slot = i;
+                        sample.worker_id = worker_id;
+                        sample.phase = batch.back().phase;
+                        sample.step = batch.back().step;
+                        sample.priority_mode = priority_mode;
+                        sample.selection_strategy = scan.strategy;
+                        sample.queue_depth_before = queue_depth_before;
+                        sample.queue_scan_candidates = scan.candidates;
+                        sample.queue_scan_available = scan.available;
+                        sample.scan_start_ts_ns = scan.start_ts_ns;
+                        sample.scan_end_ts_ns = scan.end_ts_ns;
+                        sample.winner_task_id = batch.back().lifecycle.task_id;
+                        sample.winner_class = "legacy";
+                        sample.batch_decision_ts_ns = batch_decision_ts_ns;
+                        sample.clock_read_count = scan.clock_read_count;
+                        selection_samples.emplace_back(sample);
+                    }
+                }
+                worker_batches++;
+                batched_candidates += count;
+                if (pressure_shadow_on) {
+                    busy_workers.fetch_add(1, std::memory_order_relaxed);
+                }
+
+                lock.unlock_and_measure();
+                batch_sample.batch_id = batch_id;
+                batch_sample.priority_mode = priority_mode;
+                batch_sample.phase = batch.empty() ?
+                        LLM_MEM_TRACE_PHASE_UNKNOWN : batch.front().phase;
+                batch_sample.lock_wait_start_ts_ns = lock.last_wait_start_ts_ns();
+                batch_sample.lock_acquired_ts_ns = lock.last_acquired_ts_ns();
+                batch_sample.condition_wait_count = condition_wait_count;
+                batch_sample.condition_reacquire_count = reacquire_count;
+                batch_sample.repeat_wake_count =
+                        reacquire_count > 0 ? reacquire_count - 1 : 0;
+                batch_sample.lock_release_ts_ns = lock.last_release_ts_ns();
+                batch_sample.clock_read_count = lock.clock_read_count() +
+                        (legacy_decision_clock ? 1 : 0);
+
+                queue_overhead_observer->record_batch(batch_sample);
+                for (const ExpertQueueOverheadSelectionSample & sample : selection_samples) {
+                    queue_overhead_observer->record_selection(sample);
+                    if (queue_overhead_mode == ExpertQueueOverheadMode::Detail) {
+                        ExpertQueueOverheadDetailMeta detail;
+                        detail.batch = batch_sample;
+                        detail.selection = sample;
+                        queue_overhead_observer->record_detail_event();
+                        write_expert_queue_overhead_selection(detail);
+                    }
+                }
             }
 
-            for (ExpertHintTask & task : batch) {
+            for (size_t i = 0; i < batch.size(); ++i) {
+                ExpertHintTask & task = batch[i];
                 transition_expert_task(task.lifecycle, ExpertTaskEvent::Dequeue);
+                write_expert_priority_selection(task, priority_selections[i]);
+                if (i == 0 && max_wait_selection.valid) {
+                    write_expert_max_wait_selection(task, max_wait_selection, max_wait_config);
+                }
                 if (expert_shadow_enabled()) {
                     const uint64_t dequeued_ts_ns = task.lifecycle.dequeued_ts_ns != 0 ?
                             task.lifecycle.dequeued_ts_ns : llm_mem_trace_time_ns();
@@ -3288,9 +3919,137 @@ struct ExpertHintQueue {
         }
     }
 
-    ExpertHintTask pop_one_unlocked() {
+    template<bool Observe>
+    ExpertHintTask pop_one_max_wait_unlocked(
+            ExpertMaxWaitSelectionMeta & meta,
+            ExpertQueueScanMeta * scan) {
+        if (!priority_enabled || priority_heap_enabled ||
+                priority_mode != ExpertAsyncPriorityMode::MaxWaitProtection ||
+                tasks.empty()) {
+            expert_max_wait_config_fatal("invalid internal queue state during selection");
+        }
+
+        const uint64_t decision_now_ns = llm_mem_trace_time_ns();
+        auto best = tasks.end();
+        ExpertMaxWaitKey best_key;
+        ExpertMaxWaitDecision best_decision;
+        uint64_t protected_candidates = 0;
+        bool normal_present = false;
+
+        if constexpr (Observe) {
+            scan->available = true;
+            scan->strategy = "linear_scan";
+            scan->start_ts_ns = llm_mem_trace_time_ns();
+            scan->clock_read_count++;
+        }
+        for (auto it = tasks.begin(); it != tasks.end(); ++it) {
+            if constexpr (Observe) {
+                scan->candidates++;
+            }
+            const ExpertMaxWaitKey key = expert_max_wait_key(*it);
+            const ExpertMaxWaitDecision decision = expert_max_wait_classify(
+                    key, decision_now_ns, max_wait_config);
+            if (decision.task_class == ExpertMaxWaitClass::Protected) {
+                protected_candidates = expert_max_wait_saturating_add(
+                        protected_candidates, 1);
+            } else if (decision.task_class == ExpertMaxWaitClass::Normal) {
+                normal_present = true;
+            }
+            if (best == tasks.end() || expert_max_wait_higher(
+                        key, decision, best_key, best_decision)) {
+                best = it;
+                best_key = key;
+                best_decision = decision;
+            }
+        }
+        if constexpr (Observe) {
+            scan->end_ts_ns = llm_mem_trace_time_ns();
+            scan->clock_read_count++;
+        }
+
+        meta.valid = true;
+        meta.decision_ts_ns = decision_now_ns;
+        meta.enqueued_ts_ns = best_key.enqueued_ts_ns;
+        meta.decision = best_decision;
+        meta.protected_candidate_count = protected_candidates;
+        meta.normal_competitor_present = normal_present;
+
+        max_wait_eligible_count = expert_max_wait_saturating_add(
+                max_wait_eligible_count, protected_candidates);
+        if (protected_candidates != 0) {
+            max_wait_eligible_decisions = expert_max_wait_saturating_add(
+                    max_wait_eligible_decisions, 1);
+        }
+        max_wait_selection_count = expert_max_wait_saturating_add(
+                max_wait_selection_count, 1);
+
+        const bool selected_protected =
+                best_decision.task_class == ExpertMaxWaitClass::Protected;
+        if (best_decision.task_class == ExpertMaxWaitClass::Urgent) {
+            max_wait_selected_urgent = expert_max_wait_saturating_add(
+                    max_wait_selected_urgent, 1);
+        } else if (selected_protected) {
+            max_wait_selected_protected = expert_max_wait_saturating_add(
+                    max_wait_selected_protected, 1);
+            max_wait_protected_wait_count = expert_max_wait_saturating_add(
+                    max_wait_protected_wait_count, 1);
+            max_wait_protected_wait_total_ns = expert_max_wait_saturating_add(
+                    max_wait_protected_wait_total_ns, best_decision.waiting_ns);
+            max_wait_protected_wait_max_ns = std::max(
+                    max_wait_protected_wait_max_ns, best_decision.waiting_ns);
+            max_wait_overshoot_count = expert_max_wait_saturating_add(
+                    max_wait_overshoot_count, 1);
+            max_wait_overshoot_total_ns = expert_max_wait_saturating_add(
+                    max_wait_overshoot_total_ns, best_decision.threshold_overshoot_ns);
+            max_wait_overshoot_max_ns = std::max(
+                    max_wait_overshoot_max_ns, best_decision.threshold_overshoot_ns);
+            if (normal_present) {
+                max_wait_protected_over_normal = expert_max_wait_saturating_add(
+                        max_wait_protected_over_normal, 1);
+            }
+        } else {
+            max_wait_selected_normal = expert_max_wait_saturating_add(
+                    max_wait_selected_normal, 1);
+        }
+
+        max_wait_still_waiting = protected_candidates - (selected_protected ? 1 : 0);
+        max_wait_still_waiting_max = std::max(
+                max_wait_still_waiting_max, max_wait_still_waiting);
+        if (best_key.priority.deadline_ts_ns == 0) {
+            max_wait_missing_deadline = expert_max_wait_saturating_add(
+                    max_wait_missing_deadline, 1);
+        }
+        if (best_decision.reason == ExpertMaxWaitReason::MissingEnqueueFallback) {
+            max_wait_missing_enqueue_timestamp = expert_max_wait_saturating_add(
+                    max_wait_missing_enqueue_timestamp, 1);
+        } else if (best_decision.reason ==
+                ExpertMaxWaitReason::EnqueueTimeRegressionFallback) {
+            max_wait_enqueue_time_regression = expert_max_wait_saturating_add(
+                    max_wait_enqueue_time_regression, 1);
+        }
+
+        ExpertHintTask task = std::move(*best);
+        tasks.erase(best);
+        priority_pops++;
+        queued_bytes -= std::min<uint64_t>(queued_bytes, (uint64_t) task.nbytes);
+        return task;
+    }
+
+    template<bool Observe>
+    ExpertHintTask pop_one_unlocked(
+            ExpertPrioritySelectionMeta * selection,
+            ExpertQueueScanMeta * scan) {
+        if (selection && router_score_diagnostic_enabled() && priority_enabled) {
+            selection->valid = true;
+            selection->decision_ts_ns = llm_mem_trace_time_ns();
+            selection->candidate_count = queue_depth_unlocked();
+            selection->mode = priority_mode;
+        }
         ExpertHintTask task;
         if (priority_enabled && priority_heap_enabled) {
+            if constexpr (Observe) {
+                scan->strategy = "heap";
+            }
             auto cmp = [this](const ExpertHintTask & a, const ExpertHintTask & b) {
                 return is_higher_priority(b, a);
             };
@@ -3309,9 +4068,18 @@ struct ExpertHintQueue {
             priority_pops++;
             priority_heap_pops++;
         } else if (priority_enabled) {
+            if constexpr (Observe) {
+                scan->available = true;
+                scan->strategy = "linear_scan";
+                scan->start_ts_ns = llm_mem_trace_time_ns();
+                scan->clock_read_count++;
+            }
             auto best_known = tasks.end();
             auto best_legacy = tasks.end();
             for (auto it = tasks.begin(); it != tasks.end(); ++it) {
+                if constexpr (Observe) {
+                    scan->candidates++;
+                }
                 auto & best = priority_mode == ExpertAsyncPriorityMode::StageDeadlineScore &&
                                 expert_hint_priority_uses_legacy_partition(it->stage) ?
                         best_legacy : best_known;
@@ -3324,10 +4092,17 @@ struct ExpertHintQueue {
                     is_higher_priority(*best_legacy, *best))) {
                 best = best_legacy;
             }
+            if constexpr (Observe) {
+                scan->end_ts_ns = llm_mem_trace_time_ns();
+                scan->clock_read_count++;
+            }
             task = std::move(*best);
             tasks.erase(best);
             priority_pops++;
         } else {
+            if constexpr (Observe) {
+                scan->strategy = "fifo";
+            }
             task = std::move(tasks.front());
             tasks.pop_front();
         }
@@ -3440,6 +4215,202 @@ struct ExpertHintQueue {
         line += ",\"coalesced_syscalls_saved\":" + std::to_string(coalesced_saved);
         line += ",\"batch_size\":" + std::to_string(expert_prefetch_async_batch_size());
         line += ",\"batch_wait_us\":" + std::to_string(expert_prefetch_async_batch_wait_us());
+        line += "}";
+        llm_mem_trace_write(LLM_MEM_TRACE_SINK_MEMORY, line.c_str(), line.size());
+        if (mode == ExpertAsyncPriorityMode::MaxWaitProtection) {
+            write_max_wait_summary();
+        }
+        if (queue_overhead_mode != ExpertQueueOverheadMode::Off) {
+            write_queue_overhead_summary(priority_on, heap_on, mode);
+        }
+    }
+
+    void write_queue_overhead_summary(
+            bool priority_on,
+            bool heap_on,
+            ExpertAsyncPriorityMode scheduler_mode) {
+        const ExpertQueueOverheadSnapshot snapshot =
+                queue_overhead_observer->snapshot();
+        if (snapshot.mode == ExpertQueueOverheadMode::Off) {
+            return;
+        }
+
+        const uint64_t clock_regression_count =
+                snapshot.clock_self_check_ns.regression_count +
+                queue_overhead_cell_regression_count(snapshot.global);
+        const uint64_t clock_equality_count =
+                snapshot.clock_self_check_ns.zero_count +
+                queue_overhead_cell_zero_count(snapshot.global);
+        const uint64_t overflow_count =
+                snapshot.clock_self_check_ns.overflow_count +
+                queue_overhead_cell_overflow_count(snapshot.global);
+        const uint64_t event_ts_ns = llm_mem_trace_time_ns();
+
+        std::string line;
+        line.reserve(32768);
+        line += "{\"event\":\"EXPERT_QUEUE_OVERHEAD_SUMMARY\",\"ts_ns\":" +
+                std::to_string(event_ts_ns);
+        line += ",\"schema_version\":\"m6b2.1-queue-overhead-v1\"";
+        line += ",\"mode\":";
+        json_escape_append(line, expert_queue_overhead_mode_name(snapshot.mode));
+        line += ",\"semantics\":\"direct_queue_selection_measurement\"";
+        line += ",\"clock\":{\"name\":\"llm_mem_trace_time_ns\"";
+        line += ",\"semantics\":\"project_monotonic_clock\"";
+        line += ",\"self_check\":";
+        append_queue_overhead_aggregate(line, snapshot.clock_self_check_ns);
+        line += "}";
+        line += ",\"workers\":" + std::to_string(snapshot.workers);
+        line += ",\"scheduler_batch\":" + std::to_string(snapshot.scheduler_batch);
+        line += ",\"priority_enabled\":" +
+                std::string(priority_on ? "true" : "false");
+        line += ",\"priority_mode\":";
+        json_escape_append(line, expert_prefetch_async_priority_mode_name(scheduler_mode));
+        line += ",\"priority_heap_enabled\":" +
+                std::string(heap_on ? "true" : "false");
+        line += ",\"selection_count\":" + std::to_string(snapshot.selection_count);
+        line += ",\"batch_count\":" + std::to_string(snapshot.batch_count);
+        line += ",\"condition_wait_count\":" +
+                std::to_string(snapshot.condition_wait_count);
+        line += ",\"condition_reacquire_count\":" +
+                std::to_string(snapshot.condition_reacquire_count);
+        line += ",\"spurious_or_repeat_wake_count\":" +
+                std::to_string(snapshot.repeat_wake_count);
+        line += ",\"clock_read_count\":" +
+                std::to_string(snapshot.clock_read_count + 1);
+        line += ",\"clock_regression_count\":" +
+                std::to_string(clock_regression_count);
+        line += ",\"clock_equality_count\":" +
+                std::to_string(clock_equality_count);
+        line += ",\"overflow_count\":" + std::to_string(overflow_count);
+        line += ",\"detail_event_count\":" +
+                std::to_string(snapshot.detail_event_count);
+        line += ",\"idle_wait_exit_count\":" +
+                std::to_string(snapshot.idle_wait_exit_count);
+        line += ",\"unsubmitted_lock_clock_read_count\":" +
+                std::to_string(snapshot.unsubmitted_lock_clock_read_count);
+        line += ",\"next_decision_id\":" +
+                std::to_string(snapshot.next_decision_id);
+        line += ",\"next_batch_id\":" + std::to_string(snapshot.next_batch_id);
+        line += ",\"global\":";
+        append_queue_overhead_cell(line, snapshot.global);
+        line += ",\"by_priority_mode_phase\":[";
+        bool needs_comma = false;
+        for (size_t mode_index = 0;
+                mode_index < ExpertQueueOverheadSnapshot::kPriorityModeCount;
+                ++mode_index) {
+            for (size_t phase_index = 0;
+                    phase_index < ExpertQueueOverheadSnapshot::kPhaseCount;
+                    ++phase_index) {
+                const size_t index =
+                        mode_index * ExpertQueueOverheadSnapshot::kPhaseCount +
+                        phase_index;
+                const ExpertQueueOverheadCell & cell = snapshot.cells[index];
+                if (!queue_overhead_cell_has_samples(cell)) {
+                    continue;
+                }
+                if (needs_comma) {
+                    line += ',';
+                }
+                needs_comma = true;
+                line += "{\"priority_mode\":";
+                json_escape_append(line, expert_prefetch_async_priority_mode_name(
+                        static_cast<ExpertAsyncPriorityMode>(mode_index)));
+                line += ",\"phase\":";
+                json_escape_append(line, phase_name(static_cast<int>(phase_index)));
+                line += ",\"aggregates\":";
+                append_queue_overhead_cell(line, cell);
+                line += "}";
+            }
+        }
+        line += "]";
+        line += ",\"physical_load_observed\":false}";
+        llm_mem_trace_write(LLM_MEM_TRACE_SINK_MEMORY, line.c_str(), line.size());
+    }
+
+    void write_max_wait_summary() {
+        ExpertMaxWaitConfig config;
+        uint64_t eligible = 0;
+        uint64_t eligible_decisions = 0;
+        uint64_t selected_protected = 0;
+        uint64_t selected_urgent = 0;
+        uint64_t selected_normal = 0;
+        uint64_t still_waiting = 0;
+        uint64_t still_waiting_max = 0;
+        uint64_t protected_wait_count = 0;
+        uint64_t protected_wait_total_ns = 0;
+        uint64_t protected_wait_max_ns = 0;
+        uint64_t overshoot_count = 0;
+        uint64_t overshoot_total_ns = 0;
+        uint64_t overshoot_max_ns = 0;
+        uint64_t protected_over_normal = 0;
+        uint64_t missing_deadline = 0;
+        uint64_t missing_enqueue = 0;
+        uint64_t enqueue_regression = 0;
+        uint64_t selections = 0;
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            if (priority_mode != ExpertAsyncPriorityMode::MaxWaitProtection) {
+                return;
+            }
+            config = max_wait_config;
+            eligible = max_wait_eligible_count;
+            eligible_decisions = max_wait_eligible_decisions;
+            selected_protected = max_wait_selected_protected;
+            selected_urgent = max_wait_selected_urgent;
+            selected_normal = max_wait_selected_normal;
+            still_waiting = max_wait_still_waiting;
+            still_waiting_max = max_wait_still_waiting_max;
+            protected_wait_count = max_wait_protected_wait_count;
+            protected_wait_total_ns = max_wait_protected_wait_total_ns;
+            protected_wait_max_ns = max_wait_protected_wait_max_ns;
+            overshoot_count = max_wait_overshoot_count;
+            overshoot_total_ns = max_wait_overshoot_total_ns;
+            overshoot_max_ns = max_wait_overshoot_max_ns;
+            protected_over_normal = max_wait_protected_over_normal;
+            missing_deadline = max_wait_missing_deadline;
+            missing_enqueue = max_wait_missing_enqueue_timestamp;
+            enqueue_regression = max_wait_enqueue_time_regression;
+            selections = max_wait_selection_count;
+        }
+
+        std::string line;
+        line.reserve(768);
+        line += "{\"event\":\"EXPERT_MAX_WAIT_SUMMARY\",\"ts_ns\":" +
+                std::to_string(llm_mem_trace_time_ns());
+        line += ",\"mode\":\"max_wait_protection\"";
+        line += ",\"semantics\":\"queue_selection\"";
+        line += ",\"physical_load_observed\":false";
+        line += ",\"threshold_us\":" + std::to_string(config.threshold_us);
+        line += ",\"threshold_ns\":" + std::to_string(config.threshold_ns);
+        line += ",\"urgent_guard_us\":" + std::to_string(config.urgent_guard_us);
+        line += ",\"urgent_guard_ns\":" + std::to_string(config.urgent_guard_ns);
+        line += ",\"protection_eligible_count\":" + std::to_string(eligible);
+        line += ",\"protection_eligible_semantics\":\"candidate_observations\"";
+        line += ",\"protection_eligible_decisions\":" +
+                std::to_string(eligible_decisions);
+        line += ",\"protection_selected_count\":" + std::to_string(selected_protected);
+        line += ",\"protection_still_waiting_count\":" + std::to_string(still_waiting);
+        line += ",\"protection_still_waiting_max\":" + std::to_string(still_waiting_max);
+        line += ",\"urgent_selected_count\":" + std::to_string(selected_urgent);
+        line += ",\"normal_selected_count\":" + std::to_string(selected_normal);
+        line += ",\"protected_wait_count\":" + std::to_string(protected_wait_count);
+        line += ",\"protected_wait_total_ns\":" + std::to_string(protected_wait_total_ns);
+        line += ",\"protected_wait_mean_ns\":" + std::to_string(
+                protected_wait_count ? protected_wait_total_ns / protected_wait_count : 0);
+        line += ",\"protected_wait_max_ns\":" + std::to_string(protected_wait_max_ns);
+        line += ",\"threshold_overshoot_count\":" + std::to_string(overshoot_count);
+        line += ",\"threshold_overshoot_total_ns\":" + std::to_string(overshoot_total_ns);
+        line += ",\"threshold_overshoot_mean_ns\":" + std::to_string(
+                overshoot_count ? overshoot_total_ns / overshoot_count : 0);
+        line += ",\"threshold_overshoot_max_ns\":" + std::to_string(overshoot_max_ns);
+        line += ",\"protected_over_normal_count\":" +
+                std::to_string(protected_over_normal);
+        line += ",\"missing_deadline_count\":" + std::to_string(missing_deadline);
+        line += ",\"missing_enqueue_timestamp_count\":" +
+                std::to_string(missing_enqueue);
+        line += ",\"enqueue_time_regression_count\":" +
+                std::to_string(enqueue_regression);
+        line += ",\"selection_count\":" + std::to_string(selections);
         line += "}";
         llm_mem_trace_write(LLM_MEM_TRACE_SINK_MEMORY, line.c_str(), line.size());
     }

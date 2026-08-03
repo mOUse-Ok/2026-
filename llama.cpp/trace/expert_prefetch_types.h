@@ -33,6 +33,7 @@ enum class ExpertAsyncPriorityMode {
     Deadline,
     DeadlineScore,
     StageDeadlineScore,
+    MaxWaitProtection,
 };
 
 enum class ExpertPressureLevel {

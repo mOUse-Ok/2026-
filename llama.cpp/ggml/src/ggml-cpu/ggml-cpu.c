@@ -3041,6 +3041,14 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             continue;
         }
 
+        // All graph compute threads evaluate the same metadata-only predicate.
+        // When the Router GET_ROWS payload will be observed, the first barrier
+        // publishes every producer shard before thread 0 reads the Tensor. The
+        // existing node (or graph-tail) barrier then keeps the other threads
+        // from entering a later node until the observation is complete.
+        const bool sync_moe_weights_observation =
+                llm_mem_trace_moe_weights_requires_sync(node) != 0;
+
         if (state->ith == 0 && llm_mem_trace_enabled()) {
             llm_mem_trace_tensor_begin(node);
         }
@@ -3052,6 +3060,10 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             node_n += n_fused;
         } else {
             ggml_compute_forward(&params, node);
+        }
+
+        if (sync_moe_weights_observation) {
+            ggml_barrier(state->threadpool);
         }
 
         if (state->ith == 0 && llm_mem_trace_enabled()) {

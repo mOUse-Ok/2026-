@@ -17,6 +17,7 @@ const char * expert_prefetch_async_priority_mode_name(ExpertAsyncPriorityMode mo
         case ExpertAsyncPriorityMode::Deadline:      return "deadline";
         case ExpertAsyncPriorityMode::DeadlineScore: return "deadline_score";
         case ExpertAsyncPriorityMode::StageDeadlineScore: return "stage_deadline_score";
+        case ExpertAsyncPriorityMode::MaxWaitProtection: return "max_wait_protection";
     }
     return "score";
 }

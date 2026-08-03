@@ -15,6 +15,84 @@ from analyze_trace import collect_expert_stage_pairing, collect_metrics  # noqa:
 
 
 class AnalysisMetricsTest(unittest.TestCase):
+    def test_queue_overhead_summary_and_detail(self) -> None:
+        def aggregate(count: int, total: int) -> dict:
+            return {
+                "count": count,
+                "total": total if count else None,
+                "min": 1 if count else None,
+                "max": total if count else None,
+                "unavailable_count": 0,
+                "clock_regression_count": 0,
+            }
+
+        memory = [
+            {
+                "event": "EXPERT_TASK",
+                "lifecycle_event": "DEQUEUE",
+                "task_id": 7,
+            },
+            {
+                "event": "EXPERT_ASYNC_SUMMARY",
+                "priority_pops": 1,
+            },
+            {
+                "event": "EXPERT_QUEUE_OVERHEAD_SELECTION",
+                "schema_version": "m6b2.1-queue-overhead-v1",
+                "semantics": "direct_queue_selection_measurement",
+                "physical_load_observed": False,
+                "decision_id": 0,
+                "winner_task_id": 7,
+            },
+            {
+                "event": "EXPERT_QUEUE_OVERHEAD_SUMMARY",
+                "schema_version": "m6b2.1-queue-overhead-v1",
+                "mode": "detail",
+                "semantics": "direct_queue_selection_measurement",
+                "physical_load_observed": False,
+                "workers": 2,
+                "priority_mode": "deadline_score",
+                "selection_count": 1,
+                "batch_count": 1,
+                "condition_wait_count": 1,
+                "condition_reacquire_count": 1,
+                "spurious_or_repeat_wake_count": 0,
+                "clock_read_count": 136,
+                "clock_regression_count": 0,
+                "clock_equality_count": 0,
+                "overflow_count": 0,
+                "detail_event_count": 1,
+                "global": {
+                    "mutex_acquire_wait_ns": aggregate(1, 2),
+                    "mutex_hold_ns": aggregate(1, 8),
+                    "queue_scan_ns": aggregate(1, 3),
+                    "queue_scan_candidates": aggregate(1, 5),
+                },
+                "by_priority_mode_phase": [],
+            },
+        ]
+        metrics = collect_metrics(
+            {"memory": memory, "tensor": [], "kv": [], "expert": []}
+        )
+        self.assertTrue(metrics["expert_queue_overhead_available"])
+        self.assertEqual(metrics["expert_queue_overhead_selection_count"], 1)
+        self.assertEqual(metrics["expert_queue_overhead_mutex_hold_ns_total"], 8)
+        self.assertEqual(metrics["expert_queue_overhead_queue_scan_candidates_total"], 5)
+        self.assertEqual(metrics["expert_queue_overhead_schema_violations"], 0)
+        self.assertEqual(metrics["expert_queue_overhead_summary_detail_mismatch"], 0)
+        self.assertEqual(metrics["expert_queue_overhead_priority_pop_mismatch"], 0)
+        self.assertEqual(metrics["expert_queue_overhead_winner_link_mismatches"], 0)
+
+    def test_queue_overhead_old_trace_is_explicitly_unavailable(self) -> None:
+        metrics = collect_metrics(
+            {"memory": [], "tensor": [], "kv": [], "expert": []}
+        )
+        self.assertFalse(metrics["expert_queue_overhead_available"])
+        self.assertEqual(
+            metrics["expert_queue_overhead_unavailable_reason"],
+            "no_expert_queue_overhead_summary",
+        )
+
     def test_step_latency_and_fault_window_are_authoritative(self) -> None:
         memory = [
             {"event": "TRACE_START", "ts_ns": 100},
@@ -113,6 +191,71 @@ class AnalysisMetricsTest(unittest.TestCase):
         self.assertEqual(metrics["expert_prediction_candidates"], 10)
         self.assertEqual(metrics["expert_prediction_precision_pct"], 75.0)
         self.assertEqual(metrics["expert_prediction_recall_pct"], 18.75)
+
+    def test_max_wait_summary_and_selection_replay(self) -> None:
+        memory = [
+            {
+                "event": "EXPERT_TASK",
+                "lifecycle_event": "DEQUEUE",
+                "task_id": 7,
+                "dequeued_ts_ns": 250,
+            },
+            {
+                "event": "EXPERT_MAX_WAIT_SELECTION",
+                "semantics": "queue_selection",
+                "physical_load_observed": False,
+                "task_id": 7,
+                "decision_ts_ns": 240,
+                "enqueued_ts_ns": 100,
+                "waiting_ns": 140,
+                "threshold_us": 0,
+                "threshold_ns": 100,
+                "urgent_guard_us": 0,
+                "urgent_guard_ns": 0,
+                "class": "protected",
+                "reason": "waiting_at_or_above_threshold",
+                "deadline_ts_ns": 500,
+                "route_score": 0.5,
+                "sequence": 3,
+            },
+            {
+                "event": "EXPERT_MAX_WAIT_SUMMARY",
+                "mode": "max_wait_protection",
+                "semantics": "queue_selection",
+                "physical_load_observed": False,
+                "threshold_us": 0,
+                "urgent_guard_us": 0,
+                "protection_eligible_count": 2,
+                "protection_eligible_semantics": "candidate_observations",
+                "protection_eligible_decisions": 1,
+                "protection_selected_count": 1,
+                "protection_still_waiting_count": 0,
+                "protection_still_waiting_max": 1,
+                "urgent_selected_count": 0,
+                "normal_selected_count": 0,
+                "protected_wait_count": 1,
+                "protected_wait_total_ns": 140,
+                "protected_wait_max_ns": 140,
+                "threshold_overshoot_count": 1,
+                "threshold_overshoot_total_ns": 40,
+                "threshold_overshoot_max_ns": 40,
+                "protected_over_normal_count": 1,
+                "missing_deadline_count": 0,
+                "missing_enqueue_timestamp_count": 0,
+                "enqueue_time_regression_count": 0,
+                "selection_count": 1,
+            },
+        ]
+        metrics = collect_metrics({"memory": memory, "tensor": [], "kv": [], "expert": []})
+        self.assertEqual(metrics["expert_max_wait_summary_events"], 1)
+        self.assertEqual(metrics["expert_max_wait_selection_events"], 1)
+        self.assertEqual(metrics["expert_max_wait_protection_selected_count"], 1)
+        self.assertEqual(metrics["expert_max_wait_classification_mismatches"], 0)
+        self.assertEqual(metrics["expert_max_wait_timestamp_mismatches"], 0)
+        self.assertEqual(metrics["expert_max_wait_summary_selection_mismatch"], 0)
+        self.assertEqual(metrics["expert_max_wait_summary_semantic_violations"], 0)
+        self.assertEqual(metrics["expert_max_wait_selection_semantic_violations"], 0)
+        self.assertEqual(metrics["expert_max_wait_protected_wait_mean_ns"], 140.0)
 
     def test_expert_task_lifecycle_metrics(self) -> None:
         def task_event(
