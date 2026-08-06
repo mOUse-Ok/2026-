@@ -235,6 +235,26 @@ if (LLAMA_MEM_TRACE)
     set_property(TEST test-expert-max-wait-protection PROPERTY LABELS main)
 
     add_executable(
+        test-expert-reserved-service
+        test-expert-reserved-service.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../trace/expert_hint_priority.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../trace/expert_reserved_service.cpp
+    )
+    target_include_directories(test-expert-reserved-service PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../trace)
+    add_test(NAME test-expert-reserved-service COMMAND $<TARGET_FILE:test-expert-reserved-service>)
+    set_property(TEST test-expert-reserved-service PROPERTY LABELS main)
+
+    add_executable(
+        test-expert-continuous-aging
+        test-expert-continuous-aging.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../trace/expert_hint_priority.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../trace/expert_continuous_aging.cpp
+    )
+    target_include_directories(test-expert-continuous-aging PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../trace)
+    add_test(NAME test-expert-continuous-aging COMMAND $<TARGET_FILE:test-expert-continuous-aging>)
+    set_property(TEST test-expert-continuous-aging PROPERTY LABELS main)
+
+    add_executable(
         test-expert-queue-overhead-observation
         test-expert-queue-overhead-observation.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../trace/expert_queue_overhead_observation.cpp
