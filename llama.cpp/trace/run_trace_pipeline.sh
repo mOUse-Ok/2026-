@@ -259,35 +259,6 @@ if [ "${LLM_MEM_TRACE_OPT_EXPERT_RESERVED_SERVICE_ACTIVE:-0}" = "1" ]; then
     m6b1_require_explicit_value LLM_MEM_TRACE_OPT_EXPERT_ASYNC_FALLBACK 1
 fi
 
-if [ "${LLM_MEM_TRACE_OPT_EXPERT_CONTINUOUS_AGING_ACTIVE:-0}" = "1" ]; then
-    if [ "${LLM_MEM_TRACE_OPT_EXPERT_RESERVED_SERVICE_ACTIVE:-0}" = "1" ]; then
-        echo "ERROR: Continuous Aging and Reserved-Service cannot both be active" >&2
-        exit 1
-    fi
-    m6b1_require_explicit_value LLM_MEM_TRACE_OPT_EXPERT_ASYNC_PRIORITY_MODE deadline_score
-    m6b1_require_explicit_value LLM_MEM_TRACE_OPT_EXPERT_CONTROLLER off
-    m6b1_require_explicit_value LLM_MEM_TRACE_OPT_EXPERT_FEEDBACK 0
-    m6b1_require_explicit_value LLM_MEM_TRACE_OPT_EXPERT_SLACK 0
-    m6b1_require_explicit_value LLM_MEM_TRACE_OPT_EXPERT_VALUE_GATE 0
-    m6b1_require_explicit_value LLM_MEM_TRACE_OPT_EXPERT_CROSS_LAYER_PREDICT 0
-    m6b1_require_explicit_value LLM_MEM_TRACE_OPT_EXPERT_SLACK_MODE off
-    m6b1_require_explicit_value LLM_MEM_TRACE_PRESSURE_SHADOW_MODE off
-    m6b1_require_explicit_value LLM_MEM_TRACE_OPT_EXPERT_DEADLINE_OBSERVE 1
-    m6b1_require_explicit_value LLM_MEM_TRACE_OPT_EXPERT_ASYNC 1
-    m6b1_require_explicit_value LLM_MEM_TRACE_OPT_EXPERT_ASYNC_PRIORITY 1
-    m6b1_require_explicit_value LLM_MEM_TRACE_OPT_EXPERT_ASYNC_PRIORITY_HEAP 0
-    m6b1_require_explicit_value LLM_MEM_TRACE_OPT_EXPERT_ASYNC_BATCH 1
-    m6b1_require_explicit_value LLM_MEM_TRACE_OPT_EXPERT_ASYNC_BATCH_WAIT_US 0
-    m6b1_require_explicit_value LLM_MEM_TRACE_OPT_EXPERT_ASYNC_BATCH_COALESCE 0
-    m6b1_require_explicit_value LLM_MEM_TRACE_OPT_EXPERT_COALESCE 0
-    m6b1_require_explicit_value LLM_MEM_TRACE_OPT_EXPERT_PREFETCH_TOPK 0
-    m6b1_require_explicit_value LLM_MEM_TRACE_OPT_EXPERT_POLICY route
-    m6b1_require_explicit_value LLM_MEM_TRACE_OPT_EXPERT_TTL_STEPS 0
-    m6b1_require_explicit_value LLM_MEM_TRACE_OPT_EXPERT_ROUTE_HINT_TTL_STEPS 0
-    m6b1_require_explicit_value LLM_MEM_TRACE_OPT_EXPERT_ASYNC_QUEUE 131072
-    m6b1_require_explicit_value LLM_MEM_TRACE_OPT_EXPERT_ASYNC_FALLBACK 1
-fi
-
 # ------------------------------------------------------------------
 # Step 0: Check prerequisites
 # ------------------------------------------------------------------
@@ -385,7 +356,6 @@ export LLM_MEM_TRACE_OPT_EXPERT_ASYNC_PRIORITY="${LLM_MEM_TRACE_OPT_EXPERT_ASYNC
 export LLM_MEM_TRACE_OPT_EXPERT_ASYNC_PRIORITY_MODE="${LLM_MEM_TRACE_OPT_EXPERT_ASYNC_PRIORITY_MODE:-$CONTROLLER_PRIORITY_MODE}"
 export LLM_MEM_TRACE_OPT_EXPERT_ASYNC_PRIORITY_HEAP="${LLM_MEM_TRACE_OPT_EXPERT_ASYNC_PRIORITY_HEAP:-$CONTROLLER_PRIORITY_HEAP}"
 export LLM_MEM_TRACE_OPT_EXPERT_RESERVED_SERVICE_ACTIVE="${LLM_MEM_TRACE_OPT_EXPERT_RESERVED_SERVICE_ACTIVE:-0}"
-export LLM_MEM_TRACE_OPT_EXPERT_CONTINUOUS_AGING_ACTIVE="${LLM_MEM_TRACE_OPT_EXPERT_CONTINUOUS_AGING_ACTIVE:-0}"
 export LLM_MEM_TRACE_OPT_EXPERT_DEADLINE_OBSERVE="${LLM_MEM_TRACE_OPT_EXPERT_DEADLINE_OBSERVE:-0}"
 export LLM_MEM_TRACE_OPT_EXPERT_CONTROLLER="$EXPERT_CONTROLLER"
 export LLM_MEM_TRACE_OPT_EXPERT_FEEDBACK="${LLM_MEM_TRACE_OPT_EXPERT_FEEDBACK:-$CONTROLLER_FEEDBACK}"

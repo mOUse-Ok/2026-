@@ -3,7 +3,6 @@
 #include "expert_tensor_registry.h"
 #include "expert_prefetch_policy.h"
 #include "expert_hint_priority.h"
-#include "expert_continuous_aging.h"
 #include "expert_max_wait_protection.h"
 #include "expert_reserved_service.h"
 #include "expert_queue_overhead_observation.h"
@@ -1133,12 +1132,6 @@ bool expert_prefetch_async_priority_heap_enabled() {
 bool expert_reserved_service_active_enabled() {
     static const bool enabled =
             os_hint_opt_enabled("LLM_MEM_TRACE_OPT_EXPERT_RESERVED_SERVICE_ACTIVE");
-    return enabled;
-}
-
-bool expert_continuous_aging_active_enabled() {
-    static const bool enabled =
-            os_hint_opt_enabled("LLM_MEM_TRACE_OPT_EXPERT_CONTINUOUS_AGING_ACTIVE");
     return enabled;
 }
 
@@ -3437,24 +3430,8 @@ struct ExpertReservedRuntimeSelectionMeta {
     uint64_t index_op_end_ts_ns = 0;
 };
 
-struct ExpertContinuousAgingRuntimeSelectionMeta {
-    ExpertContinuousAgingSelection policy;
-    uint64_t decision_id = 0;
-    uint64_t batch_id = 0;
-    uint64_t batch_slot = 0;
-    uint64_t worker_id = 0;
-    uint64_t index_op_start_ts_ns = 0;
-    uint64_t index_op_end_ts_ns = 0;
-};
-
 [[noreturn]] void expert_reserved_service_fatal(const char * reason) {
     std::fprintf(stderr, "fatal: Reserved-Service Active invariant: %s\n",
-            reason ? reason : "unknown");
-    std::abort();
-}
-
-[[noreturn]] void expert_continuous_aging_fatal(const char * reason) {
-    std::fprintf(stderr, "fatal: Continuous Aging Active invariant: %s\n",
             reason ? reason : "unknown");
     std::abort();
 }
@@ -3478,38 +3455,9 @@ std::string expert_u64_hex(uint64_t value) {
     return result;
 }
 
-std::string expert_f64_decimal(double value) {
-    char buffer[64];
-    std::snprintf(buffer, sizeof(buffer), "%.17g", value);
-    return buffer;
-}
-
 void append_expert_reserved_task_ref(
         std::string & line,
         const ExpertReservedTaskRef & ref) {
-    if (!ref.available) {
-        line += "null";
-        return;
-    }
-    line += "{\"task_id\":" + std::to_string(ref.key.task_id);
-    line += ",\"slot_id\":" + std::to_string(ref.handle.slot_id);
-    line += ",\"generation\":" + std::to_string(ref.handle.generation);
-    line += ",\"enqueued_ts_ns\":" + std::to_string(ref.key.enqueued_ts_ns);
-    line += ",\"deadline_ts_ns\":" + std::to_string(ref.key.deadline_ts_ns);
-    line += ",\"step\":" + std::to_string(ref.key.step);
-    line += ",\"layer\":" + std::to_string(ref.key.layer);
-    line += ",\"stage\":";
-    json_escape_append(line, expert_tensor_stage_name(ref.key.stage));
-    line += ",\"route_score_f64_bits\":";
-    json_escape_append(line, expert_u64_hex(
-            expert_route_score_bits(ref.key.route_score)).c_str());
-    line += ",\"sequence\":" + std::to_string(ref.key.sequence);
-    line += "}";
-}
-
-void append_expert_continuous_aging_task_ref(
-        std::string & line,
-        const ExpertContinuousAgingTaskRef & ref) {
     if (!ref.available) {
         line += "null";
         return;
@@ -3592,51 +3540,6 @@ void write_expert_reserved_service_selection(
     llm_mem_trace_write(LLM_MEM_TRACE_SINK_MEMORY, line.c_str(), line.size());
 }
 
-void write_expert_continuous_aging_selection(
-        const ExpertHintTask & task,
-        const ExpertContinuousAgingRuntimeSelectionMeta & meta) {
-    if (!meta.policy.valid ||
-            !llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_MEMORY)) {
-        return;
-    }
-    const ExpertContinuousAgingSelection & policy = meta.policy;
-    std::string line;
-    line.reserve(1536);
-    line += "{\"event\":\"EXPERT_CONTINUOUS_AGING_SELECTION\",\"ts_ns\":" +
-            std::to_string(llm_mem_trace_time_ns());
-    line += ",\"schema_version\":\"continuous-aging-active-v1\"";
-    line += ",\"feature_flag\":\"LLM_MEM_TRACE_OPT_EXPERT_CONTINUOUS_AGING_ACTIVE\"";
-    line += ",\"decision_id\":" + std::to_string(meta.decision_id);
-    line += ",\"batch_id\":" + std::to_string(meta.batch_id);
-    line += ",\"batch_slot\":" + std::to_string(meta.batch_slot);
-    line += ",\"worker_id\":" + std::to_string(meta.worker_id);
-    line += ",\"decision_ts_ns\":" + std::to_string(policy.decision_ts_ns);
-    line += ",\"selected_task_id\":" + std::to_string(task.lifecycle.task_id);
-    line += ",\"legacy_head\":";
-    append_expert_continuous_aging_task_ref(line, policy.legacy_head);
-    line += ",\"selected\":";
-    append_expert_continuous_aging_task_ref(line, policy.selected);
-    line += ",\"active_winner_changed_vs_legacy\":" +
-            std::string(policy.winner_changed_vs_legacy ? "true" : "false");
-    line += ",\"legacy_head_hard_urgent\":" +
-            std::string(policy.legacy_head_hard_urgent ? "true" : "false");
-    line += ",\"selected_static_score\":" +
-            std::to_string(static_cast<double>(policy.selected_static_score));
-    line += ",\"selected_direct_adjusted_score\":" +
-            std::to_string(static_cast<double>(policy.selected_direct_adjusted_score));
-    line += ",\"store_size_before\":" + std::to_string(policy.size_before);
-    line += ",\"store_size_after\":" + std::to_string(policy.size_after);
-    line += ",\"queued_bytes_before\":" + std::to_string(policy.queued_bytes_before);
-    line += ",\"queued_bytes_after\":" + std::to_string(policy.queued_bytes_after);
-    line += ",\"index_op_start_ts_ns\":" + std::to_string(meta.index_op_start_ts_ns);
-    line += ",\"index_op_end_ts_ns\":" + std::to_string(meta.index_op_end_ts_ns);
-    line += ",\"index_op_duration_ns\":" + std::to_string(
-            meta.index_op_end_ts_ns >= meta.index_op_start_ts_ns ?
-            meta.index_op_end_ts_ns - meta.index_op_start_ts_ns : 0);
-    line += "}";
-    llm_mem_trace_write(LLM_MEM_TRACE_SINK_MEMORY, line.c_str(), line.size());
-}
-
 struct ExpertHintQueue {
     std::mutex mu;
     std::condition_variable cv;
@@ -3646,8 +3549,6 @@ struct ExpertHintQueue {
     std::vector<ExpertHintTask> legacy_priority_heap;
     std::vector<std::unique_ptr<ExpertHintTask>> reserved_task_store;
     ExpertReservedServiceQueue reserved_service_queue;
-    std::vector<std::unique_ptr<ExpertHintTask>> continuous_aging_task_store;
-    ExpertContinuousAgingQueue continuous_aging_queue;
     std::vector<std::thread> workers;
     bool started = false;
     bool stopping = false;
@@ -3656,7 +3557,6 @@ struct ExpertHintQueue {
     bool priority_enabled = false;
     bool priority_heap_enabled = false;
     bool reserved_service_active = false;
-    bool continuous_aging_active = false;
     ExpertAsyncPriorityMode priority_mode = ExpertAsyncPriorityMode::Score;
     ExpertMaxWaitConfig max_wait_config;
     ExpertQueueOverheadMode queue_overhead_mode = ExpertQueueOverheadMode::Off;
@@ -3665,8 +3565,6 @@ struct ExpertHintQueue {
     uint64_t queue_overhead_next_decision_id = 0;
     uint64_t reserved_next_batch_id = 0;
     uint64_t reserved_next_decision_id = 0;
-    uint64_t continuous_aging_next_batch_id = 0;
-    uint64_t continuous_aging_next_decision_id = 0;
     uint64_t next_sequence = 0;
     uint64_t enqueued_tasks = 0;
     uint64_t issued_tasks = 0;
@@ -3715,13 +3613,6 @@ struct ExpertHintQueue {
     uint64_t reserved_dequeue_index_op_max_ns = 0;
     uint64_t reserved_hard_urgent_safety_violation = 0;
     uint64_t reserved_cross_store_invariant_error = 0;
-    uint64_t continuous_aging_enqueue_index_op_count = 0;
-    uint64_t continuous_aging_enqueue_index_op_total_ns = 0;
-    uint64_t continuous_aging_enqueue_index_op_max_ns = 0;
-    uint64_t continuous_aging_dequeue_index_op_count = 0;
-    uint64_t continuous_aging_dequeue_index_op_total_ns = 0;
-    uint64_t continuous_aging_dequeue_index_op_max_ns = 0;
-    uint64_t continuous_aging_cross_store_invariant_error = 0;
     std::atomic<uint64_t> busy_workers{0};
 
     ~ExpertHintQueue() {
@@ -3763,39 +3654,7 @@ struct ExpertHintQueue {
                 (void) expert_shadow_slack().register_task(std::move(input));
             }
             const uint64_t enqueue_op_start = llm_mem_trace_time_ns();
-            if (continuous_aging_active) {
-                std::unique_ptr<ExpertHintTask> entity(
-                        new ExpertHintTask(std::move(task)));
-                ExpertContinuousAgingTaskKey key;
-                key.task_id = entity->lifecycle.task_id;
-                key.step = entity->step;
-                key.layer = entity->layer;
-                key.stage = entity->stage;
-                key.route_score = entity->route_score;
-                key.sequence = entity->sequence;
-                key.deadline_ts_ns = entity->deadline_ts_ns;
-                key.enqueued_ts_ns = entity->lifecycle.enqueued_ts_ns;
-                key.nbytes = task_bytes;
-                const uint64_t op_start = llm_mem_trace_time_ns();
-                const ExpertContinuousAgingHandle handle =
-                        continuous_aging_queue.insert(key);
-                const uint64_t op_end = llm_mem_trace_time_ns();
-                if (handle.slot_id >= continuous_aging_task_store.size() ||
-                        continuous_aging_task_store[handle.slot_id]) {
-                    continuous_aging_cross_store_invariant_error++;
-                    expert_continuous_aging_fatal(
-                            "Task store slot is not uniquely available");
-                }
-                continuous_aging_task_store[handle.slot_id] = std::move(entity);
-                const uint64_t duration = op_end >= op_start ? op_end - op_start : 0;
-                continuous_aging_enqueue_index_op_count++;
-                continuous_aging_enqueue_index_op_total_ns =
-                        expert_max_wait_saturating_add(
-                                continuous_aging_enqueue_index_op_total_ns,
-                                duration);
-                continuous_aging_enqueue_index_op_max_ns = std::max(
-                        continuous_aging_enqueue_index_op_max_ns, duration);
-            } else if (reserved_service_active) {
+            if (reserved_service_active) {
                 std::unique_ptr<ExpertHintTask> entity(
                         new ExpertHintTask(std::move(task)));
                 ExpertReservedTaskKey key;
@@ -3846,9 +3705,7 @@ struct ExpertHintQueue {
             enqueue_queue_op_max_ns = std::max(
                     enqueue_queue_op_max_ns, enqueue_op_duration);
             enqueued_tasks++;
-            if (continuous_aging_active) {
-                queued_bytes = continuous_aging_queue.queued_bytes();
-            } else if (reserved_service_active) {
+            if (reserved_service_active) {
                 queued_bytes = reserved_service_queue.queued_bytes();
             } else {
                 queued_bytes += task_bytes;
@@ -3875,16 +3732,6 @@ struct ExpertHintQueue {
         priority_heap_enabled = priority_enabled && expert_prefetch_async_priority_heap_enabled();
         priority_mode = expert_prefetch_async_priority_mode();
         reserved_service_active = expert_reserved_service_active_enabled();
-        continuous_aging_active = expert_continuous_aging_active_enabled();
-        if (reserved_service_active && continuous_aging_active) {
-            expert_continuous_aging_fatal(
-                    "Continuous Aging and Reserved-Service cannot both be active");
-        }
-        if (continuous_aging_active &&
-                (!priority_enabled || priority_mode != ExpertAsyncPriorityMode::DeadlineScore)) {
-            expert_continuous_aging_fatal(
-                    "Active requires priority_enabled=1 and priority_mode=deadline_score");
-        }
         if (reserved_service_active &&
                 (!priority_enabled || priority_mode != ExpertAsyncPriorityMode::DeadlineScore)) {
             expert_reserved_service_fatal(
@@ -3902,16 +3749,8 @@ struct ExpertHintQueue {
         queue_overhead_next_decision_id = 0;
         reserved_next_batch_id = 0;
         reserved_next_decision_id = 0;
-        continuous_aging_next_batch_id = 0;
-        continuous_aging_next_decision_id = 0;
         try {
-            if (continuous_aging_active) {
-                ExpertContinuousAgingConfig config;
-                config.score_epoch_ts_ns = llm_mem_trace_time_ns();
-                continuous_aging_queue.reset(capacity, config);
-                continuous_aging_task_store.clear();
-                continuous_aging_task_store.resize(capacity);
-            } else if (reserved_service_active) {
+            if (reserved_service_active) {
                 const ExpertReservedServiceConfig frozen_config;
                 reserved_service_queue.reset(capacity, frozen_config);
                 reserved_task_store.clear();
@@ -3949,7 +3788,6 @@ struct ExpertHintQueue {
             priority_enabled = false;
             priority_heap_enabled = false;
             reserved_service_active = false;
-            continuous_aging_active = false;
             priority_mode = ExpertAsyncPriorityMode::Score;
             max_wait_config = {};
             queue_overhead_mode = ExpertQueueOverheadMode::Off;
@@ -3957,8 +3795,6 @@ struct ExpertHintQueue {
             observed_cv.reset();
             reserved_task_store.clear();
             reserved_service_queue.clear();
-            continuous_aging_task_store.clear();
-            continuous_aging_queue.clear();
             started = false;
             return false;
         }
@@ -3997,15 +3833,12 @@ struct ExpertHintQueue {
             legacy_priority_heap.clear();
             reserved_task_store.clear();
             reserved_service_queue.clear();
-            continuous_aging_task_store.clear();
-            continuous_aging_queue.clear();
             queued_bytes = 0;
             worker_count = 0;
             busy_workers.store(0, std::memory_order_relaxed);
             priority_enabled = false;
             priority_heap_enabled = false;
             reserved_service_active = false;
-            continuous_aging_active = false;
             priority_mode = ExpertAsyncPriorityMode::Score;
             max_wait_config = {};
             queue_overhead_mode = ExpertQueueOverheadMode::Off;
@@ -4013,8 +3846,6 @@ struct ExpertHintQueue {
             queue_overhead_next_decision_id = 0;
             reserved_next_batch_id = 0;
             reserved_next_decision_id = 0;
-            continuous_aging_next_batch_id = 0;
-            continuous_aging_next_decision_id = 0;
             queue_overhead_observer.reset();
             observed_cv.reset();
         }
@@ -4025,8 +3856,6 @@ struct ExpertHintQueue {
             std::vector<ExpertHintTask> batch;
             std::vector<ExpertPrioritySelectionMeta> priority_selections;
             std::vector<ExpertReservedRuntimeSelectionMeta> reserved_selections;
-            std::vector<ExpertContinuousAgingRuntimeSelectionMeta>
-                    continuous_aging_selections;
             ExpertMaxWaitSelectionMeta max_wait_selection;
             const bool pressure_shadow_on = llm_pressure_shadow::enabled();
             if (queue_overhead_mode == ExpertQueueOverheadMode::Off) {
@@ -4049,22 +3878,7 @@ struct ExpertHintQueue {
                 batch.reserve(count);
                 priority_selections.reserve(count);
                 reserved_selections.reserve(count);
-                continuous_aging_selections.reserve(count);
-                if (continuous_aging_active) {
-                    const uint64_t batch_id = continuous_aging_next_batch_id++;
-                    const uint64_t decision_ts_ns = llm_mem_trace_time_ns();
-                    for (size_t i = 0; i < count; ++i) {
-                        ExpertContinuousAgingRuntimeSelectionMeta selection;
-                        selection.decision_id = continuous_aging_next_decision_id++;
-                        selection.batch_id = batch_id;
-                        selection.batch_slot = i;
-                        selection.worker_id = worker_id;
-                        batch.emplace_back(pop_one_continuous_aging_unlocked(
-                                decision_ts_ns, selection));
-                        priority_selections.emplace_back();
-                        continuous_aging_selections.emplace_back(selection);
-                    }
-                } else if (reserved_service_active) {
+                if (reserved_service_active) {
                     const uint64_t batch_id = reserved_next_batch_id++;
                     const uint64_t decision_ts_ns = llm_mem_trace_time_ns();
                     for (size_t i = 0; i < count; ++i) {
@@ -4147,7 +3961,7 @@ struct ExpertHintQueue {
                 const uint64_t batch_id = queue_overhead_next_batch_id++;
                 uint64_t batch_decision_ts_ns = 0;
                 bool legacy_decision_clock = false;
-                if (!reserved_service_active && !continuous_aging_active &&
+                if (!reserved_service_active &&
                         priority_mode != ExpertAsyncPriorityMode::MaxWaitProtection) {
                     batch_decision_ts_ns = llm_mem_trace_time_ns();
                     legacy_decision_clock = true;
@@ -4155,46 +3969,7 @@ struct ExpertHintQueue {
                 batch.reserve(count);
                 priority_selections.reserve(count);
                 reserved_selections.reserve(count);
-                continuous_aging_selections.reserve(count);
-                if (continuous_aging_active) {
-                    batch_decision_ts_ns = llm_mem_trace_time_ns();
-                    const uint64_t continuous_batch_id =
-                            continuous_aging_next_batch_id++;
-                    for (size_t i = 0; i < count; ++i) {
-                        ExpertContinuousAgingRuntimeSelectionMeta selection;
-                        selection.decision_id = continuous_aging_next_decision_id++;
-                        selection.batch_id = continuous_batch_id;
-                        selection.batch_slot = i;
-                        selection.worker_id = worker_id;
-                        const uint64_t queue_depth_before = queue_depth_unlocked();
-                        batch.emplace_back(pop_one_continuous_aging_unlocked(
-                                batch_decision_ts_ns, selection));
-                        priority_selections.emplace_back();
-                        continuous_aging_selections.emplace_back(selection);
-
-                        ExpertQueueOverheadSelectionSample sample;
-                        sample.decision_id = queue_overhead_next_decision_id++;
-                        sample.batch_id = batch_id;
-                        sample.batch_slot = i;
-                        sample.worker_id = worker_id;
-                        sample.phase = batch.back().phase;
-                        sample.step = batch.back().step;
-                        sample.priority_mode = priority_mode;
-                        sample.selection_strategy =
-                                "continuous_aging_indexed_dual_heap";
-                        sample.queue_depth_before = queue_depth_before;
-                        sample.queue_scan_candidates = 0;
-                        sample.queue_scan_available = true;
-                        sample.scan_start_ts_ns = selection.index_op_start_ts_ns;
-                        sample.scan_end_ts_ns = selection.index_op_end_ts_ns;
-                        sample.winner_task_id = batch.back().lifecycle.task_id;
-                        sample.winner_class = selection.policy.winner_changed_vs_legacy ?
-                                "continuous_aging_changed" : "continuous_aging_same";
-                        sample.batch_decision_ts_ns = batch_decision_ts_ns;
-                        sample.clock_read_count = 2;
-                        selection_samples.emplace_back(sample);
-                    }
-                } else if (reserved_service_active) {
+                if (reserved_service_active) {
                     batch_decision_ts_ns = llm_mem_trace_time_ns();
                     const uint64_t reserved_batch_id = reserved_next_batch_id++;
                     for (size_t i = 0; i < count; ++i) {
@@ -4329,10 +4104,6 @@ struct ExpertHintQueue {
                     write_expert_reserved_service_selection(
                             task, reserved_selections[i]);
                 }
-                if (i < continuous_aging_selections.size()) {
-                    write_expert_continuous_aging_selection(
-                            task, continuous_aging_selections[i]);
-                }
                 if (i == 0 && max_wait_selection.valid) {
                     write_expert_max_wait_selection(task, max_wait_selection, max_wait_config);
                 }
@@ -4411,53 +4182,6 @@ struct ExpertHintQueue {
                 }
             }
         }
-    }
-
-    ExpertHintTask pop_one_continuous_aging_unlocked(
-            uint64_t decision_ts_ns,
-            ExpertContinuousAgingRuntimeSelectionMeta & meta) {
-        if (!continuous_aging_active || !priority_enabled ||
-                priority_mode != ExpertAsyncPriorityMode::DeadlineScore ||
-                continuous_aging_queue.size() == 0) {
-            continuous_aging_cross_store_invariant_error++;
-            expert_continuous_aging_fatal(
-                    "invalid internal Active queue state during selection");
-        }
-        meta.index_op_start_ts_ns = llm_mem_trace_time_ns();
-        try {
-            meta.policy = continuous_aging_queue.select(decision_ts_ns);
-        } catch (const std::exception & error) {
-            continuous_aging_cross_store_invariant_error++;
-            expert_continuous_aging_fatal(error.what());
-        }
-        meta.index_op_end_ts_ns = llm_mem_trace_time_ns();
-        const ExpertContinuousAgingHandle handle = meta.policy.selected.handle;
-        if (handle.slot_id >= continuous_aging_task_store.size() ||
-                !continuous_aging_task_store[handle.slot_id]) {
-            continuous_aging_cross_store_invariant_error++;
-            expert_continuous_aging_fatal("selected Active Task entity is missing");
-        }
-        std::unique_ptr<ExpertHintTask> entity =
-                std::move(continuous_aging_task_store[handle.slot_id]);
-        if (entity->lifecycle.task_id != meta.policy.selected.key.task_id ||
-                entity->sequence != meta.policy.selected.key.sequence ||
-                static_cast<uint64_t>(entity->nbytes) !=
-                        meta.policy.selected.key.nbytes) {
-            continuous_aging_cross_store_invariant_error++;
-            expert_continuous_aging_fatal("selected Active Task identity mismatch");
-        }
-        const uint64_t duration =
-                meta.index_op_end_ts_ns >= meta.index_op_start_ts_ns ?
-                meta.index_op_end_ts_ns - meta.index_op_start_ts_ns : 0;
-        continuous_aging_dequeue_index_op_count++;
-        continuous_aging_dequeue_index_op_total_ns =
-                expert_max_wait_saturating_add(
-                        continuous_aging_dequeue_index_op_total_ns, duration);
-        continuous_aging_dequeue_index_op_max_ns = std::max(
-                continuous_aging_dequeue_index_op_max_ns, duration);
-        queued_bytes = continuous_aging_queue.queued_bytes();
-        priority_pops++;
-        return std::move(*entity);
     }
 
     ExpertHintTask pop_one_reserved_unlocked(
@@ -4749,7 +4473,6 @@ struct ExpertHintQueue {
         bool priority_on = false;
         bool heap_on = false;
         bool reserved_on = false;
-        bool continuous_aging_on = false;
         uint64_t final_queue_depth = 0;
         uint64_t final_queued_bytes = 0;
         ExpertAsyncPriorityMode mode = ExpertAsyncPriorityMode::Score;
@@ -4780,7 +4503,6 @@ struct ExpertHintQueue {
             priority_on = priority_enabled;
             heap_on = priority_heap_enabled;
             reserved_on = reserved_service_active;
-            continuous_aging_on = continuous_aging_active;
             final_queue_depth = queue_depth_unlocked();
             final_queued_bytes = queued_bytes;
             mode = priority_mode;
@@ -4796,8 +4518,6 @@ struct ExpertHintQueue {
         line += ",\"priority_heap_enabled\":" + std::string(heap_on ? "true" : "false");
         line += ",\"reserved_service_active\":" +
                 std::string(reserved_on ? "true" : "false");
-        line += ",\"continuous_aging_active\":" +
-                std::string(continuous_aging_on ? "true" : "false");
         line += ",\"priority_mode\":";
         json_escape_append(line, expert_prefetch_async_priority_mode_name(mode));
         line += ",\"priority_pops\":" + std::to_string(priority);
@@ -4832,9 +4552,6 @@ struct ExpertHintQueue {
         }
         if (reserved_on) {
             write_reserved_service_summary();
-        }
-        if (continuous_aging_on) {
-            write_continuous_aging_summary();
         }
         if (queue_overhead_mode != ExpertQueueOverheadMode::Off) {
             write_queue_overhead_summary(priority_on, heap_on, mode);
@@ -4962,113 +4679,6 @@ struct ExpertHintQueue {
         line += ",\"dequeue_index_op_max_ns\":" + std::to_string(dequeue_max_ns);
         line += ",\"physical_system_reexecuted\":true";
         line += ",\"performance_claim\":false}";
-        llm_mem_trace_write(LLM_MEM_TRACE_SINK_MEMORY, line.c_str(), line.size());
-    }
-
-    void write_continuous_aging_summary() {
-        ExpertContinuousAgingConfig config;
-        ExpertContinuousAgingCounters counters;
-        ExpertContinuousAgingAudit audit;
-        uint64_t task_entity_count = 0;
-        uint64_t enqueue_count = 0;
-        uint64_t enqueue_total_ns = 0;
-        uint64_t enqueue_max_ns = 0;
-        uint64_t dequeue_count = 0;
-        uint64_t dequeue_total_ns = 0;
-        uint64_t dequeue_max_ns = 0;
-        uint64_t cross_store_errors = 0;
-        uint64_t runtime_queued_bytes = 0;
-        {
-            std::lock_guard<std::mutex> lock(mu);
-            if (!continuous_aging_active) {
-                return;
-            }
-            config = continuous_aging_queue.config();
-            counters = continuous_aging_queue.counters();
-            audit = continuous_aging_queue.audit(true);
-            for (const auto & entity : continuous_aging_task_store) {
-                task_entity_count += entity ? 1 : 0;
-            }
-            enqueue_count = continuous_aging_enqueue_index_op_count;
-            enqueue_total_ns = continuous_aging_enqueue_index_op_total_ns;
-            enqueue_max_ns = continuous_aging_enqueue_index_op_max_ns;
-            dequeue_count = continuous_aging_dequeue_index_op_count;
-            dequeue_total_ns = continuous_aging_dequeue_index_op_total_ns;
-            dequeue_max_ns = continuous_aging_dequeue_index_op_max_ns;
-            cross_store_errors = continuous_aging_cross_store_invariant_error;
-            runtime_queued_bytes = queued_bytes;
-        }
-        const bool conserved = audit.valid && task_entity_count == audit.store_size &&
-                runtime_queued_bytes == audit.queued_bytes;
-        std::string line;
-        line.reserve(2048);
-        line += "{\"event\":\"EXPERT_CONTINUOUS_AGING_SUMMARY\",\"ts_ns\":" +
-                std::to_string(llm_mem_trace_time_ns());
-        line += ",\"schema_version\":\"continuous-aging-active-v1\"";
-        line += ",\"active\":true";
-        line += ",\"feature_flag\":\"LLM_MEM_TRACE_OPT_EXPERT_CONTINUOUS_AGING_ACTIVE\"";
-        line += ",\"base_priority_mode\":\"deadline_score\"";
-        line += ",\"group_order\":\"step_layer_early_late\"";
-        line += ",\"within_group_order\":\"router_score_plus_alpha_wait\"";
-        line += ",\"static_key\":\"router_score_minus_alpha_enqueue_offset\"";
-        line += ",\"alpha_per_ns\":" + expert_f64_decimal(config.alpha_per_ns);
-        line += ",\"alpha_f64_bits\":";
-        json_escape_append(line, expert_u64_hex(
-                expert_route_score_bits(config.alpha_per_ns)).c_str());
-        line += ",\"alpha_per_ms\":" +
-                expert_f64_decimal(config.alpha_per_ns * 1000000.0);
-        line += ",\"score_epoch_ts_ns\":" +
-                std::to_string(config.score_epoch_ts_ns);
-        line += ",\"store_kind\":\"bounded_unique_task_store\"";
-        line += ",\"index_kind\":\"dual_indexed_binary_heap\"";
-        line += ",\"insert_count\":" + std::to_string(counters.insert_count);
-        line += ",\"erase_count\":" + std::to_string(counters.erase_count);
-        line += ",\"selection_count\":" + std::to_string(counters.selection_count);
-        line += ",\"active_winner_changed_count\":" +
-                std::to_string(counters.active_winner_changed_count);
-        line += ",\"winner_same_as_legacy_count\":" +
-                std::to_string(counters.winner_same_as_legacy_count);
-        line += ",\"hard_urgent_bypass_count\":" +
-                std::to_string(counters.hard_urgent_bypass_count);
-        line += ",\"selected_after_deadline_count\":" +
-                std::to_string(counters.selected_after_deadline_count);
-        line += ",\"legacy_heap_sift_count\":" +
-                std::to_string(counters.legacy_heap_sift_count);
-        line += ",\"continuous_heap_sift_count\":" +
-                std::to_string(counters.continuous_heap_sift_count);
-        line += ",\"stale_handle_count\":" +
-                std::to_string(counters.stale_handle_count);
-        line += ",\"duplicate_erase_count\":" +
-                std::to_string(counters.duplicate_erase_count);
-        line += ",\"generation_mismatch_count\":" +
-                std::to_string(counters.generation_mismatch_count);
-        line += ",\"full_store_scan_count\":" +
-                std::to_string(counters.full_store_scan_count);
-        line += ",\"invariant_error_count\":" + std::to_string(
-                counters.invariant_error_count + cross_store_errors);
-        line += ",\"store_size\":" + std::to_string(audit.store_size);
-        line += ",\"task_entity_count\":" + std::to_string(task_entity_count);
-        line += ",\"registry_size\":" + std::to_string(audit.registry_size);
-        line += ",\"legacy_index_size\":" +
-                std::to_string(audit.legacy_index_size);
-        line += ",\"continuous_index_size\":" +
-                std::to_string(audit.continuous_index_size);
-        line += ",\"queued_bytes\":" + std::to_string(audit.queued_bytes);
-        line += ",\"runtime_queued_bytes\":" +
-                std::to_string(runtime_queued_bytes);
-        line += ",\"store_index_registry_bytes_conserved\":" +
-                std::string(conserved ? "true" : "false");
-        line += ",\"final_queue_empty\":" +
-                std::string(audit.final_queue_empty ? "true" : "false");
-        line += ",\"enqueue_index_op_count\":" + std::to_string(enqueue_count);
-        line += ",\"enqueue_index_op_mean_ns\":" + std::to_string(
-                enqueue_count ? enqueue_total_ns / enqueue_count : 0);
-        line += ",\"enqueue_index_op_max_ns\":" + std::to_string(enqueue_max_ns);
-        line += ",\"dequeue_index_op_count\":" + std::to_string(dequeue_count);
-        line += ",\"dequeue_index_op_mean_ns\":" + std::to_string(
-                dequeue_count ? dequeue_total_ns / dequeue_count : 0);
-        line += ",\"dequeue_index_op_max_ns\":" + std::to_string(dequeue_max_ns);
-        line += "}";
         llm_mem_trace_write(LLM_MEM_TRACE_SINK_MEMORY, line.c_str(), line.size());
     }
 
@@ -5263,9 +4873,6 @@ struct ExpertHintQueue {
     }
 
     size_t queue_depth_unlocked() const {
-        if (continuous_aging_active) {
-            return continuous_aging_queue.size();
-        }
         if (reserved_service_active) {
             return reserved_service_queue.size();
         }
