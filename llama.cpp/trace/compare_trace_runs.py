@@ -30,10 +30,6 @@ RUN_LABELS = {
     "load_prefetch": "Load Prefetch",
     "expert_prefetch": "Expert Prefetch",
     "expert_prefetch_route": "Expert Prefetch Route",
-    "lru_512_cold": "LRU 512 Cold",
-    "lfu_512_cold": "LFU 512 Cold",
-    "window_lfu_512_cold": "Window LFU 512 Cold",
-    "least_stale_512_cold": "Least-Stale 512 Cold",
     "all_hints": "All Hints",
 }
 
@@ -54,9 +50,6 @@ KEY_METRICS = [
     ("kv_total_mb", "KV Total (MiB)", "lower"),
     ("kv_mb_per_1k_tokens_est", "KV MiB/1k Tokens", "lower"),
     ("kv_projected_4096_mb", "Projected KV 4k (MiB)", "lower"),
-    ("expert_cache_hit_rate_pct", "Expert Cache Hit (%)", "higher"),
-    ("expert_cache_peak_mb", "Expert Cache Peak (MiB)", "lower"),
-    ("expert_cache_evictions", "Expert Cache Evictions", "neutral"),
     ("expert_route_hint_ttl_steps", "Route Hint TTL Steps", "neutral"),
     ("expert_route_hint_candidates", "Route Hint Candidates", "neutral"),
     ("expert_route_hint_issued", "Route Hint Issued", "neutral"),
@@ -67,18 +60,12 @@ KEY_METRICS = [
     ("expert_async_fallback", "Async Fallbacks", "lower"),
     ("expert_async_max_queue_depth", "Async Max Queue Depth", "neutral"),
     ("expert_async_max_queued_mb", "Async Max Queued (MiB)", "lower"),
-    ("expert_async_cancelled_expired", "Slack-expired Tasks", "neutral"),
     ("expert_async_cancelled_pressure", "Pressure-cancelled Tasks", "neutral"),
     ("expert_async_cancelled_value", "Value-cancelled Tasks", "neutral"),
-    ("expert_async_coalesced_syscalls_saved", "Coalesced Syscalls Saved", "higher"),
     ("expert_controller_cancelled_total", "Controller Skips/Cancels", "neutral"),
     ("expert_pressure_high_or_critical_samples", "High/Critical Pressure Samples", "lower"),
     ("expert_pressure_refault_delta_total", "Workingset Refault Delta", "lower"),
     ("expert_pressure_budget_min_mb", "Minimum Prefetch Budget (MiB)", "neutral"),
-    ("expert_prediction_candidates", "Cross-layer Predictions", "neutral"),
-    ("expert_prediction_precision_pct", "Prediction Precision (%)", "higher"),
-    ("expert_prediction_recall_pct", "Prediction Recall (%)", "higher"),
-    ("expert_prediction_set_hit_rate_pct", "Prediction Set Hit (%)", "higher"),
     ("expert_async_workers", "Async Workers", "neutral"),
 ]
 
@@ -115,9 +102,6 @@ def load_metrics(run_dir: Path) -> dict[str, Any]:
     metrics.setdefault("kv_total_mb", 0.0)
     metrics.setdefault("kv_mb_per_1k_tokens_est", 0.0)
     metrics.setdefault("kv_projected_4096_mb", 0.0)
-    metrics.setdefault("expert_cache_hit_rate_pct", 0.0)
-    metrics.setdefault("expert_cache_peak_mb", 0.0)
-    metrics.setdefault("expert_cache_evictions", 0)
     metrics.setdefault("expert_route_hint_ttl_steps", 0)
     metrics.setdefault("expert_route_hint_candidates", 0)
     metrics.setdefault("expert_route_hint_issued", 0)
@@ -277,8 +261,6 @@ def compact_run_label(label: str) -> str:
         "async4_deadline_score": "deadline_score",
         "async4_deadline_heap": "deadline_heap",
         "decode_ttl1": "ttl1",
-        "all_async4_coalesced": "async4_coalesce",
-        "all_coalesced": "coalesce",
     }
     return replacements.get(value, value)
 

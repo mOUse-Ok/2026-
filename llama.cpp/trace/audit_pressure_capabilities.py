@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Audit cgroup/PSI sources required by M5A Pressure Shadow.
+"""Audit cgroup/PSI sources required by active memory-pressure admission.
 
 This utility does not run model inference. It reads the current process
 cgroup and /proc sources, benchmarks their read/parse cost, and optionally
@@ -574,11 +574,10 @@ def main() -> None:
     runners = [
         audit_runner(repo, "llama.cpp/trace/run_cgroup_memory_matrix.sh"),
         audit_runner(repo, "llama.cpp/trace/run_finalist_repeat_matrix.sh"),
-        audit_runner(repo, "llama.cpp/trace/run_stage_deadline_score_repeat_matrix.sh"),
     ]
     systemd_available = systemd_probe["status"] == STATUS_AVAILABLE
     selected_runner = (
-        "systemd-run --user --scope via M5A dedicated runner"
+        "systemd-run --user --scope via memory-pressure runner"
         if systemd_available
         else
         "direct delegated cgroup parent"

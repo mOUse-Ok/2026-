@@ -13,27 +13,10 @@ struct ExpertTensorInfo {
     size_t expert_stride = 0;
 };
 
-enum class ExpertPolicy {
-    Route,
-    Lru,
-    Lfu,
-    WindowLfu,
-    LeastStale,
-};
-
-enum class ExpertEvictAdvice {
-    None,
-    Cold,
-    DontNeed,
-    PageOut,
-};
-
 enum class ExpertAsyncPriorityMode {
     Score,
     Deadline,
     DeadlineScore,
-    StageDeadlineScore,
-    MaxWaitProtection,
 };
 
 enum class ExpertPressureLevel {

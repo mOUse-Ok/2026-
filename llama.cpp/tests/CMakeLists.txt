@@ -225,42 +225,6 @@ if (LLAMA_MEM_TRACE)
     set_property(TEST test-expert-hint-priority PROPERTY LABELS main)
 
     add_executable(
-        test-expert-max-wait-protection
-        test-expert-max-wait-protection.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/../trace/expert_hint_priority.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/../trace/expert_max_wait_protection.cpp
-    )
-    target_include_directories(test-expert-max-wait-protection PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../trace)
-    add_test(NAME test-expert-max-wait-protection COMMAND $<TARGET_FILE:test-expert-max-wait-protection>)
-    set_property(TEST test-expert-max-wait-protection PROPERTY LABELS main)
-
-    add_executable(
-        test-expert-reserved-service
-        test-expert-reserved-service.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/../trace/expert_hint_priority.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/../trace/expert_reserved_service.cpp
-    )
-    target_include_directories(test-expert-reserved-service PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../trace)
-    add_test(NAME test-expert-reserved-service COMMAND $<TARGET_FILE:test-expert-reserved-service>)
-    set_property(TEST test-expert-reserved-service PROPERTY LABELS main)
-
-    add_executable(
-        test-expert-queue-overhead-observation
-        test-expert-queue-overhead-observation.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/../trace/expert_queue_overhead_observation.cpp
-    )
-    target_include_directories(
-        test-expert-queue-overhead-observation
-        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../trace
-    )
-    target_link_libraries(test-expert-queue-overhead-observation PRIVATE Threads::Threads)
-    add_test(
-        NAME test-expert-queue-overhead-observation
-        COMMAND $<TARGET_FILE:test-expert-queue-overhead-observation>
-    )
-    set_property(TEST test-expert-queue-overhead-observation PROPERTY LABELS main)
-
-    add_executable(
         test-expert-task-lifecycle
         test-expert-task-lifecycle.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../trace/expert_tensor_stage.cpp
@@ -271,40 +235,6 @@ if (LLAMA_MEM_TRACE)
     add_test(NAME test-expert-task-lifecycle COMMAND $<TARGET_FILE:test-expert-task-lifecycle>)
     set_property(TEST test-expert-task-lifecycle PROPERTY LABELS main)
 
-    add_executable(
-        test-expert-shadow-slack
-        test-expert-shadow-slack.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/../trace/expert_tensor_stage.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/../trace/expert_shadow_slack.cpp
-    )
-    target_include_directories(test-expert-shadow-slack PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../trace)
-    add_test(NAME test-expert-shadow-slack COMMAND $<TARGET_FILE:test-expert-shadow-slack>)
-    set_property(TEST test-expert-shadow-slack PROPERTY LABELS main)
-
-    add_executable(
-        test-expert-pressure-shadow
-        test-expert-pressure-shadow.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/../trace/expert_pressure_shadow.cpp
-    )
-    target_compile_definitions(test-expert-pressure-shadow PRIVATE LLM_MEM_TRACE)
-    target_include_directories(test-expert-pressure-shadow PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../trace)
-    add_test(NAME test-expert-pressure-shadow COMMAND $<TARGET_FILE:test-expert-pressure-shadow>)
-    add_test(
-        NAME test-expert-pressure-shadow-off
-        COMMAND $<TARGET_FILE:test-expert-pressure-shadow> --runtime-off
-    )
-    add_test(
-        NAME test-expert-pressure-shadow-detail
-        COMMAND $<TARGET_FILE:test-expert-pressure-shadow> --runtime-detail
-    )
-    add_test(
-        NAME test-expert-pressure-shadow-not-started
-        COMMAND $<TARGET_FILE:test-expert-pressure-shadow> --runtime-not-started
-    )
-    set_property(TEST test-expert-pressure-shadow PROPERTY LABELS main)
-    set_property(TEST test-expert-pressure-shadow-off PROPERTY LABELS main)
-    set_property(TEST test-expert-pressure-shadow-detail PROPERTY LABELS main)
-    set_property(TEST test-expert-pressure-shadow-not-started PROPERTY LABELS main)
 endif()
 
 llama_build_and_test(

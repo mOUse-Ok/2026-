@@ -1,23 +1,10 @@
 #include "expert_prefetch_policy.h"
 
-const char * expert_policy_name(ExpertPolicy policy) {
-    switch (policy) {
-        case ExpertPolicy::Route:      return "route";
-        case ExpertPolicy::Lru:        return "lru";
-        case ExpertPolicy::Lfu:        return "lfu";
-        case ExpertPolicy::WindowLfu:  return "window_lfu";
-        case ExpertPolicy::LeastStale: return "least_stale";
-    }
-    return "route";
-}
-
 const char * expert_prefetch_async_priority_mode_name(ExpertAsyncPriorityMode mode) {
     switch (mode) {
         case ExpertAsyncPriorityMode::Score:         return "score";
         case ExpertAsyncPriorityMode::Deadline:      return "deadline";
         case ExpertAsyncPriorityMode::DeadlineScore: return "deadline_score";
-        case ExpertAsyncPriorityMode::StageDeadlineScore: return "stage_deadline_score";
-        case ExpertAsyncPriorityMode::MaxWaitProtection: return "max_wait_protection";
     }
     return "score";
 }

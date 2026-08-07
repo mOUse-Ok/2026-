@@ -41,19 +41,6 @@ bool compare_deadline_score(const ExpertHintPriorityKey & a, const ExpertHintPri
     return compare_score(a, b);
 }
 
-bool compare_known_stage(const ExpertHintPriorityKey & a, const ExpertHintPriorityKey & b) {
-    if (a.step != b.step) {
-        return a.step < b.step;
-    }
-    if (a.layer != b.layer) {
-        return a.layer < b.layer;
-    }
-    if (a.stage != b.stage) {
-        return a.stage == ExpertTensorStage::Early;
-    }
-    return compare_score(a, b);
-}
-
 } // namespace
 
 bool expert_hint_priority_higher(
@@ -67,20 +54,6 @@ bool expert_hint_priority_higher(
             return compare_deadline(a, b);
         case ExpertAsyncPriorityMode::DeadlineScore:
             return compare_deadline_score(a, b);
-        case ExpertAsyncPriorityMode::StageDeadlineScore:
-            if (expert_hint_priority_uses_legacy_partition(a.stage) ||
-                    expert_hint_priority_uses_legacy_partition(b.stage)) {
-                return compare_deadline_score(a, b);
-            }
-            return compare_known_stage(a, b);
-        case ExpertAsyncPriorityMode::MaxWaitProtection:
-            // The dequeue policy applies the dynamic class ordering. Keep the
-            // frozen legacy key available as the within-class comparator.
-            return compare_deadline_score(a, b);
     }
     return compare_score(a, b);
-}
-
-bool expert_hint_priority_uses_legacy_partition(ExpertTensorStage stage) {
-    return stage == ExpertTensorStage::Unknown;
 }

@@ -4,7 +4,6 @@
 #include "ggml-backend.h"
 #include "llama-batch.h"
 
-#include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
@@ -78,38 +77,6 @@ int env_int_or_default(const char * key, int def_value) {
     char * end = nullptr;
     const long parsed = std::strtol(val, &end, 10);
     return end && *end == '\0' && parsed > 0 ? (int) parsed : def_value;
-}
-
-bool router_score_diagnostic_enabled() {
-    static const bool enabled = [] {
-        const char * value = std::getenv("LLM_MEM_TRACE_ROUTER_SCORE_DIAGNOSTIC");
-        return value && std::strcmp(value, "1") == 0;
-    }();
-    return enabled;
-}
-
-uint32_t raw_score_bits(const ggml_tensor * t, const char * base, size_t offset) {
-    uint32_t bits = 0;
-    if (t->type == GGML_TYPE_F32) {
-        std::memcpy(&bits, base + offset, sizeof(bits));
-    } else if (t->type == GGML_TYPE_F16 || t->type == GGML_TYPE_BF16) {
-        uint16_t bits16 = 0;
-        std::memcpy(&bits16, base + offset, sizeof(bits16));
-        bits = bits16;
-    }
-    return bits;
-}
-
-uint32_t f32_bits(float value) {
-    uint32_t bits = 0;
-    std::memcpy(&bits, &value, sizeof(bits));
-    return bits;
-}
-
-void append_hex_bits(std::string & line, uint32_t bits, int width) {
-    char buffer[16];
-    std::snprintf(buffer, sizeof(buffer), width == 4 ? "0x%04x" : "0x%08x", bits);
-    json_escape_append(line, buffer);
 }
 
 float read_f32(const ggml_tensor * t, const char * base, size_t offset) {
@@ -197,9 +164,6 @@ extern "C" void llm_mem_trace_moe_weights(const ggml_tensor * t) {
         }
         int experts[64];
         float scores[64];
-        uint32_t source_bits[64];
-        uint32_t converted_bits[64];
-        const bool score_diagnostic = router_score_diagnostic_enabled();
         bool valid = n_expert_used <= (int64_t) (sizeof(experts) / sizeof(experts[0]));
 
         for (int64_t e = 0; valid && e < n_expert_used; ++e) {
@@ -212,10 +176,6 @@ extern "C" void llm_mem_trace_moe_weights(const ggml_tensor * t) {
             const size_t w_offset = (size_t) e * t->nb[1] + (size_t) tok * t->nb[2];
             experts[e] = expert;
             scores[e] = read_f32(t, weights_base, w_offset);
-            if (score_diagnostic) {
-                source_bits[e] = raw_score_bits(t, weights_base, w_offset);
-                converted_bits[e] = f32_bits(scores[e]);
-            }
         }
 
         if (!valid) {
@@ -243,34 +203,6 @@ extern "C" void llm_mem_trace_moe_weights(const ggml_tensor * t) {
             line += std::to_string(scores[e]);
         }
         line += "]";
-
-        if (score_diagnostic) {
-            line += ",\"observation_sync\":\"producer_barrier_hook_release_barrier\"";
-            line += ",\"observation_sync_protocol\":\"m6b1.2-v1\"";
-            line += ",\"score_source_dtype\":";
-            json_escape_append(line, ggml_type_name(t->type));
-            line += ",\"score_shape\":[" + std::to_string(t->ne[0]) + "," +
-                    std::to_string(t->ne[1]) + "," + std::to_string(t->ne[2]) + "]";
-            line += ",\"score_strides_bytes\":[" + std::to_string(t->nb[0]) + "," +
-                    std::to_string(t->nb[1]) + "," + std::to_string(t->nb[2]) + "]";
-            line += ",\"score_raw_bits\":[";
-            const int source_width = t->type == GGML_TYPE_F32 ? 8 : 4;
-            for (int64_t e = 0; e < n_expert_used; ++e) {
-                if (e) {
-                    line += ",";
-                }
-                append_hex_bits(line, source_bits[e], source_width);
-            }
-            line += "]";
-            line += ",\"score_f32_bits\":[";
-            for (int64_t e = 0; e < n_expert_used; ++e) {
-                if (e) {
-                    line += ",";
-                }
-                append_hex_bits(line, converted_bits[e], 8);
-            }
-            line += "]";
-        }
 
         line += "}";
 

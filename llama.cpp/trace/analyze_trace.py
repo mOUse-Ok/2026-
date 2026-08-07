@@ -25,8 +25,6 @@ import numpy as np
 import pandas as pd
 
 from trace_metrics import collect_core_metrics, inference_latency_records
-from stage_scheduling_analysis import analyze_stage_scheduling_opportunity
-from shadow_slack_analysis import analyze_shadow_slack
 
 
 # ─────────────────────────────────────────────
@@ -127,10 +125,7 @@ def load_all(trace_dir: str) -> dict[str, list[dict]]:
         "tensor": tensor_records,
         "kv":     load_jsonl(os.path.join(trace_dir, "kv_trace.jsonl")),
         "expert": load_jsonl(os.path.join(trace_dir, "expert_trace.jsonl")),
-        "memory": load_jsonl(
-            os.path.join(trace_dir, "memory_trace.jsonl"),
-            exclude_substrings=('"event":"EXPERT_SHADOW_SLACK"',),
-        ),
+        "memory": load_jsonl(os.path.join(trace_dir, "memory_trace.jsonl")),
     }
     run_id = Path(trace_dir).resolve().name
     manifest_path = Path(trace_dir) / "run_manifest.json"
@@ -142,44 +137,6 @@ def load_all(trace_dir: str) -> dict[str, list[dict]]:
     for record in data["memory"]:
         record.setdefault("run_id", run_id)
     return data
-
-
-class ShadowSlackEventStream:
-    """Re-iterable filtered JSONL view used by the multi-pass M4A.1 analyzer."""
-
-    def __init__(self, path: Path, run_id: str):
-        self.path = path
-        self.run_id = run_id
-
-    def __iter__(self):
-        with self.path.open("r", encoding="utf-8") as stream:
-            for line in stream:
-                if (
-                    '"event":"EXPERT_SHADOW_SLACK' not in line
-                    and '"event":"OS_HINT"' not in line
-                ):
-                    continue
-                try:
-                    record = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                record.setdefault("run_id", self.run_id)
-                yield record
-
-
-def load_shadow_slack_events(trace_dir: str):
-    """Return a streaming Shadow/OS_HINT view to avoid Detail-record OOM."""
-    path = Path(trace_dir) / "memory_trace.jsonl"
-    if not path.exists():
-        return []
-    run_id = Path(trace_dir).resolve().name
-    manifest_path = Path(trace_dir) / "run_manifest.json"
-    try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        run_id = str(manifest.get("run_name") or run_id)
-    except (OSError, json.JSONDecodeError):
-        pass
-    return ShadowSlackEventStream(path, run_id)
 
 
 def load_key_tensor_events(path: str) -> list[dict]:
@@ -252,7 +209,7 @@ def residency_nonresident_bytes(records: list[dict]) -> int:
 def is_os_hint_syscall(record: dict) -> bool:
     action = str(record.get("action", ""))
     decision = str(record.get("decision", ""))
-    if decision in {"hit", "skip", "keep"} or action.startswith("expert_cache_"):
+    if decision == "skip":
         return False
     return "madvise" in action or "fadvise" in action
 
@@ -1115,10 +1072,7 @@ def collect_expert_stage_pairing(first_use_events: list[dict]) -> dict:
     result["duplicate_match_records_collapsed"] = len(first_use_events) - invalid_stage_records - len(observations)
     return result
 
-def collect_metrics(
-    data: dict[str, list[dict]],
-    shadow_records=None,
-) -> dict:
+def collect_metrics(data: dict[str, list[dict]]) -> dict:
     """Extract key numeric metrics for the report."""
     metrics = collect_core_metrics(data["memory"])
 
@@ -1244,35 +1198,11 @@ def collect_metrics(
         metrics["os_hint_events"] = len(os_hint_syscalls)
         metrics["os_hint_errors"] = sum(1 for r in os_hint_syscalls if r.get("result", 0) != 0)
         metrics["os_hint_advised_mb"] = sum(r.get("advised_bytes", 0) for r in os_hint_syscalls) / (1024**2)
-        metrics["expert_cache_hits"] = sum(1 for r in os_hints if r.get("decision") == "hit" or r.get("cache_hit") is True)
-        metrics["expert_cache_prefetches"] = sum(1 for r in os_hints if r.get("decision") == "prefetch")
-        metrics["expert_cache_evictions"] = sum(1 for r in os_hints if r.get("decision") == "evict")
-        metrics["expert_cache_skips"] = sum(1 for r in os_hints if r.get("decision") == "skip")
-        cache_decisions = metrics["expert_cache_hits"] + metrics["expert_cache_prefetches"]
-        if cache_decisions > 0:
-            metrics["expert_cache_hit_rate_pct"] = metrics["expert_cache_hits"] / cache_decisions * 100
-        cache_bytes = [r.get("cache_bytes", 0) for r in os_hints if "cache_bytes" in r]
-        cache_capacity = [r.get("cache_capacity_bytes", 0) for r in os_hints if "cache_capacity_bytes" in r]
-        if cache_bytes:
-            metrics["expert_cache_peak_mb"] = max(cache_bytes) / (1024**2)
-        if cache_capacity:
-            metrics["expert_cache_capacity_mb"] = max(cache_capacity) / (1024**2)
         for action, count in Counter(r.get("action", "unknown") for r in os_hints).items():
             key = "os_hint_" + "".join(ch if ch.isalnum() else "_" for ch in action.lower()) + "_events"
             metrics[key] = count
-        for policy, count in Counter(r.get("policy", "none") for r in os_hints if r.get("policy")).items():
-            key = "expert_cache_policy_" + "".join(ch if ch.isalnum() else "_" for ch in policy.lower()) + "_events"
-            metrics[key] = count
         controlled_hints = [r for r in os_hints if "route_confidence" in r]
-        predicted_hints = [r for r in controlled_hints if r.get("predicted") is True]
         metrics["expert_controller_records"] = len(controlled_hints)
-        metrics["expert_predicted_records"] = len(predicted_hints)
-        metrics["expert_predicted_prefetches"] = sum(
-            1 for r in predicted_hints if r.get("decision") == "prefetch"
-        )
-        metrics["expert_predicted_skips"] = sum(
-            1 for r in predicted_hints if r.get("decision") == "skip"
-        )
         value_ratios = [float(r["value_ratio"]) for r in controlled_hints if isinstance(r.get("value_ratio"), (int, float))]
         if value_ratios:
             metrics["expert_controller_value_ratio_avg"] = float(np.mean(value_ratios))
@@ -1280,7 +1210,6 @@ def collect_metrics(
         if slack_values:
             metrics["expert_controller_slack_p50_us"] = float(np.percentile(slack_values, 50)) / 1e3
         controller_cancel_actions = {
-            "expert_prefetch_cancel_expired",
             "expert_prefetch_cancel_pressure",
             "expert_prefetch_cancel_value",
             "expert_prefetch_cancel_queue_full",
@@ -1317,12 +1246,7 @@ def collect_metrics(
             "rejected_value",
             "cancelled_pressure",
             "cancelled_value",
-            "cancelled_expired",
             "cancelled_queue_full",
-            "issue_groups",
-            "coalesced_issue_groups",
-            "same_stage_issue_groups",
-            "cross_stage_issue_groups",
             "early_task_count",
             "late_task_count",
             "unknown_task_count",
@@ -1481,22 +1405,9 @@ def collect_metrics(
             issue_tasks[issue_id].append(record)
         metrics["expert_task_invalid_issue_id_records"] = invalid_issue_id_records
         metrics["expert_issue_unique_ids"] = len(issue_tasks)
-        metrics["expert_issue_coalesced_groups"] = sum(
-            1 for records in issue_tasks.values() if len(records) > 1
-        )
-        metrics["expert_issue_coalesced_tasks"] = sum(
-            len(records) for records in issue_tasks.values() if len(records) > 1
-        )
-        metrics["expert_issue_max_tasks_per_group"] = max(
-            (len(records) for records in issue_tasks.values()), default=0
-        )
         metrics["expert_issue_task_count_mismatches"] = sum(
             1 for records in issue_tasks.values()
-            if any(int(r.get("issue_task_count", 0)) != len(records) for r in records)
-        )
-        metrics["expert_issue_cross_stage_groups_from_detail"] = sum(
-            int(len({str(record.get("stage", "UNKNOWN")) for record in records}) > 1)
-            for records in issue_tasks.values()
+            if len(records) != 1 or int(records[0].get("issue_task_count", 0)) != 1
         )
 
         linked_syscalls = [
@@ -1616,13 +1527,6 @@ def collect_metrics(
 
         metrics["expert_stage_pairing"] = collect_expert_stage_pairing(first_use_events)
 
-    metrics["expert_stage_scheduling_opportunity"] = analyze_stage_scheduling_opportunity(
-        data["memory"]
-    )
-    metrics["expert_shadow_slack"] = analyze_shadow_slack(
-        data["memory"] if shadow_records is None else shadow_records
-    )
-
     async_summaries = [r for r in data["memory"] if r.get("event") == "EXPERT_ASYNC_SUMMARY"]
     if async_summaries:
         metrics["expert_async_summary_events"] = len(async_summaries)
@@ -1642,286 +1546,12 @@ def collect_metrics(
         metrics["expert_async_max_queued_mb"] = max(int(r.get("max_queued_bytes", 0)) for r in async_summaries) / (1024**2)
         metrics["expert_async_queue_capacity"] = max(int(r.get("queue_capacity", 0)) for r in async_summaries)
         metrics["expert_async_workers"] = max(int(r.get("workers", 0)) for r in async_summaries)
-        metrics["expert_async_cancelled_expired"] = sum(int(r.get("cancelled_expired", 0)) for r in async_summaries)
         metrics["expert_async_cancelled_pressure"] = sum(int(r.get("cancelled_pressure", 0)) for r in async_summaries)
         metrics["expert_async_cancelled_value"] = sum(int(r.get("cancelled_value", 0)) for r in async_summaries)
         metrics["expert_async_cancelled_queue_full"] = sum(int(r.get("cancelled_queue_full", 0)) for r in async_summaries)
-        metrics["expert_async_worker_batches"] = sum(int(r.get("worker_batches", 0)) for r in async_summaries)
-        metrics["expert_async_batched_candidates"] = sum(int(r.get("batched_candidates", 0)) for r in async_summaries)
-        metrics["expert_async_coalesced_syscalls_saved"] = sum(
-            int(r.get("coalesced_syscalls_saved", 0)) for r in async_summaries
+        metrics["expert_async_final_queue_depth"] = max(
+            int(r.get("final_queue_depth", 0)) for r in async_summaries
         )
-        metrics["expert_async_batch_size"] = max(int(r.get("batch_size", 1)) for r in async_summaries)
-        metrics["expert_async_batch_wait_us"] = max(int(r.get("batch_wait_us", 0)) for r in async_summaries)
-
-    queue_overhead_summaries = [
-        r for r in data["memory"]
-        if r.get("event") == "EXPERT_QUEUE_OVERHEAD_SUMMARY"
-    ]
-    queue_overhead_selections = [
-        r for r in data["memory"]
-        if r.get("event") == "EXPERT_QUEUE_OVERHEAD_SELECTION"
-    ]
-    if not queue_overhead_summaries:
-        metrics["expert_queue_overhead_available"] = False
-        metrics["expert_queue_overhead_unavailable_reason"] = (
-            "no_expert_queue_overhead_summary"
-        )
-    else:
-        metrics["expert_queue_overhead_available"] = True
-        metrics["expert_queue_overhead_summary_events"] = len(
-            queue_overhead_summaries
-        )
-        metrics["expert_queue_overhead_modes"] = ",".join(sorted({
-            str(r.get("mode")) for r in queue_overhead_summaries if r.get("mode")
-        }))
-        for field in (
-            "selection_count",
-            "batch_count",
-            "condition_wait_count",
-            "condition_reacquire_count",
-            "spurious_or_repeat_wake_count",
-            "clock_read_count",
-            "clock_regression_count",
-            "clock_equality_count",
-            "overflow_count",
-            "detail_event_count",
-        ):
-            metrics[f"expert_queue_overhead_{field}"] = sum(
-                int(r.get(field, 0)) for r in queue_overhead_summaries
-            )
-        metrics["expert_queue_overhead_schema_violations"] = sum(
-            1 for r in queue_overhead_summaries
-            if r.get("schema_version") != "m6b2.1-queue-overhead-v1"
-            or r.get("mode") not in {"summary", "detail"}
-            or r.get("semantics") != "direct_queue_selection_measurement"
-            or r.get("physical_load_observed") is not False
-        )
-        metrics["expert_queue_overhead_priority_modes"] = ",".join(sorted({
-            str(r.get("priority_mode"))
-            for r in queue_overhead_summaries
-            if r.get("priority_mode")
-        }))
-        metrics["expert_queue_overhead_workers"] = sorted({
-            int(r.get("workers", 0)) for r in queue_overhead_summaries
-        })
-        metrics["expert_queue_overhead_by_priority_mode_phase"] = [
-            group
-            for summary in queue_overhead_summaries
-            for group in summary.get("by_priority_mode_phase", [])
-            if isinstance(group, dict)
-        ]
-        aggregate_names = (
-            "mutex_acquire_wait_ns",
-            "mutex_hold_ns",
-            "queue_scan_ns",
-            "queue_scan_candidates",
-        )
-        for name in aggregate_names:
-            aggregates = [
-                summary.get("global", {}).get(name, {})
-                for summary in queue_overhead_summaries
-            ]
-            count = sum(int(item.get("count", 0)) for item in aggregates)
-            total = sum(
-                int(item.get("total", 0))
-                for item in aggregates
-                if item.get("total") is not None
-            )
-            metrics[f"expert_queue_overhead_{name}_count"] = count
-            metrics[f"expert_queue_overhead_{name}_total"] = total
-            metrics[f"expert_queue_overhead_{name}_mean"] = (
-                float(total) / count if count else None
-            )
-            values_min = [
-                int(item["min"]) for item in aggregates
-                if item.get("min") is not None
-            ]
-            values_max = [
-                int(item["max"]) for item in aggregates
-                if item.get("max") is not None
-            ]
-            metrics[f"expert_queue_overhead_{name}_min"] = (
-                min(values_min) if values_min else None
-            )
-            metrics[f"expert_queue_overhead_{name}_max"] = (
-                max(values_max) if values_max else None
-            )
-            metrics[f"expert_queue_overhead_{name}_unavailable_count"] = sum(
-                int(item.get("unavailable_count", 0)) for item in aggregates
-            )
-            metrics[f"expert_queue_overhead_{name}_regression_count"] = sum(
-                int(item.get("clock_regression_count", 0))
-                for item in aggregates
-            )
-
-        metrics["expert_queue_overhead_selection_events"] = len(
-            queue_overhead_selections
-        )
-        metrics["expert_queue_overhead_selection_semantic_violations"] = sum(
-            1 for r in queue_overhead_selections
-            if r.get("schema_version") != "m6b2.1-queue-overhead-v1"
-            or r.get("semantics") != "direct_queue_selection_measurement"
-            or r.get("physical_load_observed") is not False
-        )
-        decision_ids = [
-            r.get("decision_id") for r in queue_overhead_selections
-        ]
-        metrics["expert_queue_overhead_duplicate_decision_ids"] = (
-            len(decision_ids) - len(set(decision_ids))
-        )
-        dequeued_task_ids = {
-            int(task["task_id"])
-            for task in task_events
-            if task.get("lifecycle_event") == "DEQUEUE"
-            and isinstance(task.get("task_id"), int)
-        }
-        metrics["expert_queue_overhead_winner_link_mismatches"] = sum(
-            1 for r in queue_overhead_selections
-            if not isinstance(r.get("winner_task_id"), int)
-            or int(r["winner_task_id"]) not in dequeued_task_ids
-        )
-        summary_detail_expected = sum(
-            int(r.get("selection_count", 0))
-            for r in queue_overhead_summaries
-            if r.get("mode") == "detail"
-        )
-        metrics["expert_queue_overhead_summary_detail_mismatch"] = abs(
-            summary_detail_expected - len(queue_overhead_selections)
-        )
-        if async_summaries:
-            metrics["expert_queue_overhead_priority_pop_mismatch"] = abs(
-                metrics["expert_queue_overhead_selection_count"]
-                - metrics["expert_async_priority_pops"]
-            )
-
-    max_wait_summaries = [
-        r for r in data["memory"] if r.get("event") == "EXPERT_MAX_WAIT_SUMMARY"
-    ]
-    max_wait_selections = [
-        r for r in data["memory"] if r.get("event") == "EXPERT_MAX_WAIT_SELECTION"
-    ]
-    if max_wait_summaries:
-        metrics["expert_max_wait_summary_events"] = len(max_wait_summaries)
-        metrics["expert_max_wait_modes"] = ",".join(sorted({
-            str(r.get("mode")) for r in max_wait_summaries if r.get("mode")
-        }))
-        for field in (
-            "protection_eligible_count",
-            "protection_eligible_decisions",
-            "protection_selected_count",
-            "urgent_selected_count",
-            "normal_selected_count",
-            "protected_wait_count",
-            "protected_wait_total_ns",
-            "threshold_overshoot_count",
-            "threshold_overshoot_total_ns",
-            "protected_over_normal_count",
-            "missing_deadline_count",
-            "missing_enqueue_timestamp_count",
-            "enqueue_time_regression_count",
-            "selection_count",
-        ):
-            metrics[f"expert_max_wait_{field}"] = sum(
-                int(r.get(field, 0)) for r in max_wait_summaries
-            )
-        for field in (
-            "protection_still_waiting_count",
-            "protection_still_waiting_max",
-            "protected_wait_max_ns",
-            "threshold_overshoot_max_ns",
-        ):
-            metrics[f"expert_max_wait_{field}"] = max(
-                int(r.get(field, 0)) for r in max_wait_summaries
-            )
-        metrics["expert_max_wait_threshold_us"] = max(
-            int(r.get("threshold_us", 0)) for r in max_wait_summaries
-        )
-        metrics["expert_max_wait_urgent_guard_us"] = max(
-            int(r.get("urgent_guard_us", 0)) for r in max_wait_summaries
-        )
-        protected_count = metrics["expert_max_wait_protected_wait_count"]
-        protected_total = metrics["expert_max_wait_protected_wait_total_ns"]
-        metrics["expert_max_wait_protected_wait_mean_ns"] = (
-            float(protected_total) / protected_count if protected_count else 0.0
-        )
-        overshoot_count = metrics["expert_max_wait_threshold_overshoot_count"]
-        overshoot_total = metrics["expert_max_wait_threshold_overshoot_total_ns"]
-        metrics["expert_max_wait_threshold_overshoot_mean_ns"] = (
-            float(overshoot_total) / overshoot_count if overshoot_count else 0.0
-        )
-        metrics["expert_max_wait_summary_semantic_violations"] = sum(
-            1 for r in max_wait_summaries
-            if r.get("mode") != "max_wait_protection"
-            or r.get("semantics") != "queue_selection"
-            or r.get("physical_load_observed") is not False
-            or r.get("protection_eligible_semantics") != "candidate_observations"
-        )
-
-    if max_wait_selections:
-        metrics["expert_max_wait_selection_events"] = len(max_wait_selections)
-        task_ids = [r.get("task_id") for r in max_wait_selections]
-        metrics["expert_max_wait_duplicate_selection_task_ids"] = (
-            len(task_ids) - len(set(task_ids))
-        )
-        metrics["expert_max_wait_selection_semantic_violations"] = sum(
-            1 for r in max_wait_selections
-            if r.get("semantics") != "queue_selection"
-            or r.get("physical_load_observed") is not False
-        )
-        classification_mismatches = 0
-        timestamp_mismatches = 0
-        dequeued_by_task = {
-            int(task["task_id"]): int(task.get("dequeued_ts_ns", 0))
-            for task in task_events
-            if task.get("lifecycle_event") == "DEQUEUE"
-            and isinstance(task.get("task_id"), int)
-        }
-        for record in max_wait_selections:
-            decision_ts = int(record.get("decision_ts_ns", 0))
-            enqueued_ts = int(record.get("enqueued_ts_ns", 0))
-            deadline_ts = int(record.get("deadline_ts_ns", 0))
-            threshold_ns = int(record.get("threshold_ns", 0))
-            urgent_guard_ns = int(record.get("urgent_guard_ns", 0))
-            waiting = record.get("waiting_ns")
-            actual_class = str(record.get("class", ""))
-            actual_reason = str(record.get("reason", ""))
-
-            if enqueued_ts == 0:
-                expected_class = "normal"
-                expected_reason = "missing_enqueue_fallback"
-                expected_waiting = None
-            elif decision_ts < enqueued_ts:
-                expected_class = "normal"
-                expected_reason = "enqueue_time_regression_fallback"
-                expected_waiting = None
-            else:
-                expected_waiting = decision_ts - enqueued_ts
-                urgent_limit = min((1 << 64) - 1, decision_ts + urgent_guard_ns)
-                if deadline_ts != 0 and deadline_ts <= urgent_limit:
-                    expected_class = "urgent"
-                    expected_reason = "deadline_within_guard"
-                elif expected_waiting >= threshold_ns:
-                    expected_class = "protected"
-                    expected_reason = "waiting_at_or_above_threshold"
-                else:
-                    expected_class = "normal"
-                    expected_reason = "legacy_normal"
-
-            if (actual_class != expected_class or actual_reason != expected_reason
-                    or waiting != expected_waiting):
-                classification_mismatches += 1
-            dequeued_ts = dequeued_by_task.get(int(record.get("task_id", 0)), 0)
-            if enqueued_ts and expected_waiting is not None and not (
-                    enqueued_ts <= decision_ts and
-                    (dequeued_ts == 0 or decision_ts <= dequeued_ts)):
-                timestamp_mismatches += 1
-        metrics["expert_max_wait_classification_mismatches"] = classification_mismatches
-        metrics["expert_max_wait_timestamp_mismatches"] = timestamp_mismatches
-        if max_wait_summaries:
-            metrics["expert_max_wait_summary_selection_mismatch"] = abs(
-                metrics["expert_max_wait_selection_count"] - len(max_wait_selections)
-            )
 
     route_hint_summaries = [r for r in data["memory"] if r.get("event") == "EXPERT_ROUTE_HINT_SUMMARY"]
     if route_hint_summaries:
@@ -1950,39 +1580,6 @@ def collect_metrics(
         budgets = [int(r.get("prefetch_budget_bytes", 0)) for r in pressure_events]
         metrics["expert_pressure_budget_min_mb"] = min(budgets) / (1024**2)
         metrics["expert_pressure_budget_max_mb"] = max(budgets) / (1024**2)
-
-    prediction_summaries = [r for r in data["memory"] if r.get("event") == "EXPERT_PREDICT_SUMMARY"]
-    if prediction_summaries:
-        metrics["expert_prediction_summary_events"] = len(prediction_summaries)
-        for field in (
-            "observed_routes",
-            "learned_transitions",
-            "transition_buckets",
-            "prediction_sets",
-            "prediction_candidates",
-            "evaluated_sets",
-            "evaluated_candidates",
-            "prediction_hits",
-            "prediction_set_hits",
-            "actual_experts_evaluated",
-            "unevaluated_sets",
-            "capacity_skips",
-            "destination_replacements",
-        ):
-            metric_name = f"expert_{field}" if field.startswith("prediction_") else f"expert_prediction_{field}"
-            metrics[metric_name] = sum(int(r.get(field, 0)) for r in prediction_summaries)
-        evaluated = metrics["expert_prediction_evaluated_candidates"]
-        actual = metrics["expert_prediction_actual_experts_evaluated"]
-        evaluated_sets = metrics["expert_prediction_evaluated_sets"]
-        metrics["expert_prediction_precision_pct"] = (
-            100.0 * metrics["expert_prediction_hits"] / evaluated if evaluated else 0.0
-        )
-        metrics["expert_prediction_recall_pct"] = (
-            100.0 * metrics["expert_prediction_hits"] / actual if actual else 0.0
-        )
-        metrics["expert_prediction_set_hit_rate_pct"] = (
-            100.0 * metrics["expert_prediction_set_hits"] / evaluated_sets if evaluated_sets else 0.0
-        )
 
     return metrics
 
@@ -2221,10 +1818,6 @@ def generate_html_report(
     os_hint_events = metrics.get("os_hint_events", 0)
     os_hint_errors = metrics.get("os_hint_errors", 0)
     os_hint_records = metrics.get("os_hint_records", os_hint_events)
-    cache_hit_rate = metrics.get("expert_cache_hit_rate_pct")
-    cache_hit_rate_display = "N/A" if cache_hit_rate is None else f"{cache_hit_rate:.1f}%"
-    cache_peak = metrics.get("expert_cache_peak_mb")
-    cache_peak_display = "N/A" if cache_peak is None else f"{cache_peak:.1f} MiB"
     metric_cards = f"""
     <div class="metric-card"><div class="metric-value">{_opt(metrics.get('rss_peak_gb'))} GB</div><div class="metric-label">峰值 RSS</div></div>
     <div class="metric-card"><div class="metric-value">{pss_peak_display}</div><div class="metric-label">峰值 PSS</div></div>
@@ -2241,8 +1834,6 @@ def generate_html_report(
     <div class="metric-card"><div class="metric-value">{os_hint_events:,}</div><div class="metric-label">OS Hint 系统调用</div></div>
     <div class="metric-card"><div class="metric-value">{os_hint_records:,}</div><div class="metric-label">OS Hint 决策记录</div></div>
     <div class="metric-card"><div class="metric-value">{os_hint_errors:,}</div><div class="metric-label">OS Hint 失败</div></div>
-    <div class="metric-card"><div class="metric-value">{cache_hit_rate_display}</div><div class="metric-label">Expert Cache 命中率</div></div>
-    <div class="metric-card"><div class="metric-value">{cache_peak_display}</div><div class="metric-label">Expert Cache 峰值</div></div>
     <div class="metric-card"><div class="metric-value">{metrics.get('mmap_count', 'N/A')}</div><div class="metric-label">mmap 区域数</div></div>
     """
 
@@ -2426,13 +2017,9 @@ def main():
     data = load_all(trace_dir)
     for name, records in data.items():
         print(f"      {name}: {len(records)} events")
-    shadow_records = load_shadow_slack_events(trace_dir)
-    if shadow_records:
-        print("      shadow calibration pass: streaming filtered events")
-
     # Collect metrics
     print("\n[2/7] Computing key metrics...")
-    metrics = collect_metrics(data, shadow_records=shadow_records)
+    metrics = collect_metrics(data)
 
     process_metrics_path = os.path.join(trace_dir, "process_metrics.json")
     if os.path.exists(process_metrics_path):
@@ -2503,15 +2090,6 @@ def main():
     with open(metrics_path, "w") as f:
         json.dump(metrics, f, indent=2, default=str)
     print(f"  [OK] {metrics_path}")
-    stage_opportunity_path = os.path.join(out_dir, "stage_scheduling_opportunity.json")
-    with open(stage_opportunity_path, "w") as f:
-        json.dump(metrics["expert_stage_scheduling_opportunity"], f, indent=2, default=str)
-    print(f"  [OK] {stage_opportunity_path}")
-    shadow_slack_path = os.path.join(out_dir, "shadow_slack_calibration.json")
-    with open(shadow_slack_path, "w") as f:
-        json.dump(metrics["expert_shadow_slack"], f, indent=2, default=str)
-    print(f"  [OK] {shadow_slack_path}")
-
     # Write a text summary
     print("\n[7/7] Writing text summary...")
     summary_path = os.path.join(out_dir, "summary.txt")

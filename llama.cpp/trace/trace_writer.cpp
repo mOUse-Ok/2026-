@@ -1,5 +1,4 @@
 #include "trace_event.h"
-#include "expert_pressure_shadow.h"
 
 #include "llama-batch.h"
 
@@ -280,7 +279,6 @@ extern "C" void llm_mem_trace_init(const char * dir) {
             const std::string line = "{\"event\":\"TRACE_START\",\"ts_ns\":" + std::to_string(ts) + "}";
             llm_mem_trace_write(LLM_MEM_TRACE_SINK_MEMORY, line.c_str(), line.size());
             llm_mem_trace_memory_sample("trace_init");
-            llm_pressure_shadow::start();
         }
 
         std::atexit(llm_mem_trace_shutdown);
@@ -294,7 +292,6 @@ extern "C" void llm_mem_trace_shutdown(void) {
     }
 
     if (s.sink_enabled[LLM_MEM_TRACE_SINK_MEMORY]) {
-        llm_pressure_shadow::stop();
         llm_mem_trace_memory_sample("trace_shutdown");
         const uint64_t ts = llm_mem_trace_time_ns();
         const std::string line = "{\"event\":\"TRACE_END\",\"ts_ns\":" + std::to_string(ts) + "}";
@@ -397,12 +394,6 @@ extern "C" void llm_mem_trace_step_end(void) {
     line += ",\"n_tokens\":" + std::to_string(ubatch->n_tokens);
     line += ",\"latency_ns\":" + std::to_string(ts - start_ts) + "}";
     llm_mem_trace_write(LLM_MEM_TRACE_SINK_MEMORY, line.c_str(), line.size());
-    llm_pressure_shadow::observe_step_end(
-            llm_mem_trace_get_phase(),
-            llm_mem_trace_get_step(),
-            start_ts,
-            ts,
-            ts - start_ts);
     llm_mem_trace_memory_sample("step_end");
 }
 
