@@ -77,3 +77,6 @@ llmop_draft.tex
 
 # docs 下的 codex 目录
 /docs/codex/
+
+# Local experiments and large trace artifacts
+experiments/
