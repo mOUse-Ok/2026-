@@ -235,6 +235,24 @@ if (LLAMA_MEM_TRACE)
     add_test(NAME test-expert-task-lifecycle COMMAND $<TARGET_FILE:test-expert-task-lifecycle>)
     set_property(TEST test-expert-task-lifecycle PROPERTY LABELS main)
 
+    add_executable(
+        test-expert-memory-object
+        test-expert-memory-object.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../trace/expert_memory_object.cpp
+    )
+    target_include_directories(test-expert-memory-object PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../trace)
+    add_test(NAME test-expert-memory-object COMMAND $<TARGET_FILE:test-expert-memory-object>)
+    set_property(TEST test-expert-memory-object PROPERTY LABELS main)
+
+    add_executable(
+        test-expert-calibration-shadow
+        test-expert-calibration-shadow.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../trace/expert_calibration_shadow.cpp
+    )
+    target_include_directories(test-expert-calibration-shadow PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../trace)
+    add_test(NAME test-expert-calibration-shadow COMMAND $<TARGET_FILE:test-expert-calibration-shadow>)
+    set_property(TEST test-expert-calibration-shadow PROPERTY LABELS main)
+
 endif()
 
 llama_build_and_test(

@@ -1,4 +1,6 @@
 #include "trace_event.h"
+#include "expert_memory_object.h"
+#include "expert_calibration_shadow.h"
 #include "expert_prefetch_types.h"
 #include "expert_tensor_registry.h"
 #include "expert_prefetch_policy.h"
@@ -23,8 +25,10 @@
 #include <deque>
 #include <limits>
 #include <mutex>
+#include <numeric>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -32,6 +36,7 @@
 #ifdef __linux__
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <unistd.h>
 #endif
 
@@ -123,6 +128,81 @@ bool env_truthy(const char * value) {
         return false;
     }
     return !(value[0] == '0' && value[1] == '\0');
+}
+
+bool expert_inflight_hint_aggregation_requested() {
+    static const bool requested = env_truthy(
+            std::getenv("LLM_MEM_TRACE_OPT_EXPERT_INFLIGHT_HINT_AGGREGATION"));
+    return requested;
+}
+
+bool expert_semantic_stale_cancel_requested() {
+    static const bool requested = env_truthy(
+            std::getenv("LLM_MEM_TRACE_OPT_EXPERT_SEMANTIC_STALE_CANCEL"));
+    return requested;
+}
+
+bool expert_madv_cold_reclaim_requested() {
+    static const bool requested = env_truthy(
+            std::getenv("LLM_MEM_TRACE_OPT_EXPERT_MADV_COLD_RECLAIM"));
+    return requested;
+}
+
+uint64_t expert_madv_cold_reclaim_grace_steps() {
+    static const uint64_t grace_steps = [] {
+        const char * value = std::getenv("LLM_MEM_TRACE_OPT_EXPERT_RECLAIM_GRACE_STEPS");
+        if (!value || !value[0]) {
+            return uint64_t{3};
+        }
+        char * end = nullptr;
+        const unsigned long long parsed = std::strtoull(value, &end, 10);
+        return end && *end == '\0' && parsed > 0 ? (uint64_t) parsed : uint64_t{3};
+    }();
+    return grace_steps;
+}
+
+uint64_t expert_working_set_budget_bytes() {
+    static const uint64_t budget = [] {
+        const char * value = std::getenv("LLM_MEM_TRACE_OPT_EXPERT_WORKING_SET_MB");
+        if (!value || !value[0]) {
+            return uint64_t{0};
+        }
+        char * end = nullptr;
+        const unsigned long long mb = std::strtoull(value, &end, 10);
+        if (!end || *end != '\0' || mb == 0) {
+            return uint64_t{0};
+        }
+        constexpr uint64_t mib = 1024ull * 1024ull;
+        return mb > std::numeric_limits<uint64_t>::max() / mib ?
+                std::numeric_limits<uint64_t>::max() : (uint64_t) mb * mib;
+    }();
+    return budget;
+}
+
+bool expert_working_set_requested() {
+    return expert_working_set_budget_bytes() > 0;
+}
+
+bool expert_madv_cold_reclaim_enabled() {
+    return expert_madv_cold_reclaim_requested() && expert_working_set_requested() &&
+            llm_mem_trace_enabled();
+}
+
+bool expert_memory_objects_enabled() {
+    static const bool lifecycle_enabled = env_truthy(
+            std::getenv("LLM_MEM_TRACE_OPT_EXPERT_MEMORY_OBJECTS"));
+    return (lifecycle_enabled || expert_inflight_hint_aggregation_requested() ||
+            expert_semantic_stale_cancel_requested() || expert_working_set_requested() ||
+            expert_madv_cold_reclaim_enabled()) &&
+            llm_mem_trace_enabled();
+}
+
+bool expert_inflight_hint_aggregation_enabled() {
+    return expert_inflight_hint_aggregation_requested() && llm_mem_trace_enabled();
+}
+
+bool expert_semantic_stale_cancel_enabled() {
+    return expert_semantic_stale_cancel_requested() && llm_mem_trace_enabled();
 }
 
 bool trace_profile_is_benchmark() {
@@ -254,6 +334,14 @@ bool os_hints_enabled() {
 
 bool os_hint_opt_enabled(const char * key) {
     return os_hints_enabled() && env_truthy(std::getenv(key));
+}
+
+// Phase 2E-A: observation-only shadow calibration. Default OFF; enabled via
+// LLM_MEM_TRACE_OS_HINTS + LLM_MEM_TRACE_OPT_EXPERT_CALIBRATION_SHADOW.
+// Strictly additive — never affects any control behavior (spec §15).
+bool expert_calibration_shadow_enabled() {
+    return os_hint_opt_enabled("LLM_MEM_TRACE_OPT_EXPERT_CALIBRATION_SHADOW") &&
+            llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_MEMORY);
 }
 
 uint64_t env_u64_or_default(const char * key, uint64_t def_value) {
@@ -465,7 +553,7 @@ void write_os_hint_event(
     llm_mem_trace_write(LLM_MEM_TRACE_SINK_MEMORY, line.c_str(), line.size());
 }
 
-void apply_madvise_hint(
+int apply_madvise_hint(
         const char * action,
         int advice,
         const char * trigger,
@@ -479,14 +567,16 @@ void apply_madvise_hint(
     uintptr_t start = 0;
     size_t len = 0;
     if (!page_aligned_range(addr, nbytes, start, len)) {
-        return;
+        return -1;
     }
     errno = 0;
     const int rc = madvise(reinterpret_cast<void *>(start), len, advice);
     const int err = rc == 0 ? 0 : errno;
     write_os_hint_event(action, trigger, tensor_name, layer, expert, addr, nbytes, len, rc, err, 0, meta);
+    return rc;
 #else
     (void) action; (void) advice; (void) trigger; (void) tensor_name; (void) layer; (void) expert; (void) addr; (void) nbytes; (void) meta;
+    return -1;
 #endif
 }
 
@@ -791,6 +881,1061 @@ bool expert_deadline_observation_enabled() {
 bool expert_value_gate_enabled() {
     static const bool enabled = os_hint_opt_enabled("LLM_MEM_TRACE_OPT_EXPERT_VALUE_GATE");
     return enabled;
+}
+
+enum class ExpertRuntimeRescueMode {
+    ReclaimBackoff,
+    GateRecovery,
+};
+
+const char * expert_runtime_rescue_mode_name(ExpertRuntimeRescueMode mode) {
+    switch (mode) {
+        case ExpertRuntimeRescueMode::ReclaimBackoff: return "reclaim_backoff";
+        case ExpertRuntimeRescueMode::GateRecovery:   return "gate_recovery";
+    }
+    return "reclaim_backoff";
+}
+
+bool expert_runtime_rescue_requested() {
+    static const bool requested = env_truthy(
+            std::getenv("LLM_MEM_TRACE_OPT_EXPERT_RUNTIME_RESCUE"));
+    return requested;
+}
+
+// Formal Phase 2E flag: feedback-driven COLD rate recovery ladder.
+// Default OFF; when OFF the rescue controller behaves exactly as before.
+bool expert_cold_rate_recovery_requested() {
+    static const bool requested = env_truthy(
+            std::getenv("LLM_MEM_TRACE_OPT_EXPERT_COLD_RATE_RECOVERY"));
+    return requested;
+}
+
+ExpertRuntimeRescueMode expert_runtime_rescue_mode() {
+    static const ExpertRuntimeRescueMode mode = [] {
+        if (expert_cold_rate_recovery_requested()) {
+            // The rate-recovery ladder always uses the gate-recovery rescue flow.
+            return ExpertRuntimeRescueMode::GateRecovery;
+        }
+        const char * value = std::getenv("LLM_MEM_TRACE_OPT_EXPERT_RUNTIME_RESCUE_MODE");
+        return value && std::strcmp(value, "gate_recovery") == 0 ?
+                ExpertRuntimeRescueMode::GateRecovery :
+                ExpertRuntimeRescueMode::ReclaimBackoff;
+    }();
+    return mode;
+}
+
+bool expert_runtime_rescue_enabled() {
+    return (expert_runtime_rescue_requested() || expert_cold_rate_recovery_requested()) &&
+            llm_mem_trace_enabled() &&
+            llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_MEMORY);
+}
+
+enum class ExpertRuntimeRescueState {
+    Normal,
+    ColdSuspended,
+    GateRecovery,
+    ReEntry,
+    Probe25,
+    Probe50,
+    Probe100,
+    Disabled,
+};
+
+const char * expert_runtime_rescue_state_name(ExpertRuntimeRescueState state) {
+    switch (state) {
+        case ExpertRuntimeRescueState::Normal:        return "normal";
+        case ExpertRuntimeRescueState::ColdSuspended: return "cold_suspended";
+        case ExpertRuntimeRescueState::GateRecovery:  return "gate_recovery";
+        case ExpertRuntimeRescueState::ReEntry:       return "reentry";
+        case ExpertRuntimeRescueState::Probe25:       return "probe_25";
+        case ExpertRuntimeRescueState::Probe50:       return "probe_50";
+        case ExpertRuntimeRescueState::Probe100:      return "probe_100";
+        case ExpertRuntimeRescueState::Disabled:      return "disabled";
+    }
+    return "normal";
+}
+
+// Phase 2E ladder budgets (bytes per decode step), from the Phase 2D measured
+// full-rate baseline B = 271222731 bytes/step.
+uint64_t expert_probe_state_budget_bytes(ExpertRuntimeRescueState state) {
+    switch (state) {
+        case ExpertRuntimeRescueState::Probe25:  return 67805682;
+        case ExpertRuntimeRescueState::Probe50:  return 135611365;
+        case ExpertRuntimeRescueState::Probe100: return 271222731;
+        default:                                 return 0;
+    }
+}
+
+// Minimal self-contained readers for the benefit check (defined before the
+// rescue controller; the heavier cgroup helpers live later in this file).
+uint64_t rescue_read_cgroup_file(const char * name) {
+    char cgroup_line[512];
+    FILE * f = std::fopen("/proc/self/cgroup", "r");
+    if (!f) {
+        return 0;
+    }
+    std::string relative;
+    if (std::fgets(cgroup_line, sizeof(cgroup_line), f)) {
+        const char * marker = std::strstr(cgroup_line, "0::");
+        if (marker) {
+            relative = marker + 3;
+            while (!relative.empty() &&
+                    (relative.back() == '\n' || relative.back() == '\r')) {
+                relative.pop_back();
+            }
+        }
+    }
+    std::fclose(f);
+    if (relative.empty() || relative == "/") {
+        return 0;
+    }
+    std::string path = "/sys/fs/cgroup/" +
+            (relative.front() == '/' ? relative.substr(1) : relative) + "/" + name;
+    FILE * vf = std::fopen(path.c_str(), "r");
+    if (!vf) {
+        return 0;
+    }
+    unsigned long long value = 0;
+    const int rc = std::fscanf(vf, "%llu", &value);
+    std::fclose(vf);
+    return rc == 1 ? (uint64_t) value : 0;
+}
+
+uint64_t rescue_read_memory_current() {
+    return rescue_read_cgroup_file("memory.current");
+}
+
+uint64_t rescue_read_memory_limit() {
+    const uint64_t high = rescue_read_cgroup_file("memory.high");
+    if (high > 0 && high != std::numeric_limits<uint64_t>::max()) {
+        return high;
+    }
+    const uint64_t maximum = rescue_read_cgroup_file("memory.max");
+    return maximum == std::numeric_limits<uint64_t>::max() ? 0 : maximum;
+}
+
+uint64_t rescue_read_rss_bytes() {
+    FILE * f = std::fopen("/proc/self/statm", "r");
+    if (!f) {
+        return 0;
+    }
+    unsigned long long total_pages = 0, resident_pages = 0;
+    const int rc = std::fscanf(f, "%llu %llu", &total_pages, &resident_pages);
+    std::fclose(f);
+    return rc == 2 ? (uint64_t) resident_pages * 4096ull : 0;
+}
+
+// Experiment-only (Phase 2D): single COLD re-entry attempt with a per-decode-step
+// byte budget. rate percent 0 disables re-entry (suspend-only, existing behavior).
+uint64_t expert_reentry_rate_percent() {
+    static const uint64_t rate = env_u64_or_default(
+            "LLM_MEM_TRACE_OPT_EXPERT_REENTRY_RATE_PERCENT", 0);
+    return rate;
+}
+
+uint64_t expert_reentry_budget_base_bytes() {
+    static const uint64_t base = env_u64_or_default(
+            "LLM_MEM_TRACE_OPT_EXPERT_REENTRY_BUDGET_BYTES_PER_STEP", 0);
+    return base;
+}
+
+uint64_t expert_reentry_step_budget_bytes() {
+    const uint64_t base = expert_reentry_budget_base_bytes();
+    const uint64_t rate = expert_reentry_rate_percent();
+    if (base == 0 || rate == 0 || rate > 100) {
+        return 0;
+    }
+    return base * rate / 100;
+}
+
+struct ExpertRuntimeRescueWindow {
+    uint64_t steps = 0;
+    uint64_t issued = 0;
+    uint64_t major_faults = 0;
+    uint64_t latency_ns = 0;
+
+    void observe(uint64_t step_issued, uint64_t step_major_faults, uint64_t step_latency_ns) {
+        steps++;
+        issued += step_issued;
+        major_faults += step_major_faults;
+        latency_ns += step_latency_ns;
+    }
+};
+
+struct ExpertRuntimeRescueCounters {
+    uint64_t decode_steps_observed = 0;
+    uint64_t early_issued_sum = 0;
+    uint64_t early_major_fault_sum = 0;
+    uint64_t runtime_rescue_triggered = 0;
+    uint64_t runtime_rescue_trigger_step = 0;
+    uint64_t runtime_rescue_trigger_decode_step = 0;
+    uint64_t runtime_rescue_cold_suspended = 0;
+    uint64_t runtime_rescue_gate_bypass_steps = 0;
+    uint64_t runtime_rescue_prefetch_bypassed_tasks = 0;
+    // Phase 2D re-entry experiment counters
+    uint64_t reentry_attempted = 0;
+    uint64_t reentry_start_decode_step = 0;
+    uint64_t reentry_failed = 0;
+    uint64_t reentry_failure_decode_step = 0;
+    uint64_t reentry_step_budget_used_bytes = 0;
+    // Phase 2E rate-recovery ladder counters
+    uint64_t recovery_completed_step = 0;
+    uint64_t probe_25_start_step = 0;
+    uint64_t probe_50_start_step = 0;
+    uint64_t probe_100_start_step = 0;
+    uint64_t re_degradation_detected = 0;
+    uint64_t re_degradation_step = 0;
+    uint64_t cold_disabled_for_run = 0;
+    int cold_disabled_reason = 0; // 0 none, 1 RE_DEGRADATION, 2 LOW_BENEFIT
+    uint64_t probe_cold_issued_bytes = 0;
+    uint64_t benefit_check_performed = 0;
+    int64_t benefit_memory_delta = 0;
+    int64_t benefit_rss_delta = 0;
+    int64_t benefit_fault_delta = 0;
+    ExpertRuntimeRescueWindow early_window;
+    ExpertRuntimeRescueWindow post_trigger_5;
+    ExpertRuntimeRescueWindow post_trigger_10;
+    ExpertRuntimeRescueWindow post_trigger_rest;
+};
+
+uint64_t current_major_fault_count() {
+#ifdef __linux__
+    struct rusage usage = {};
+    return getrusage(RUSAGE_SELF, &usage) == 0 && usage.ru_majflt > 0 ?
+            (uint64_t) usage.ru_majflt : 0;
+#else
+    return 0;
+#endif
+}
+
+struct ExpertRuntimeRescueController {
+    mutable std::mutex mu;
+    ExpertRuntimeRescueState state = ExpertRuntimeRescueState::Normal;
+    ExpertRuntimeRescueCounters counters;
+    std::unordered_map<uint64_t, uint64_t> issued_by_step;
+    uint64_t gate_recovery_steps_remaining = 0;
+    uint64_t previous_major_faults = 0;
+    bool has_previous_major_faults = false;
+    std::deque<uint64_t> recovery_issued;
+    std::deque<uint64_t> recovery_faults;
+    std::deque<uint64_t> redeg_issued;
+    std::deque<uint64_t> redeg_faults;
+    // Phase 2E ladder state
+    uint64_t ladder_steps_in_probe = 0;
+    uint64_t ladder_baseline_mem_current = 0;
+    uint64_t ladder_baseline_mem_limit = 0;
+    uint64_t ladder_baseline_rss = 0;
+    double ladder_baseline_fault_avg3 = 0.0;
+    std::deque<uint64_t> probe_issued;
+    std::deque<uint64_t> probe_faults;
+
+    static double avg_last_n(const std::deque<uint64_t> & values, size_t n) {
+        if (values.size() < n) {
+            return 0.0;
+        }
+        double sum = 0.0;
+        for (size_t i = values.size() - n; i < values.size(); ++i) {
+            sum += (double) values[i];
+        }
+        return sum / (double) n;
+    }
+
+    void record_prefetch_issued(int phase, uint64_t step) {
+        if (phase != LLM_MEM_TRACE_PHASE_DECODE) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(mu);
+        issued_by_step[step]++;
+    }
+
+    bool value_gate_bypass_active(int phase) const {
+        if (phase != LLM_MEM_TRACE_PHASE_DECODE) {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(mu);
+        return state == ExpertRuntimeRescueState::GateRecovery;
+    }
+
+    void record_value_gate_bypass() {
+        std::lock_guard<std::mutex> lock(mu);
+        if (state == ExpertRuntimeRescueState::GateRecovery) {
+            counters.runtime_rescue_prefetch_bypassed_tasks++;
+        }
+    }
+
+    bool cold_suspended() const {
+        std::lock_guard<std::mutex> lock(mu);
+        return state != ExpertRuntimeRescueState::Normal;
+    }
+
+    // Phase 2E-A observation-only: returns true when the current rescue state
+    // is considered safe for calibration healthy-sample admission. Only Normal
+    // and ReEntry are allowed; GateRecovery, ColdSuspended, Probe* and Disabled
+    // are excluded (spec §6). This is a const query with zero control impact.
+    bool state_allows_calibration() const {
+        std::lock_guard<std::mutex> lock(mu);
+        return state == ExpertRuntimeRescueState::Normal ||
+               state == ExpertRuntimeRescueState::ReEntry;
+    }
+
+    // 0 = normal (unlimited), 1 = suspended (skip real MADV_COLD), 2 = probe/re-entry (byte budget).
+    int cold_issue_mode() const {
+        std::lock_guard<std::mutex> lock(mu);
+        switch (state) {
+            case ExpertRuntimeRescueState::Normal:   return 0;
+            case ExpertRuntimeRescueState::ReEntry:
+            case ExpertRuntimeRescueState::Probe25:
+            case ExpertRuntimeRescueState::Probe50:
+            case ExpertRuntimeRescueState::Probe100: return 2;
+            default:                                 return 1;
+        }
+    }
+
+    uint64_t reentry_budget_remaining() const {
+        std::lock_guard<std::mutex> lock(mu);
+        const uint64_t budget = expert_cold_rate_recovery_requested() ?
+                expert_probe_state_budget_bytes(state) :
+                expert_reentry_step_budget_bytes();
+        return budget > counters.reentry_step_budget_used_bytes ?
+                budget - counters.reentry_step_budget_used_bytes : 0;
+    }
+
+    void reentry_budget_commit(uint64_t bytes) {
+        std::lock_guard<std::mutex> lock(mu);
+        counters.reentry_step_budget_used_bytes += bytes;
+        if (state == ExpertRuntimeRescueState::Probe25 ||
+                state == ExpertRuntimeRescueState::Probe50 ||
+                state == ExpertRuntimeRescueState::Probe100) {
+            counters.probe_cold_issued_bytes += bytes;
+        }
+    }
+
+    void on_step_end(int phase, uint64_t step, uint64_t latency_ns) {
+        const uint64_t current_major_faults = current_major_fault_count();
+        std::lock_guard<std::mutex> lock(mu);
+        const uint64_t major_fault_delta = has_previous_major_faults &&
+                current_major_faults >= previous_major_faults ?
+                current_major_faults - previous_major_faults : 0;
+        previous_major_faults = current_major_faults;
+        has_previous_major_faults = true;
+        if (phase != LLM_MEM_TRACE_PHASE_DECODE) {
+            return;
+        }
+
+        const uint64_t issued = issued_by_step[step];
+        counters.decode_steps_observed++;
+        const uint64_t decode_step = counters.decode_steps_observed;
+        const ExpertRuntimeRescueState state_for_step = state;
+
+        if (counters.runtime_rescue_triggered == 0 && decode_step <= 3) {
+            counters.early_window.observe(issued, major_fault_delta, latency_ns);
+            counters.early_issued_sum += issued;
+            counters.early_major_fault_sum += major_fault_delta;
+            if (decode_step == 3 && counters.early_issued_sum < 300 &&
+                    counters.early_major_fault_sum > 6000) {
+                counters.runtime_rescue_triggered = 1;
+                counters.runtime_rescue_trigger_step = step;
+                counters.runtime_rescue_trigger_decode_step = decode_step;
+                counters.runtime_rescue_cold_suspended = 1;
+                if (expert_runtime_rescue_mode() == ExpertRuntimeRescueMode::GateRecovery) {
+                    state = ExpertRuntimeRescueState::GateRecovery;
+                    gate_recovery_steps_remaining = 5;
+                } else {
+                    state = ExpertRuntimeRescueState::ColdSuspended;
+                }
+            }
+        } else if (counters.runtime_rescue_triggered != 0 &&
+                decode_step > counters.runtime_rescue_trigger_decode_step) {
+            const uint64_t relative_step = decode_step - counters.runtime_rescue_trigger_decode_step;
+            if (relative_step <= 5) {
+                counters.post_trigger_5.observe(issued, major_fault_delta, latency_ns);
+            }
+            if (relative_step <= 10) {
+                counters.post_trigger_10.observe(issued, major_fault_delta, latency_ns);
+            }
+            if (relative_step > 10) {
+                counters.post_trigger_rest.observe(issued, major_fault_delta, latency_ns);
+            }
+            if (state_for_step == ExpertRuntimeRescueState::GateRecovery &&
+                    gate_recovery_steps_remaining > 0) {
+                counters.runtime_rescue_gate_bypass_steps++;
+                gate_recovery_steps_remaining--;
+                if (gate_recovery_steps_remaining == 0) {
+                    state = ExpertRuntimeRescueState::ColdSuspended;
+                }
+            }
+            // Phase 2E: formal COLD rate-recovery ladder. Takes precedence over
+            // the Phase 2D single-shot re-entry experiment when enabled.
+            if (expert_cold_rate_recovery_requested()) {
+                if (state == ExpertRuntimeRescueState::ColdSuspended) {
+                    recovery_issued.push_back(issued);
+                    recovery_faults.push_back(major_fault_delta);
+                    if (recovery_issued.size() > 5) {
+                        recovery_issued.pop_front();
+                        recovery_faults.pop_front();
+                    }
+                    if (recovery_issued.size() == 5 &&
+                            avg_last_n(recovery_issued, 5) >= 500.0 &&
+                            avg_last_n(recovery_faults, 5) <= 2500.0) {
+                        state = ExpertRuntimeRescueState::Probe25;
+                        counters.recovery_completed_step = decode_step;
+                        counters.probe_25_start_step = decode_step;
+                        ladder_steps_in_probe = 0;
+                        ladder_baseline_mem_current = rescue_read_memory_current();
+                        ladder_baseline_mem_limit = rescue_read_memory_limit();
+                        ladder_baseline_rss = rescue_read_rss_bytes();
+                        ladder_baseline_fault_avg3 = avg_last_n(recovery_faults, 3);
+                        probe_issued.clear();
+                        probe_faults.clear();
+                    }
+                } else if (state == ExpertRuntimeRescueState::Probe25 ||
+                        state == ExpertRuntimeRescueState::Probe50 ||
+                        state == ExpertRuntimeRescueState::Probe100) {
+                    ladder_steps_in_probe++;
+                    probe_issued.push_back(issued);
+                    probe_faults.push_back(major_fault_delta);
+                    if (probe_issued.size() > 5) {
+                        probe_issued.pop_front();
+                        probe_faults.pop_front();
+                    }
+                    const double avg3_issued = avg_last_n(probe_issued, 3);
+                    const double avg3_faults = avg_last_n(probe_faults, 3);
+                    // Benefit check: once, after >=10 probe steps and >=1 GiB of COLD.
+                    if (counters.benefit_check_performed == 0 &&
+                            ladder_steps_in_probe >= 10 &&
+                            counters.probe_cold_issued_bytes >= (1ull << 30)) {
+                        counters.benefit_check_performed = 1;
+                        const uint64_t now_mem = rescue_read_memory_current();
+                        const uint64_t now_rss = rescue_read_rss_bytes();
+                        counters.benefit_memory_delta = (int64_t) ladder_baseline_mem_current -
+                                (int64_t) now_mem;
+                        counters.benefit_rss_delta = (int64_t) ladder_baseline_rss -
+                                (int64_t) now_rss;
+                        counters.benefit_fault_delta = (int64_t) llround(
+                                ladder_baseline_fault_avg3 - avg3_faults);
+                        const uint64_t mem_ref = ladder_baseline_mem_limit > 0 ?
+                                ladder_baseline_mem_limit : ladder_baseline_mem_current;
+                        const bool mem_not_improved = mem_ref == 0 ||
+                                counters.benefit_memory_delta < (int64_t) (mem_ref / 100);
+                        const bool rss_not_improved = ladder_baseline_rss == 0 ||
+                                counters.benefit_rss_delta < (int64_t) (ladder_baseline_rss / 100);
+                        const bool fault_not_improved = ladder_baseline_fault_avg3 <= 0.0 ||
+                                (ladder_baseline_fault_avg3 - avg3_faults) <
+                                        0.10 * ladder_baseline_fault_avg3;
+                        if (mem_not_improved && rss_not_improved && fault_not_improved) {
+                            state = ExpertRuntimeRescueState::Disabled;
+                            counters.cold_disabled_for_run = 1;
+                            counters.cold_disabled_reason = 2;
+                        }
+                    }
+                    // Re-degradation: rolling 3-step collapse.
+                    if (state != ExpertRuntimeRescueState::Disabled &&
+                            probe_issued.size() >= 3 &&
+                            avg3_issued < 100.0 && avg3_faults > 2000.0) {
+                        state = ExpertRuntimeRescueState::Disabled;
+                        counters.re_degradation_detected = 1;
+                        counters.re_degradation_step = decode_step;
+                        counters.cold_disabled_for_run = 1;
+                        counters.cold_disabled_reason = 1;
+                    }
+                    // Promotion: 5 consecutive stable steps.
+                    if (state == ExpertRuntimeRescueState::Probe25 ||
+                            state == ExpertRuntimeRescueState::Probe50) {
+                        if (probe_issued.size() == 5 &&
+                                avg_last_n(probe_issued, 5) >= 500.0 &&
+                                avg_last_n(probe_faults, 5) <= 2500.0) {
+                            if (state == ExpertRuntimeRescueState::Probe25) {
+                                state = ExpertRuntimeRescueState::Probe50;
+                                counters.probe_50_start_step = decode_step;
+                            } else {
+                                state = ExpertRuntimeRescueState::Probe100;
+                                counters.probe_100_start_step = decode_step;
+                            }
+                            probe_issued.clear();
+                            probe_faults.clear();
+                        }
+                    }
+                }
+            } else if (state == ExpertRuntimeRescueState::ColdSuspended &&
+                    counters.reentry_attempted == 0 &&
+                    expert_reentry_step_budget_bytes() > 0) {
+                recovery_issued.push_back(issued);
+                recovery_faults.push_back(major_fault_delta);
+                if (recovery_issued.size() > 5) {
+                    recovery_issued.pop_front();
+                    recovery_faults.pop_front();
+                }
+                if (recovery_issued.size() == 5) {
+                    const uint64_t sum_issued = std::accumulate(
+                            recovery_issued.begin(), recovery_issued.end(), uint64_t{0});
+                    const uint64_t sum_faults = std::accumulate(
+                            recovery_faults.begin(), recovery_faults.end(), uint64_t{0});
+                    if (sum_issued >= 5 * 500 && sum_faults <= 5 * 2500) {
+                        state = ExpertRuntimeRescueState::ReEntry;
+                        counters.reentry_attempted = 1;
+                        counters.reentry_start_decode_step = decode_step;
+                    }
+                }
+            }
+            if (state == ExpertRuntimeRescueState::ReEntry) {
+                redeg_issued.push_back(issued);
+                redeg_faults.push_back(major_fault_delta);
+                if (redeg_issued.size() > 3) {
+                    redeg_issued.pop_front();
+                    redeg_faults.pop_front();
+                }
+                if (redeg_issued.size() == 3) {
+                    const uint64_t sum_issued = std::accumulate(
+                            redeg_issued.begin(), redeg_issued.end(), uint64_t{0});
+                    const uint64_t sum_faults = std::accumulate(
+                            redeg_faults.begin(), redeg_faults.end(), uint64_t{0});
+                    if (sum_issued < 3 * 100 && sum_faults > 3 * 2000) {
+                        state = ExpertRuntimeRescueState::ColdSuspended;
+                        counters.reentry_failed = 1;
+                        counters.reentry_failure_decode_step = decode_step;
+                    }
+                }
+            }
+        }
+        counters.reentry_step_budget_used_bytes = 0;
+
+        if (!llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_MEMORY)) {
+            return;
+        }
+        std::string line;
+        line.reserve(288);
+        line += "{\"event\":\"EXPERT_RUNTIME_RESCUE_STEP\",\"ts_ns\":" +
+                std::to_string(llm_mem_trace_time_ns());
+        line += ",\"step\":" + std::to_string(step);
+        line += ",\"decode_step\":" + std::to_string(decode_step);
+        line += ",\"issued\":" + std::to_string(issued);
+        line += ",\"major_fault_delta\":" + std::to_string(major_fault_delta);
+        line += ",\"latency_ns\":" + std::to_string(latency_ns);
+        line += ",\"state\":";
+        json_escape_append(line, expert_runtime_rescue_state_name(state_for_step));
+        line += "}";
+        llm_mem_trace_write(LLM_MEM_TRACE_SINK_MEMORY, line.c_str(), line.size());
+    }
+
+    ExpertRuntimeRescueCounters snapshot() const {
+        std::lock_guard<std::mutex> lock(mu);
+        return counters;
+    }
+};
+
+ExpertRuntimeRescueController & expert_runtime_rescue_controller() {
+    static ExpertRuntimeRescueController controller;
+    return controller;
+}
+
+bool expert_runtime_rescue_cold_suspended() {
+    return expert_runtime_rescue_enabled() && expert_runtime_rescue_controller().cold_suspended();
+}
+
+int expert_runtime_rescue_cold_issue_mode() {
+    if (!expert_runtime_rescue_enabled()) {
+        return 0;
+    }
+    return expert_runtime_rescue_controller().cold_issue_mode();
+}
+
+bool expert_runtime_rescue_value_gate_bypass_active(int phase) {
+    return expert_runtime_rescue_enabled() &&
+            expert_runtime_rescue_controller().value_gate_bypass_active(phase);
+}
+
+// ------------------------------------------------------------------
+// Phase 2E-B: Calibrated Adaptive Control.
+// Default OFF (LLM_MEM_TRACE_OPT_EXPERT_CALIBRATED_CONTROL). When ON:
+// BOOTSTRAP (no real MADV_COLD, shadow calibration) -> frozen baseline ->
+// PROBE_25 -> PROBE_50; relative-scale DEGRADING detection -> RECOVERY
+// (gate bypass) -> PROBE_25 once; any second degradation or LOW_BENEFIT
+// -> DISABLED for the rest of the inference.
+// ------------------------------------------------------------------
+
+bool expert_calibrated_control_requested() {
+    static const bool requested = env_truthy(
+            std::getenv("LLM_MEM_TRACE_OPT_EXPERT_CALIBRATED_CONTROL"));
+    return requested;
+}
+
+bool expert_calibrated_control_enabled() {
+    return expert_calibrated_control_requested() && llm_mem_trace_enabled() &&
+            llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_MEMORY);
+}
+
+enum class CalibratedControlState {
+    Bootstrap,
+    Probe25,
+    Probe50,
+    Recovery,
+    Disabled,
+};
+
+const char * calibrated_control_state_name(CalibratedControlState state) {
+    switch (state) {
+        case CalibratedControlState::Bootstrap: return "bootstrap";
+        case CalibratedControlState::Probe25:   return "probe_25";
+        case CalibratedControlState::Probe50:   return "probe_50";
+        case CalibratedControlState::Recovery:  return "recovery";
+        case CalibratedControlState::Disabled:  return "disabled";
+    }
+    return "bootstrap";
+}
+
+struct ExpertCalibratedControlCounters {
+    uint64_t calibration_valid = 0;
+    uint64_t calibration_valid_step = 0;
+    double frozen_baseline_issue_ratio = 0.0;
+    double frozen_baseline_faults = 0.0;
+    double frozen_baseline_cold_eligible_bytes = 0.0;
+    uint64_t probe25_budget_bytes = 0;
+    uint64_t probe50_budget_bytes = 0;
+    uint64_t disaster_bypass_count = 0;
+    uint64_t recovery_triggered = 0;
+    uint64_t recovery_trigger_step = 0;
+    uint64_t recovery_completed = 0;
+    uint64_t recovery_completed_step = 0;
+    uint64_t re_degradation = 0;
+    uint64_t re_degradation_step = 0;
+    uint64_t cold_disabled_for_run = 0;
+    int disabled_reason = 0; // 0 none, 1 RE_DEGRADATION, 2 LOW_BENEFIT
+    double degradation_prefetch_health = 0.0;
+    double degradation_fault_amp = 0.0;
+    uint64_t probe_cold_issued_bytes = 0;
+    uint64_t benefit_required_bytes = 0;
+    uint64_t benefit_check_performed = 0;
+    int64_t benefit_memory_delta = 0;
+    int64_t benefit_rss_delta = 0;
+    int64_t benefit_fault_delta = 0;
+};
+
+struct ExpertCalibratedController {
+    mutable std::mutex mu;
+    CalibratedControlState state = CalibratedControlState::Bootstrap;
+    ExpertCalibratedControlCounters counters;
+
+    // Per-step accumulators (DECODE only).
+    uint64_t step_issued = 0;
+    uint64_t step_opportunities = 0;
+
+    // Major fault delta tracking.
+    uint64_t previous_major_faults = 0;
+    bool has_previous_major_faults = false;
+
+    // Model reload detection.
+    uint64_t prev_step = 0;
+    bool has_prev_step = false;
+
+    // Frozen baseline (taken once when calibration first becomes valid).
+    bool frozen = false;
+
+    // Rolling windows of valid (opportunities>0) decode steps.
+    std::deque<double> health_window;   // prefetch_health per valid step
+    std::deque<double> amp_window;      // fault_amp per valid step
+
+    uint64_t bypass_steps_remaining = 0;
+    bool recovery_used = false;
+    uint64_t steps_in_probe = 0;
+    uint64_t probe_step_budget_used = 0;
+
+    // Benefit baselines recorded at PROBE_25 entry.
+    uint64_t benefit_base_mem_current = 0;
+    uint64_t benefit_base_mem_limit = 0;
+    uint64_t benefit_base_rss = 0;
+    double benefit_base_fault_avg3 = 0.0;
+
+    void record_prefetch_issued(int phase) {
+        if (phase != LLM_MEM_TRACE_PHASE_DECODE) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(mu);
+        step_issued++;
+    }
+
+    void record_prefetch_opportunity(int phase) {
+        if (phase != LLM_MEM_TRACE_PHASE_DECODE) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(mu);
+        step_opportunities++;
+    }
+
+    bool state_allows_calibration() const {
+        std::lock_guard<std::mutex> lock(mu);
+        return state == CalibratedControlState::Bootstrap &&
+                bypass_steps_remaining == 0;
+    }
+
+    bool value_gate_bypass_active(int phase) const {
+        if (phase != LLM_MEM_TRACE_PHASE_DECODE) {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(mu);
+        return bypass_steps_remaining > 0;
+    }
+
+    // 2 = budgeted real COLD, 3 = scan eligible only (no syscall, no marking).
+    int cold_issue_mode() const {
+        std::lock_guard<std::mutex> lock(mu);
+        switch (state) {
+            case CalibratedControlState::Probe25:
+            case CalibratedControlState::Probe50: return 2;
+            default:                              return 3;
+        }
+    }
+
+    uint64_t state_budget_bytes_unlocked() const {
+        const double base = counters.frozen_baseline_cold_eligible_bytes;
+        if (!frozen || base <= 0.0) {
+            return 0;
+        }
+        const double fraction = state == CalibratedControlState::Probe25 ? 0.25 :
+                state == CalibratedControlState::Probe50 ? 0.50 : 0.0;
+        const uint64_t raw = (uint64_t) (base * fraction);
+        return raw & ~uint64_t{4095}; // page-align down; may be 0 -> no COLD this step
+    }
+
+    uint64_t cold_budget_remaining() {
+        std::lock_guard<std::mutex> lock(mu);
+        const uint64_t budget = state_budget_bytes_unlocked();
+        return budget > probe_step_budget_used ? budget - probe_step_budget_used : 0;
+    }
+
+    void cold_budget_commit(uint64_t bytes) {
+        std::lock_guard<std::mutex> lock(mu);
+        probe_step_budget_used += bytes;
+        counters.probe_cold_issued_bytes += bytes;
+    }
+
+    void freeze_baseline_unlocked(uint64_t step) {
+        const CalibrationBaseline ratio = expert_calibration_profile().baseline_prefetch_issue_ratio();
+        const CalibrationBaseline faults = expert_calibration_profile().baseline_major_faults();
+        const CalibrationBaseline cold = expert_calibration_profile().baseline_cold_eligible_bytes();
+        if (!ratio.valid || !faults.valid || !cold.valid ||
+                !(ratio.median > 0.0) || !(faults.median > 0.0) || !(cold.median > 0.0) ||
+                !std::isfinite(ratio.median) || !std::isfinite(faults.median) ||
+                !std::isfinite(cold.median)) {
+            return; // conservative: stay in BOOTSTRAP, never enable real COLD
+        }
+        frozen = true;
+        counters.calibration_valid = 1;
+        counters.calibration_valid_step = step;
+        counters.frozen_baseline_issue_ratio = ratio.median;
+        counters.frozen_baseline_faults = faults.median;
+        counters.frozen_baseline_cold_eligible_bytes = cold.median;
+        counters.probe25_budget_bytes = ((uint64_t) (cold.median * 0.25)) & ~uint64_t{4095};
+        counters.probe50_budget_bytes = ((uint64_t) (cold.median * 0.50)) & ~uint64_t{4095};
+        counters.benefit_required_bytes = (uint64_t) (cold.median * 10.0);
+    }
+
+    void enter_probe25_unlocked(uint64_t decode_step) {
+        state = CalibratedControlState::Probe25;
+        steps_in_probe = 0;
+        probe_step_budget_used = 0;
+        health_window.clear();
+        amp_window.clear();
+        benefit_base_mem_current = rescue_read_memory_current();
+        benefit_base_mem_limit = rescue_read_memory_limit();
+        benefit_base_rss = rescue_read_rss_bytes();
+        // fault baseline for the benefit check: rolling last-3 will be captured
+        // from the recovery/healthy window at entry; store 0 until 3 valid steps.
+        benefit_base_fault_avg3 = -1.0;
+        (void) decode_step;
+    }
+
+    void reset_unlocked() {
+        state = CalibratedControlState::Bootstrap;
+        frozen = false;
+        counters = ExpertCalibratedControlCounters{};
+        step_issued = 0;
+        step_opportunities = 0;
+        health_window.clear();
+        amp_window.clear();
+        bypass_steps_remaining = 0;
+        recovery_used = false;
+        steps_in_probe = 0;
+        probe_step_budget_used = 0;
+    }
+
+    void on_step_end(int phase, uint64_t step, uint64_t latency_ns) {
+        (void) latency_ns;
+        const uint64_t current_major_faults = current_major_fault_count();
+        std::lock_guard<std::mutex> lock(mu);
+        const uint64_t major_fault_delta = has_previous_major_faults &&
+                current_major_faults >= previous_major_faults ?
+                current_major_faults - previous_major_faults : 0;
+        previous_major_faults = current_major_faults;
+        has_previous_major_faults = true;
+
+        if (has_prev_step && step < prev_step) {
+            reset_unlocked();
+        }
+        prev_step = step;
+        has_prev_step = true;
+
+        if (phase != LLM_MEM_TRACE_PHASE_DECODE) {
+            step_issued = 0;
+            step_opportunities = 0;
+            return;
+        }
+
+        const uint64_t issued = step_issued;
+        const uint64_t opportunities = step_opportunities;
+        step_issued = 0;
+        step_opportunities = 0;
+        probe_step_budget_used = 0;
+
+        // Freeze the baseline the first time calibration becomes valid.
+        if (!frozen &&
+                expert_calibration_profile().state() == CalibrationState::Calibrated) {
+            freeze_baseline_unlocked(step);
+            if (frozen && state == CalibratedControlState::Bootstrap) {
+                enter_probe25_unlocked(0);
+            }
+        }
+
+        const double health = (frozen && opportunities > 0) ?
+                ((double) issued / (double) opportunities) /
+                        counters.frozen_baseline_issue_ratio : 0.0;
+        const double amp = frozen ?
+                (double) major_fault_delta /
+                        std::max(counters.frozen_baseline_faults, 1.0) : 0.0;
+
+        if (bypass_steps_remaining > 0) {
+            bypass_steps_remaining--;
+        }
+
+        switch (state) {
+            case CalibratedControlState::Bootstrap: {
+                // Scale-independent disaster guard: prefetch fully collapsed.
+                if (opportunities > 0) {
+                    health_window.push_back(issued == 0 ? 0.0 : 1.0);
+                    if (health_window.size() > 3) {
+                        health_window.pop_front();
+                    }
+                    if (health_window.size() == 3 &&
+                            std::accumulate(health_window.begin(), health_window.end(), 0.0) == 0.0) {
+                        bypass_steps_remaining = 5;
+                        counters.disaster_bypass_count++;
+                        health_window.clear();
+                    }
+                }
+                break;
+            }
+            case CalibratedControlState::Probe25:
+            case CalibratedControlState::Probe50: {
+                if (opportunities == 0) {
+                    break;
+                }
+                steps_in_probe++;
+                health_window.push_back(health);
+                amp_window.push_back(amp);
+                if (health_window.size() > 5) {
+                    health_window.pop_front();
+                    amp_window.pop_front();
+                }
+                const double avg3_health = health_window.size() >= 3 ?
+                        std::accumulate(health_window.end() - 3, health_window.end(), 0.0) / 3.0 : 1.0;
+                const double avg3_amp = amp_window.size() >= 3 ?
+                        std::accumulate(amp_window.end() - 3, amp_window.end(), 0.0) / 3.0 : 0.0;
+                if (benefit_base_fault_avg3 < 0.0 && amp_window.size() >= 3) {
+                    // capture entry fault scale from the first 3 probe steps
+                    benefit_base_fault_avg3 =
+                            std::accumulate(amp_window.end() - 3, amp_window.end(), 0.0) / 3.0 *
+                            counters.frozen_baseline_faults;
+                }
+                // Benefit check (once): >=10 probe steps AND >=10*B cold bytes.
+                if (counters.benefit_check_performed == 0 && steps_in_probe >= 10 &&
+                        counters.probe_cold_issued_bytes >= counters.benefit_required_bytes) {
+                    counters.benefit_check_performed = 1;
+                    const uint64_t now_mem = rescue_read_memory_current();
+                    const uint64_t now_rss = rescue_read_rss_bytes();
+                    counters.benefit_memory_delta = (int64_t) benefit_base_mem_current - (int64_t) now_mem;
+                    counters.benefit_rss_delta = (int64_t) benefit_base_rss - (int64_t) now_rss;
+                    const double now_fault_rate = amp_window.size() >= 3 ?
+                            std::accumulate(amp_window.end() - 3, amp_window.end(), 0.0) / 3.0 *
+                            counters.frozen_baseline_faults : (double) major_fault_delta;
+                    counters.benefit_fault_delta = (int64_t) llround(
+                            benefit_base_fault_avg3 - now_fault_rate);
+                    const uint64_t mem_ref = benefit_base_mem_limit > 0 ?
+                            benefit_base_mem_limit : benefit_base_mem_current;
+                    const bool mem_not_improved = mem_ref == 0 ||
+                            counters.benefit_memory_delta < (int64_t) (mem_ref / 100);
+                    const bool rss_not_improved = benefit_base_rss == 0 ||
+                            counters.benefit_rss_delta < (int64_t) (benefit_base_rss / 100);
+                    const bool fault_not_improved = benefit_base_fault_avg3 <= 0.0 ||
+                            (benefit_base_fault_avg3 - now_fault_rate) <
+                                    0.10 * benefit_base_fault_avg3;
+                    if (mem_not_improved && rss_not_improved && fault_not_improved) {
+                        state = CalibratedControlState::Disabled;
+                        counters.cold_disabled_for_run = 1;
+                        counters.disabled_reason = 2;
+                        break;
+                    }
+                }
+                // DEGRADING: rolling 3 valid steps.
+                if (health_window.size() >= 3 && avg3_health < 0.10 && avg3_amp > 8.0) {
+                    counters.degradation_prefetch_health = avg3_health;
+                    counters.degradation_fault_amp = avg3_amp;
+                    if (!recovery_used) {
+                        recovery_used = true;
+                        counters.recovery_triggered = 1;
+                        counters.recovery_trigger_step = step;
+                        state = CalibratedControlState::Recovery;
+                        bypass_steps_remaining = 5;
+                    } else {
+                        state = CalibratedControlState::Disabled;
+                        counters.re_degradation = 1;
+                        counters.re_degradation_step = step;
+                        counters.cold_disabled_for_run = 1;
+                        counters.disabled_reason = 1;
+                    }
+                    health_window.clear();
+                    amp_window.clear();
+                    break;
+                }
+                // Promotion: 5 consecutive stable steps.
+                if (state == CalibratedControlState::Probe25 && health_window.size() == 5) {
+                    const double avg5_health = std::accumulate(
+                            health_window.begin(), health_window.end(), 0.0) / 5.0;
+                    const double avg5_amp = std::accumulate(
+                            amp_window.begin(), amp_window.end(), 0.0) / 5.0;
+                    if (avg5_health >= 0.50 && avg5_amp <= 10.0) {
+                        state = CalibratedControlState::Probe50;
+                        health_window.clear();
+                        amp_window.clear();
+                    }
+                }
+                break;
+            }
+            case CalibratedControlState::Recovery: {
+                if (opportunities == 0) {
+                    break;
+                }
+                health_window.push_back(health);
+                amp_window.push_back(amp);
+                if (health_window.size() > 5) {
+                    health_window.pop_front();
+                    amp_window.pop_front();
+                }
+                if (health_window.size() == 5) {
+                    const double avg5_health = std::accumulate(
+                            health_window.begin(), health_window.end(), 0.0) / 5.0;
+                    const double avg5_amp = std::accumulate(
+                            amp_window.begin(), amp_window.end(), 0.0) / 5.0;
+                    if (avg5_health >= 0.50 && avg5_amp <= 10.0) {
+                        counters.recovery_completed = 1;
+                        counters.recovery_completed_step = step;
+                        enter_probe25_unlocked(step);
+                    }
+                }
+                break;
+            }
+            case CalibratedControlState::Disabled:
+                break;
+        }
+
+        if (!llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_MEMORY)) {
+            return;
+        }
+        std::string line;
+        line.reserve(256);
+        line += "{\"event\":\"EXPERT_CALIBRATED_STEP\",\"ts_ns\":" +
+                std::to_string(llm_mem_trace_time_ns());
+        line += ",\"step\":" + std::to_string(step);
+        line += ",\"issued\":" + std::to_string(issued);
+        line += ",\"opportunities\":" + std::to_string(opportunities);
+        line += ",\"major_fault_delta\":" + std::to_string(major_fault_delta);
+        line += ",\"prefetch_health\":" + std::to_string(health);
+        line += ",\"fault_amp\":" + std::to_string(amp);
+        line += ",\"state\":";
+        json_escape_append(line, calibrated_control_state_name(state));
+        line += "}";
+        llm_mem_trace_write(LLM_MEM_TRACE_SINK_MEMORY, line.c_str(), line.size());
+    }
+
+    ExpertCalibratedControlCounters snapshot() const {
+        std::lock_guard<std::mutex> lock(mu);
+        return counters;
+    }
+
+    CalibratedControlState current_state() const {
+        std::lock_guard<std::mutex> lock(mu);
+        return state;
+    }
+};
+
+ExpertCalibratedController & expert_calibrated_controller() {
+    static ExpertCalibratedController controller;
+    return controller;
+}
+
+void write_expert_calibrated_control_summary() {
+    if (!expert_calibrated_control_enabled()) {
+        return;
+    }
+    const ExpertCalibratedControlCounters counters = expert_calibrated_controller().snapshot();
+    std::string line;
+    line.reserve(900);
+    line += "{\"event\":\"EXPERT_CALIBRATED_CONTROL_SUMMARY\",\"ts_ns\":" +
+            std::to_string(llm_mem_trace_time_ns());
+    line += ",\"calibrated_control_enabled\":true";
+    line += ",\"controller_state\":";
+    json_escape_append(line, calibrated_control_state_name(
+            expert_calibrated_controller().current_state()));
+    line += ",\"calibration_valid\":" + std::to_string(counters.calibration_valid);
+    line += ",\"calibration_valid_step\":" + std::to_string(counters.calibration_valid_step);
+    line += ",\"frozen_baseline_issue_ratio\":" +
+            std::to_string(counters.frozen_baseline_issue_ratio);
+    line += ",\"frozen_baseline_faults\":" +
+            std::to_string(counters.frozen_baseline_faults);
+    line += ",\"frozen_baseline_cold_eligible_bytes\":" +
+            std::to_string(counters.frozen_baseline_cold_eligible_bytes);
+    line += ",\"probe25_budget_bytes\":" + std::to_string(counters.probe25_budget_bytes);
+    line += ",\"probe50_budget_bytes\":" + std::to_string(counters.probe50_budget_bytes);
+    line += ",\"disaster_bypass_count\":" + std::to_string(counters.disaster_bypass_count);
+    line += ",\"recovery_triggered\":" + std::to_string(counters.recovery_triggered);
+    line += ",\"recovery_trigger_step\":" + std::to_string(counters.recovery_trigger_step);
+    line += ",\"recovery_completed\":" + std::to_string(counters.recovery_completed);
+    line += ",\"recovery_completed_step\":" + std::to_string(counters.recovery_completed_step);
+    line += ",\"re_degradation\":" + std::to_string(counters.re_degradation);
+    line += ",\"re_degradation_step\":" + std::to_string(counters.re_degradation_step);
+    line += ",\"cold_disabled_for_run\":" + std::to_string(counters.cold_disabled_for_run);
+    line += ",\"disabled_reason\":";
+    json_escape_append(line, counters.disabled_reason == 1 ? "RE_DEGRADATION" :
+            counters.disabled_reason == 2 ? "LOW_BENEFIT" : "none");
+    line += ",\"degradation_prefetch_health\":" +
+            std::to_string(counters.degradation_prefetch_health);
+    line += ",\"degradation_fault_amp\":" +
+            std::to_string(counters.degradation_fault_amp);
+    line += ",\"probe_cold_issued_bytes\":" +
+            std::to_string(counters.probe_cold_issued_bytes);
+    line += ",\"benefit_required_bytes\":" + std::to_string(counters.benefit_required_bytes);
+    line += ",\"benefit_check_performed\":" + std::to_string(counters.benefit_check_performed);
+    line += ",\"benefit_memory_delta\":" + std::to_string(counters.benefit_memory_delta);
+    line += ",\"benefit_rss_delta\":" + std::to_string(counters.benefit_rss_delta);
+    line += ",\"benefit_fault_delta\":" + std::to_string(counters.benefit_fault_delta);
+    line += "}";
+    llm_mem_trace_write(LLM_MEM_TRACE_SINK_MEMORY, line.c_str(), line.size());
+}
+
+void ensure_expert_calibrated_control_summary_registered() {
+    (void) expert_calibrated_controller();
+    static const bool registered = [] {
+        std::atexit(write_expert_calibrated_control_summary);
+        return true;
+    }();
+    (void) registered;
+}
+
+// Combined value-gate bypass: runtime rescue (2C/2E) or calibrated control (2E-B).
+bool expert_value_gate_bypass_active_any(int phase) {
+    if (expert_calibrated_control_enabled() &&
+            expert_calibrated_controller().value_gate_bypass_active(phase)) {
+        return true;
+    }
+    return expert_runtime_rescue_value_gate_bypass_active(phase);
 }
 
 struct ExpertPressureSnapshot {
@@ -1175,6 +2320,7 @@ struct ExpertHintTask {
     double psi_some_avg10 = 0.0;
     double psi_full_avg10 = 0.0;
     bool use_fadvise = false;
+    bool memory_object_hint_slot_acquired = false;
     ExpertTaskLifecycleRecord lifecycle;
     uint64_t issue_id = 0;
 };
@@ -1558,6 +2704,271 @@ ExpertFirstUseMatcher & expert_first_use_matcher() {
     return matcher;
 }
 
+ExpertMemoryObjectTracker & expert_memory_object_tracker() {
+    static ExpertMemoryObjectTracker tracker(expert_working_set_budget_bytes());
+    return tracker;
+}
+
+void write_expert_memory_object_summary() {
+    if (!expert_memory_objects_enabled() ||
+            !llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_MEMORY)) {
+        return;
+    }
+    const ExpertMemoryObjectCounters counters = expert_memory_object_tracker().counters();
+    std::string line;
+    line.reserve(400);
+    line += "{\"event\":\"EXPERT_MEMORY_OBJECT_SUMMARY\",\"ts_ns\":" +
+            std::to_string(llm_mem_trace_time_ns());
+    line += ",\"enabled\":true";
+    line += ",\"inflight_hint_aggregation_enabled\":" + std::string(
+            expert_inflight_hint_aggregation_enabled() ? "true" : "false");
+    line += ",\"semantic_stale_cancel_enabled\":" + std::string(
+            expert_semantic_stale_cancel_enabled() ? "true" : "false");
+    line += ",\"working_set_enabled\":" + std::string(
+            expert_working_set_requested() ? "true" : "false");
+    line += ",\"madv_cold_reclaim_enabled\":" + std::string(
+            expert_madv_cold_reclaim_enabled() ? "true" : "false");
+    line += ",\"madv_cold_grace_steps\":" +
+            std::to_string(expert_madv_cold_reclaim_grace_steps());
+    line += ",\"memory_objects_created\":" +
+            std::to_string(counters.memory_objects_created);
+    line += ",\"semantic_demands_registered\":" +
+            std::to_string(counters.semantic_demands_registered);
+    line += ",\"semantic_demands_merged\":" +
+            std::to_string(counters.semantic_demands_merged);
+    line += ",\"demand_activations\":" +
+            std::to_string(counters.demand_activations);
+    line += ",\"demand_completions\":" +
+            std::to_string(counters.demand_completions);
+    line += ",\"stale_pending_canceled\":" +
+            std::to_string(counters.stale_pending_canceled);
+    line += ",\"unmatched_first_use\":" +
+            std::to_string(counters.unmatched_first_use);
+    line += ",\"invariant_violations\":" +
+            std::to_string(counters.invariant_violations);
+    line += ",\"pending\":" + std::to_string(counters.pending);
+    line += ",\"active\":" + std::to_string(counters.active);
+    line += ",\"pending_objects\":" + std::to_string(counters.pending_objects);
+    line += ",\"active_objects\":" + std::to_string(counters.active_objects);
+    line += ",\"peak_pending_objects\":" +
+            std::to_string(counters.peak_pending_objects);
+    line += ",\"peak_active_objects\":" +
+            std::to_string(counters.peak_active_objects);
+    line += ",\"hint_slots_acquired\":" +
+            std::to_string(counters.hint_slots_acquired);
+    line += ",\"inflight_hint_aggregated\":" +
+            std::to_string(counters.inflight_hint_aggregated);
+    line += ",\"hint_slots_released\":" +
+            std::to_string(counters.hint_slots_released);
+    line += ",\"hint_terminal_canceled\":" +
+            std::to_string(counters.hint_terminal_canceled);
+    line += ",\"current_hint_inflight_objects\":" +
+            std::to_string(counters.current_hint_inflight_objects);
+    line += ",\"peak_hint_inflight_objects\":" +
+            std::to_string(counters.peak_hint_inflight_objects);
+    line += ",\"semantic_stale_checked\":" +
+            std::to_string(counters.semantic_stale_checked);
+    line += ",\"semantic_stale_kept_live\":" +
+            std::to_string(counters.semantic_stale_kept_live);
+    line += ",\"semantic_stale_tasks_canceled\":" +
+            std::to_string(counters.semantic_stale_tasks_canceled);
+    line += ",\"semantic_stale_bytes_avoided\":" +
+            std::to_string(counters.semantic_stale_bytes_avoided);
+    line += ",\"working_set_budget_bytes\":" +
+            std::to_string(counters.working_set_budget_bytes);
+    line += ",\"working_set_current_bytes\":" +
+            std::to_string(counters.working_set_current_bytes);
+    line += ",\"working_set_peak_bytes\":" +
+            std::to_string(counters.working_set_peak_bytes);
+    line += ",\"working_set_objects\":" +
+            std::to_string(counters.working_set_objects);
+    line += ",\"working_set_peak_objects\":" +
+            std::to_string(counters.working_set_peak_objects);
+    line += ",\"working_set_admissions\":" +
+            std::to_string(counters.working_set_admissions);
+    line += ",\"working_set_readmissions\":" +
+            std::to_string(counters.working_set_readmissions);
+    line += ",\"working_set_evictions\":" +
+            std::to_string(counters.working_set_evictions);
+    line += ",\"working_set_evicted_bytes\":" +
+            std::to_string(counters.working_set_evicted_bytes);
+    line += ",\"working_set_protected_skips\":" +
+            std::to_string(counters.working_set_protected_skips);
+    line += ",\"budget_unresolved_due_to_protection\":" +
+            std::to_string(counters.budget_unresolved_due_to_protection);
+    line += ",\"working_set_lru_scans\":" +
+            std::to_string(counters.working_set_lru_scans);
+    line += ",\"readmission_gap_0\":" +
+            std::to_string(counters.readmission_gap_0);
+    line += ",\"readmission_gap_1\":" +
+            std::to_string(counters.readmission_gap_1);
+    line += ",\"readmission_gap_2_3\":" +
+            std::to_string(counters.readmission_gap_2_3);
+    line += ",\"readmission_gap_4_7\":" +
+            std::to_string(counters.readmission_gap_4_7);
+    line += ",\"readmission_gap_8_plus\":" +
+            std::to_string(counters.readmission_gap_8_plus);
+    line += ",\"readmission_gap_no_record\":" +
+            std::to_string(counters.readmission_gap_no_record);
+    line += ",\"readmissions_within_1_step\":" +
+            std::to_string(counters.readmissions_within_1_step);
+    line += ",\"readmissions_within_3_steps\":" +
+            std::to_string(counters.readmissions_within_3_steps);
+    line += ",\"probation_entries\":" + std::to_string(counters.probation_entries);
+    line += ",\"probation_canceled_by_readmission\":" +
+            std::to_string(counters.probation_canceled_by_readmission);
+    line += ",\"madv_cold_candidates\":" + std::to_string(counters.madv_cold_candidates);
+    line += ",\"madv_cold_issued\":" + std::to_string(counters.madv_cold_issued);
+    line += ",\"madv_cold_failed\":" + std::to_string(counters.madv_cold_failed);
+    line += ",\"madv_cold_bytes\":" + std::to_string(counters.madv_cold_bytes);
+    line += ",\"post_cold_readmissions\":" +
+            std::to_string(counters.post_cold_readmissions);
+    line += ",\"current_probation_objects\":" +
+            std::to_string(counters.current_probation_objects);
+    line += ",\"peak_probation_objects\":" +
+            std::to_string(counters.peak_probation_objects);
+    line += ",\"cold_skipped_ttl_nonzero\":" +
+            std::to_string(counters.cold_skipped_ttl_nonzero);
+    line += ",\"cold_protected_violation\":" +
+            std::to_string(counters.cold_protected_violation);
+    line += ",\"madv_cold_budget_deferred_candidates\":" +
+            std::to_string(counters.madv_cold_budget_deferred_candidates);
+    line += ",\"madv_cold_budget_deferred_bytes\":" +
+            std::to_string(counters.madv_cold_budget_deferred_bytes);
+    line += ",\"cold_eligible_candidate_bytes\":" +
+            std::to_string(counters.cold_eligible_candidate_bytes);
+    line += "}";
+    llm_mem_trace_write(LLM_MEM_TRACE_SINK_MEMORY, line.c_str(), line.size());
+}
+
+void append_runtime_rescue_window(
+        std::string & line,
+        const char * name,
+        const ExpertRuntimeRescueWindow & window) {
+    line += ",\"" + std::string(name) + "\":{\"steps\":" +
+            std::to_string(window.steps);
+    line += ",\"issued\":" + std::to_string(window.issued);
+    line += ",\"major_faults\":" + std::to_string(window.major_faults);
+    line += ",\"latency_ns\":" + std::to_string(window.latency_ns);
+    line += "}";
+}
+
+void write_expert_runtime_rescue_summary() {
+    if (!expert_runtime_rescue_enabled() ||
+            !llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_MEMORY)) {
+        return;
+    }
+    const ExpertRuntimeRescueCounters counters = expert_runtime_rescue_controller().snapshot();
+    std::string line;
+    line.reserve(800);
+    line += "{\"event\":\"EXPERT_RUNTIME_RESCUE_SUMMARY\",\"ts_ns\":" +
+            std::to_string(llm_mem_trace_time_ns());
+    line += ",\"enabled\":true";
+    line += ",\"mode\":";
+    json_escape_append(line, expert_runtime_rescue_mode_name(expert_runtime_rescue_mode()));
+    line += ",\"decode_steps_observed\":" +
+            std::to_string(counters.decode_steps_observed);
+    line += ",\"runtime_rescue_triggered\":" +
+            std::to_string(counters.runtime_rescue_triggered);
+    line += ",\"runtime_rescue_trigger_step\":" +
+            std::to_string(counters.runtime_rescue_trigger_step);
+    line += ",\"runtime_rescue_trigger_decode_step\":" +
+            std::to_string(counters.runtime_rescue_trigger_decode_step);
+    line += ",\"runtime_rescue_cold_suspended\":" +
+            std::to_string(counters.runtime_rescue_cold_suspended);
+    line += ",\"runtime_rescue_gate_bypass_steps\":" +
+            std::to_string(counters.runtime_rescue_gate_bypass_steps);
+    line += ",\"runtime_rescue_prefetch_bypassed_tasks\":" +
+            std::to_string(counters.runtime_rescue_prefetch_bypassed_tasks);
+    line += ",\"reentry_rate_percent\":" +
+            std::to_string(expert_reentry_rate_percent());
+    line += ",\"reentry_step_budget_bytes\":" +
+            std::to_string(expert_reentry_step_budget_bytes());
+    line += ",\"reentry_attempted\":" +
+            std::to_string(counters.reentry_attempted);
+    line += ",\"reentry_start_decode_step\":" +
+            std::to_string(counters.reentry_start_decode_step);
+    line += ",\"reentry_failed\":" +
+            std::to_string(counters.reentry_failed);
+    line += ",\"reentry_failure_decode_step\":" +
+            std::to_string(counters.reentry_failure_decode_step);
+    line += ",\"cold_rate_recovery_enabled\":" + std::string(
+            expert_cold_rate_recovery_requested() ? "true" : "false");
+    line += ",\"recovery_completed_step\":" +
+            std::to_string(counters.recovery_completed_step);
+    line += ",\"probe_25_start_step\":" +
+            std::to_string(counters.probe_25_start_step);
+    line += ",\"probe_50_start_step\":" +
+            std::to_string(counters.probe_50_start_step);
+    line += ",\"probe_100_start_step\":" +
+            std::to_string(counters.probe_100_start_step);
+    line += ",\"re_degradation_detected\":" +
+            std::to_string(counters.re_degradation_detected);
+    line += ",\"re_degradation_step\":" +
+            std::to_string(counters.re_degradation_step);
+    line += ",\"cold_disabled_for_run\":" +
+            std::to_string(counters.cold_disabled_for_run);
+    line += ",\"cold_disabled_reason\":";
+    json_escape_append(line, counters.cold_disabled_reason == 1 ? "RE_DEGRADATION" :
+            counters.cold_disabled_reason == 2 ? "LOW_BENEFIT" : "none");
+    line += ",\"probe_cold_issued_bytes\":" +
+            std::to_string(counters.probe_cold_issued_bytes);
+    line += ",\"benefit_check_performed\":" +
+            std::to_string(counters.benefit_check_performed);
+    line += ",\"benefit_memory_delta\":" +
+            std::to_string(counters.benefit_memory_delta);
+    line += ",\"benefit_rss_delta\":" +
+            std::to_string(counters.benefit_rss_delta);
+    line += ",\"benefit_fault_delta\":" +
+            std::to_string(counters.benefit_fault_delta);
+    append_runtime_rescue_window(line, "early_3_steps", counters.early_window);
+    append_runtime_rescue_window(line, "post_trigger_first_5", counters.post_trigger_5);
+    append_runtime_rescue_window(line, "post_trigger_first_10", counters.post_trigger_10);
+    append_runtime_rescue_window(line, "post_trigger_rest", counters.post_trigger_rest);
+    line += "}";
+    llm_mem_trace_write(LLM_MEM_TRACE_SINK_MEMORY, line.c_str(), line.size());
+}
+
+void ensure_expert_runtime_rescue_summary_registered() {
+    (void) expert_runtime_rescue_controller();
+    static const bool registered = [] {
+        std::atexit(write_expert_runtime_rescue_summary);
+        return true;
+    }();
+    (void) registered;
+}
+
+void ensure_expert_memory_object_summary_registered() {
+    (void) expert_memory_object_tracker();
+    static const bool registered = [] {
+        std::atexit(write_expert_memory_object_summary);
+        return true;
+    }();
+    (void) registered;
+}
+
+void write_expert_calibration_shadow_summary() {
+    if ((!expert_calibration_shadow_enabled() && !expert_calibrated_control_enabled()) ||
+            !llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_MEMORY)) {
+        return;
+    }
+    CalibrationSummaryContext ctx;
+    ctx.memory_current = rescue_read_memory_current();
+    ctx.memory_limit = rescue_read_memory_limit();
+    ctx.rss_bytes = rescue_read_rss_bytes();
+    ctx.working_set_budget_bytes = expert_working_set_budget_bytes();
+    expert_calibration_profile().write_summary(ctx);
+}
+
+void ensure_expert_calibration_shadow_summary_registered() {
+    (void) expert_calibration_profile();
+    static const bool registered = [] {
+        std::atexit(write_expert_calibration_shadow_summary);
+        return true;
+    }();
+    (void) registered;
+}
+
 void append_stage_duration_map(
         std::string & line,
         const char * field,
@@ -1802,6 +3213,16 @@ void write_expert_task_skip(const ExpertHintTask & task, const char * action, co
                         task.layer, task.expert, task.addr, task.nbytes, 0, 0, 0, 0, &meta);
 }
 
+void release_expert_task_hint_slot(
+        const ExpertHintTask & task,
+        bool terminal_canceled) {
+    if (!task.memory_object_hint_slot_acquired) {
+        return;
+    }
+    expert_memory_object_tracker().release_hint_slot(
+            task.layer, task.expert, task.tensor_name, terminal_canceled);
+}
+
 uint64_t issue_expert_hint_task(ExpertHintTask & task) {
     if (expert_task_detail_events_enabled()) {
         task.issue_id = next_expert_issue_id();
@@ -1832,7 +3253,19 @@ uint64_t issue_expert_hint_task(ExpertHintTask & task) {
     const uint64_t end = llm_mem_trace_time_ns();
     const uint64_t duration = end >= begin ? end - begin : 0;
     expert_timing_model().observe_syscall(duration);
+    if (expert_runtime_rescue_enabled()) {
+        expert_runtime_rescue_controller().record_prefetch_issued(task.phase, task.step);
+    }
+    // Phase 2E-A: count issued prefetch (observation-only, gated on calibration only).
+    // Phase 2E-B: calibrated control also feeds the profile.
+    if (expert_calibration_shadow_enabled() || expert_calibrated_control_enabled()) {
+        expert_calibration_profile().record_prefetch_issued(task.phase);
+    }
+    if (expert_calibrated_control_enabled()) {
+        expert_calibrated_controller().record_prefetch_issued(task.phase);
+    }
     transition_expert_task(task.lifecycle, ExpertTaskEvent::Issue, nullptr, begin, end);
+    release_expert_task_hint_slot(task, false);
     return duration;
 }
 
@@ -1995,18 +3428,43 @@ struct ExpertHintQueue {
                         task.lifecycle, ExpertTaskEvent::Cancel, "pressure_changed");
                 write_expert_task_skip(
                         task, "expert_prefetch_cancel_pressure", "pressure_changed");
+                release_expert_task_hint_slot(task, true);
                 std::lock_guard<std::mutex> lock(mu);
                 cancelled_pressure++;
                 continue;
             }
             if (expert_task_below_value_threshold(task)) {
-                transition_expert_task(
-                        task.lifecycle, ExpertTaskEvent::Cancel, "value_changed");
-                write_expert_task_skip(
-                        task, "expert_prefetch_cancel_value", "value_changed");
-                std::lock_guard<std::mutex> lock(mu);
-                cancelled_value++;
-                continue;
+                // R2 deliberately overrides only this value re-check.  Pressure,
+                // queue, semantic-stale, lifecycle and hint-slot safeguards stay
+                // on their normal paths.
+                if (expert_value_gate_bypass_active_any(task.phase)) {
+                    expert_runtime_rescue_controller().record_value_gate_bypass();
+                } else {
+                    transition_expert_task(
+                            task.lifecycle, ExpertTaskEvent::Cancel, "value_changed");
+                    write_expert_task_skip(
+                            task, "expert_prefetch_cancel_value", "value_changed");
+                    release_expert_task_hint_slot(task, true);
+                    std::lock_guard<std::mutex> lock(mu);
+                    cancelled_value++;
+                    continue;
+                }
+            }
+
+            if (expert_semantic_stale_cancel_enabled() &&
+                    expert_route_hint_ttl_steps_for_phase(task.phase) == 0) {
+                const bool live = expert_memory_object_tracker().has_live_demand(
+                        task.layer, task.expert, task.tensor_name);
+                expert_memory_object_tracker().record_semantic_stale_check(live);
+                if (!live) {
+                    transition_expert_task(
+                            task.lifecycle, ExpertTaskEvent::Cancel, "semantic_stale");
+                    write_expert_task_skip(
+                            task, "expert_prefetch_cancel_semantic_stale", "semantic_stale");
+                    expert_memory_object_tracker().record_semantic_stale_cancel(task.nbytes);
+                    release_expert_task_hint_slot(task, true);
+                    continue;
+                }
             }
 
             task.predicted_service_ns =
@@ -2215,12 +3673,24 @@ ExpertTaskGateResult prepare_expert_hint_task(ExpertHintTask & task) {
     }
 
     if (expert_task_below_value_threshold(task)) {
-        return ExpertTaskGateResult::Value;
+        if (expert_value_gate_bypass_active_any(task.phase)) {
+            expert_runtime_rescue_controller().record_value_gate_bypass();
+        } else {
+            return ExpertTaskGateResult::Value;
+        }
     }
     return ExpertTaskGateResult::Accept;
 }
 
 bool submit_expert_hint_task(ExpertHintTask && task) {
+    // Phase 2E-A: count every DECODE prefetch opportunity BEFORE gates.
+    // Phase 2E-B: calibrated control also feeds the profile.
+    if (expert_calibration_shadow_enabled() || expert_calibrated_control_enabled()) {
+        expert_calibration_profile().record_prefetch_opportunity(task.phase);
+    }
+    if (expert_calibrated_control_enabled()) {
+        expert_calibrated_controller().record_prefetch_opportunity(task.phase);
+    }
     const ExpertTaskGateResult gate = prepare_expert_hint_task(task);
     if (gate == ExpertTaskGateResult::Pressure) {
         transition_expert_task(task.lifecycle, ExpertTaskEvent::Reject, "pressure_budget");
@@ -2228,6 +3698,7 @@ bool submit_expert_hint_task(ExpertHintTask && task) {
         if (expert_prefetch_async_enabled()) {
             expert_hint_queue().record_cancelled_pressure();
         }
+        release_expert_task_hint_slot(task, true);
         return false;
     }
     if (gate == ExpertTaskGateResult::Value) {
@@ -2236,6 +3707,7 @@ bool submit_expert_hint_task(ExpertHintTask && task) {
         if (expert_prefetch_async_enabled()) {
             expert_hint_queue().record_cancelled_value();
         }
+        release_expert_task_hint_slot(task, true);
         return false;
     }
     transition_expert_task(task.lifecycle, ExpertTaskEvent::Admit);
@@ -2252,6 +3724,7 @@ bool submit_expert_hint_task(ExpertHintTask && task) {
             expert_hint_queue().record_cancelled_queue_full();
             transition_expert_task(task.lifecycle, ExpertTaskEvent::Cancel, "queue_full");
             write_expert_task_skip(task, "expert_prefetch_cancel_queue_full", "queue_full");
+            release_expert_task_hint_slot(task, true);
             return false;
         }
         expert_hint_queue().record_fallback();
@@ -2457,6 +3930,100 @@ struct LayerTracker {
             return;
         }
 
+        if (expert_memory_objects_enabled()) {
+            const int cold_mode = expert_runtime_rescue_cold_issue_mode();
+            const bool calibrated = expert_calibrated_control_enabled() &&
+                    expert_madv_cold_reclaim_enabled();
+            const int cal_mode = calibrated ?
+                    expert_calibrated_controller().cold_issue_mode() : -1;
+            if (calibrated && cal_mode == 3) {
+                // Phase 2E-B scan-only: keep eligible-bytes observation, defer all,
+                // never mark episodes, never call madvise.
+                if (expert_route_hint_ttl_steps_for_phase(llm_mem_trace_get_phase()) != 0) {
+                    expert_memory_object_tracker().end_layer(layer);
+                    expert_memory_object_tracker().record_cold_skipped_ttl_nonzero();
+                } else {
+                    (void) expert_memory_object_tracker().end_layer_and_collect_madv_cold_candidates(
+                            layer, step, expert_madv_cold_reclaim_grace_steps(), 1);
+                }
+            } else if (calibrated && cal_mode == 2) {
+                const std::vector<ExpertMadVColdCandidate> candidates =
+                        expert_memory_object_tracker().end_layer_and_collect_madv_cold_candidates(
+                                layer, step, expert_madv_cold_reclaim_grace_steps(),
+                                expert_calibrated_controller().cold_budget_remaining());
+                if (!candidates.empty()) {
+                    uint64_t committed = 0;
+                    for (const ExpertMadVColdCandidate & candidate : candidates) {
+                        committed += (uint64_t) candidate.nbytes;
+                    }
+                    expert_calibrated_controller().cold_budget_commit(committed);
+                }
+                for (const ExpertMadVColdCandidate & candidate : candidates) {
+#ifdef __linux__
+#ifdef MADV_COLD
+                    const int rc = apply_madvise_hint(
+                            "expert_madvise_cold",
+                            MADV_COLD,
+                            "expert_probation_reclaim",
+                            candidate.tensor.c_str(),
+                            candidate.layer,
+                            candidate.expert,
+                            candidate.addr,
+                            candidate.nbytes);
+                    expert_memory_object_tracker().record_madv_cold_result(
+                            rc == 0, candidate.nbytes);
+#else
+                    expert_memory_object_tracker().record_madv_cold_result(false, candidate.nbytes);
+#endif
+#else
+                    expert_memory_object_tracker().record_madv_cold_result(false, candidate.nbytes);
+#endif
+                }
+            } else if (expert_madv_cold_reclaim_enabled() && cold_mode != 1) {
+                if (expert_route_hint_ttl_steps_for_phase(llm_mem_trace_get_phase()) != 0) {
+                    expert_memory_object_tracker().end_layer(layer);
+                    expert_memory_object_tracker().record_cold_skipped_ttl_nonzero();
+                } else {
+                    const uint64_t max_collect_bytes = cold_mode == 2 ?
+                            expert_runtime_rescue_controller().reentry_budget_remaining() : 0;
+                    const std::vector<ExpertMadVColdCandidate> candidates =
+                            expert_memory_object_tracker().end_layer_and_collect_madv_cold_candidates(
+                                    layer, step, expert_madv_cold_reclaim_grace_steps(),
+                                    max_collect_bytes);
+                    if (cold_mode == 2 && !candidates.empty()) {
+                        uint64_t committed = 0;
+                        for (const ExpertMadVColdCandidate & candidate : candidates) {
+                            committed += (uint64_t) candidate.nbytes;
+                        }
+                        expert_runtime_rescue_controller().reentry_budget_commit(committed);
+                    }
+                    for (const ExpertMadVColdCandidate & candidate : candidates) {
+#ifdef __linux__
+#ifdef MADV_COLD
+                        const int rc = apply_madvise_hint(
+                                "expert_madvise_cold",
+                                MADV_COLD,
+                                "expert_probation_reclaim",
+                                candidate.tensor.c_str(),
+                                candidate.layer,
+                                candidate.expert,
+                                candidate.addr,
+                                candidate.nbytes);
+                        expert_memory_object_tracker().record_madv_cold_result(
+                                rc == 0, candidate.nbytes);
+#else
+                        expert_memory_object_tracker().record_madv_cold_result(false, candidate.nbytes);
+#endif
+#else
+                        expert_memory_object_tracker().record_madv_cold_result(false, candidate.nbytes);
+#endif
+                    }
+                }
+            } else {
+                expert_memory_object_tracker().end_layer(layer);
+            }
+        }
+
         const uint64_t ts = llm_mem_trace_time_ns();
         expert_timing_model().on_layer_end(step, layer, llm_mem_trace_get_phase(), ts);
         std::string line;
@@ -2507,13 +4074,18 @@ int read_expert_id(const ggml_tensor * ids, int64_t index0, int64_t index1) {
 }
 
 void observe_expert_logical_first_use(const ggml_tensor * operation) {
-    if (expert_task_trace_mode() == ExpertTaskTraceMode::Off || !operation ||
+    const bool observe_tasks = expert_task_trace_mode() != ExpertTaskTraceMode::Off;
+    const bool observe_memory_objects = expert_memory_objects_enabled();
+    if ((!observe_tasks && !observe_memory_objects) || !operation ||
             operation->op != GGML_OP_MUL_MAT_ID) {
         return;
     }
-    if (expert_task_trace_mode() != ExpertTaskTraceMode::Off) {
+    if (observe_tasks) {
         ensure_expert_task_summary_registered();
         ensure_expert_first_use_summary_registered();
+    }
+    if (observe_memory_objects) {
+        ensure_expert_memory_object_summary_registered();
     }
     const ggml_tensor * weights = operation->src[0];
     const ggml_tensor * ids = operation->src[2];
@@ -2554,6 +4126,13 @@ void observe_expert_logical_first_use(const ggml_tensor * operation) {
         if (!expert_slice_range(info, expert, slice_addr, slice_bytes)) {
             continue;
         }
+        if (observe_memory_objects) {
+            expert_memory_object_tracker().observe_first_use(
+                    step, info.layer, expert, info.name);
+        }
+        if (!observe_tasks) {
+            continue;
+        }
         ExpertFirstUseObservation use;
         use.step = step;
         use.layer = info.layer;
@@ -2570,6 +4149,47 @@ void observe_expert_logical_first_use(const ggml_tensor * operation) {
 }
 
 } // namespace
+
+extern "C" void llm_mem_trace_runtime_rescue_step_end(uint64_t latency_ns) {
+    // Phase 2E-A: shadow calibration step-end (observation-only, NOT gated on rescue).
+    // Phase 2E-B: calibrated control also requires the profile to run.
+    if (expert_calibration_shadow_enabled() || expert_calibrated_control_enabled()) {
+        ensure_expert_calibration_shadow_summary_registered();
+        const ExpertMemoryObjectCounters counters =
+                expert_memory_object_tracker().counters();
+        CalibrationStepContext ctx;
+        if (expert_calibrated_control_enabled()) {
+            ctx.rescue_state_safe =
+                    expert_calibrated_controller().state_allows_calibration();
+        } else {
+            ctx.rescue_state_safe = !expert_runtime_rescue_enabled() ||
+                    expert_runtime_rescue_controller().state_allows_calibration();
+        }
+        ctx.current_major_faults = current_major_fault_count();
+        ctx.cumulative_cold_eligible_bytes = counters.cold_eligible_candidate_bytes;
+        ctx.invariant_violations = counters.invariant_violations;
+        ctx.cold_protected_violation = counters.cold_protected_violation;
+        ctx.madv_cold_failed = counters.madv_cold_failed;
+        ctx.pending = counters.pending;
+        ctx.active = counters.active;
+        ctx.current_hint_inflight_objects = counters.current_hint_inflight_objects;
+        expert_calibration_profile().on_step_end(
+                llm_mem_trace_get_phase(), llm_mem_trace_get_step(), latency_ns, ctx);
+    }
+
+    if (expert_calibrated_control_enabled()) {
+        ensure_expert_calibrated_control_summary_registered();
+        expert_calibrated_controller().on_step_end(
+                llm_mem_trace_get_phase(), llm_mem_trace_get_step(), latency_ns);
+    }
+
+    if (!expert_runtime_rescue_enabled()) {
+        return;
+    }
+    ensure_expert_runtime_rescue_summary_registered();
+    expert_runtime_rescue_controller().on_step_end(
+            llm_mem_trace_get_phase(), llm_mem_trace_get_step(), latency_ns);
+}
 
 extern "C" void llm_mem_trace_tensor_begin(const ggml_tensor * t) {
     if (!llm_mem_trace_enabled() || !t) {
@@ -2656,7 +4276,10 @@ extern "C" void llm_mem_trace_tensor_loaded(const ggml_tensor * t, const char * 
 }
 
 extern "C" void llm_mem_trace_prefetch_expert_layer(int layer, int token_idx, const int * experts, const float * scores, int n_experts, const char * reason) {
-    if (!os_hints_enabled() || !os_hint_opt_enabled("LLM_MEM_TRACE_OPT_EXPERT_PREFETCH") ||
+    const bool prefetch_enabled =
+            os_hints_enabled() && os_hint_opt_enabled("LLM_MEM_TRACE_OPT_EXPERT_PREFETCH");
+    const bool observe_memory_objects = expert_memory_objects_enabled();
+    if ((!prefetch_enabled && !observe_memory_objects) ||
             layer < 0 || !experts || n_experts <= 0) {
         return;
     }
@@ -2671,14 +4294,20 @@ extern "C" void llm_mem_trace_prefetch_expert_layer(int layer, int token_idx, co
     const uint64_t route_hint_ttl = expert_route_hint_ttl_steps_for_phase(phase);
     const int topk = expert_prefetch_topk_for_phase(phase);
     const int limit = topk > 0 ? std::min(n_experts, topk) : n_experts;
+    const int observation_limit = observe_memory_objects ? n_experts : limit;
     (void) token_idx;
-    static const bool registered = [] {
-        std::atexit(write_expert_route_hint_summary);
-        return true;
-    }();
-    (void) registered;
+    if (prefetch_enabled) {
+        static const bool registered = [] {
+            std::atexit(write_expert_route_hint_summary);
+            return true;
+        }();
+        (void) registered;
+    }
+    if (observe_memory_objects) {
+        ensure_expert_memory_object_summary_registered();
+    }
 
-    for (int i = 0; i < limit; ++i) {
+    for (int i = 0; i < observation_limit; ++i) {
         const int expert = experts[i];
         if (expert < 0) {
             continue;
@@ -2693,6 +4322,13 @@ extern "C" void llm_mem_trace_prefetch_expert_layer(int layer, int token_idx, co
             if (!expert_slice_range(info, expert, slice_addr, slice_bytes)) {
                 continue;
             }
+            if (observe_memory_objects) {
+                expert_memory_object_tracker().register_demand(
+                        step, layer, expert, info.name, slice_addr, slice_bytes);
+            }
+            if (!prefetch_enabled || i >= limit) {
+                continue;
+            }
             if (!os_hint_size_allowed(slice_bytes)) {
                 continue;
             }
@@ -2701,7 +4337,14 @@ extern "C" void llm_mem_trace_prefetch_expert_layer(int layer, int token_idx, co
                 continue;
             }
 
-            submit_expert_hint_task(make_expert_hint_task(
+            const bool hint_slot_acquired = expert_inflight_hint_aggregation_enabled() &&
+                    expert_memory_object_tracker().try_acquire_hint_slot(
+                            layer, expert, info.name);
+            if (expert_inflight_hint_aggregation_enabled() && !hint_slot_acquired) {
+                continue;
+            }
+
+            ExpertHintTask task = make_expert_hint_task(
                     "expert_madvise_willneed",
                     "expert_posix_fadvise_willneed",
                     reason,
@@ -2711,7 +4354,9 @@ extern "C" void llm_mem_trace_prefetch_expert_layer(int layer, int token_idx, co
                     slice_addr,
                     slice_bytes,
                     score,
-                    confidence));
+                    confidence);
+            task.memory_object_hint_slot_acquired = hint_slot_acquired;
+            submit_expert_hint_task(std::move(task));
         }
     }
 }

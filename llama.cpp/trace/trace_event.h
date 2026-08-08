@@ -39,6 +39,7 @@ int  llm_mem_trace_get_phase(void);
 uint64_t llm_mem_trace_get_step(void);
 void llm_mem_trace_step_begin(void);
 void llm_mem_trace_step_end(void);
+void llm_mem_trace_runtime_rescue_step_end(uint64_t latency_ns);
 
 void llm_mem_trace_token_begin(int token_idx);
 void llm_mem_trace_token_end(int token_idx);
@@ -73,6 +74,7 @@ static inline int  llm_mem_trace_get_phase(void) { return LLM_MEM_TRACE_PHASE_UN
 static inline uint64_t llm_mem_trace_get_step(void) { return 0; }
 static inline void llm_mem_trace_step_begin(void) {}
 static inline void llm_mem_trace_step_end(void) {}
+static inline void llm_mem_trace_runtime_rescue_step_end(uint64_t latency_ns) { (void) latency_ns; }
 
 static inline void llm_mem_trace_token_begin(int token_idx) { (void) token_idx; }
 static inline void llm_mem_trace_token_end(int token_idx) { (void) token_idx; }

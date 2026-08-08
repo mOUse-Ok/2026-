@@ -395,6 +395,7 @@ extern "C" void llm_mem_trace_step_end(void) {
     line += ",\"latency_ns\":" + std::to_string(ts - start_ts) + "}";
     llm_mem_trace_write(LLM_MEM_TRACE_SINK_MEMORY, line.c_str(), line.size());
     llm_mem_trace_memory_sample("step_end");
+    llm_mem_trace_runtime_rescue_step_end(ts - start_ts);
 }
 
 extern "C" void llm_mem_trace_token_begin(int token_idx) {
