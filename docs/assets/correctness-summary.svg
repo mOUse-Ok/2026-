@@ -1,0 +1,146 @@
+<?xml version="1.0" encoding="utf-8" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN"
+  "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg xmlns:xlink="http://www.w3.org/1999/xlink" width="686.88pt" height="336.087pt" viewBox="0 0 686.88 336.087" xmlns="http://www.w3.org/2000/svg" version="1.1">
+ <metadata>
+  <rdf:RDF xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:cc="http://creativecommons.org/ns#" xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+   <cc:Work>
+    <dc:type rdf:resource="http://purl.org/dc/dcmitype/StillImage"/>
+    <dc:date>2026-08-10T10:36:20.952840</dc:date>
+    <dc:format>image/svg+xml</dc:format>
+    <dc:creator>
+     <cc:Agent>
+      <dc:title>Matplotlib v3.10.9, https://matplotlib.org/</dc:title>
+     </cc:Agent>
+    </dc:creator>
+   </cc:Work>
+  </rdf:RDF>
+ </metadata>
+ <defs>
+  <style type="text/css">*{stroke-linejoin: round; stroke-linecap: butt}</style>
+ </defs>
+ <g id="figure_1">
+  <g id="patch_1">
+   <path d="M 0 336.087 
+L 686.88 336.087 
+L 686.88 0 
+L 0 0 
+z
+" style="fill: #ffffff"/>
+  </g>
+  <g id="axes_1">
+   <g id="patch_2">
+    <path d="M 37.4328 257.514984 
+L 133.8552 257.514984 
+Q 147.2472 257.514984 147.2472 251.638344 
+L 147.2472 129.991896 
+Q 147.2472 124.115256 133.8552 124.115256 
+L 37.4328 124.115256 
+Q 24.0408 124.115256 24.0408 129.991896 
+L 24.0408 251.638344 
+Q 24.0408 257.514984 37.4328 257.514984 
+z
+" clip-path="url(#p195d027513)" style="fill: #e9f4f2; stroke: #2e7d78; stroke-width: 1.25; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_3">
+    <path d="M 165.996 257.514984 
+L 262.4184 257.514984 
+Q 275.8104 257.514984 275.8104 251.638344 
+L 275.8104 129.991896 
+Q 275.8104 124.115256 262.4184 124.115256 
+L 165.996 124.115256 
+Q 152.604 124.115256 152.604 129.991896 
+L 152.604 251.638344 
+Q 152.604 257.514984 165.996 257.514984 
+z
+" clip-path="url(#p195d027513)" style="fill: #e9f4f2; stroke: #2e7d78; stroke-width: 1.25; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_4">
+    <path d="M 294.5592 257.514984 
+L 390.9816 257.514984 
+Q 404.3736 257.514984 404.3736 251.638344 
+L 404.3736 129.991896 
+Q 404.3736 124.115256 390.9816 124.115256 
+L 294.5592 124.115256 
+Q 281.1672 124.115256 281.1672 129.991896 
+L 281.1672 251.638344 
+Q 281.1672 257.514984 294.5592 257.514984 
+z
+" clip-path="url(#p195d027513)" style="fill: #e9f4f2; stroke: #2e7d78; stroke-width: 1.25; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_5">
+    <path d="M 423.1224 257.514984 
+L 519.5448 257.514984 
+Q 532.9368 257.514984 532.9368 251.638344 
+L 532.9368 129.991896 
+Q 532.9368 124.115256 519.5448 124.115256 
+L 423.1224 124.115256 
+Q 409.7304 124.115256 409.7304 129.991896 
+L 409.7304 251.638344 
+Q 409.7304 257.514984 423.1224 257.514984 
+z
+" clip-path="url(#p195d027513)" style="fill: #e9f4f2; stroke: #2e7d78; stroke-width: 1.25; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_6">
+    <path d="M 551.6856 257.514984 
+L 648.108 257.514984 
+Q 661.5 257.514984 661.5 251.638344 
+L 661.5 129.991896 
+Q 661.5 124.115256 648.108 124.115256 
+L 551.6856 124.115256 
+Q 538.2936 124.115256 538.2936 129.991896 
+L 538.2936 251.638344 
+Q 538.2936 257.514984 551.6856 257.514984 
+z
+" clip-path="url(#p195d027513)" style="fill: #e9f4f2; stroke: #2e7d78; stroke-width: 1.25; stroke-linejoin: miter"/>
+   </g>
+   <g id="text_1">
+    <text style="font-weight: 700; font-size: 18px; font-family: 'Noto Sans CJK JP'; text-anchor: middle; fill: #183a5a" x="85.644" y="174.024439" transform="rotate(-0 85.644 174.024439)">38 / 38</text>
+   </g>
+   <g id="text_2">
+    <text style="font-size: 9.5px; font-family: 'Noto Sans CJK JP'; fill: #1f2933" transform="translate(61.869508 215.796926)">Qwen runs</text>
+    <text style="font-size: 9.5px; font-family: 'Noto Sans CJK JP'; fill: #1f2933" transform="translate(58.206813 227.046707)">exit code = 0</text>
+   </g>
+   <g id="text_3">
+    <text style="font-weight: 700; font-size: 18px; font-family: 'Noto Sans CJK JP'; text-anchor: middle; fill: #183a5a" x="214.2072" y="174.024439" transform="rotate(-0 214.2072 174.024439)">38 / 38</text>
+   </g>
+   <g id="text_4">
+    <text style="font-size: 9.5px; font-family: 'Noto Sans CJK JP'; fill: #1f2933" transform="translate(179.237552 215.796926)">output SHA-256</text>
+    <text style="font-size: 9.5px; font-family: 'Noto Sans CJK JP'; fill: #1f2933" transform="translate(194.883606 227.046707)">identical</text>
+   </g>
+   <g id="text_5">
+    <text style="font-weight: 700; font-size: 18px; font-family: 'Noto Sans CJK JP'; text-anchor: middle; fill: #183a5a" x="342.7704" y="174.024439" transform="rotate(-0 342.7704 174.024439)">33 / 33</text>
+   </g>
+   <g id="text_6">
+    <text style="font-size: 9.5px; font-family: 'Noto Sans CJK JP'; fill: #1f2933" transform="translate(320.497353 215.796926)">trace runs</text>
+    <text style="font-size: 9.5px; font-family: 'Noto Sans CJK JP'; fill: #1f2933" transform="translate(297.250556 227.046707)">zero dropped events</text>
+   </g>
+   <g id="text_7">
+    <text style="font-weight: 700; font-size: 18px; font-family: 'Noto Sans CJK JP'; text-anchor: middle; fill: #183a5a" x="471.3336" y="174.024439" transform="rotate(-0 471.3336 174.024439)">0 / 0 / 0</text>
+   </g>
+   <g id="text_8">
+    <text style="font-size: 9.5px; font-family: 'Noto Sans CJK JP'; fill: #1f2933" transform="translate(437.575202 215.635871)">Memory Object</text>
+    <text style="font-size: 9.5px; font-family: 'Noto Sans CJK JP'; fill: #1f2933" transform="translate(409.971764 227.008855)">pending / active / violations</text>
+   </g>
+   <g id="text_9">
+    <text style="font-weight: 700; font-size: 18px; font-family: 'Noto Sans CJK JP'; text-anchor: middle; fill: #183a5a" x="599.8968" y="174.024439" transform="rotate(-0 599.8968 174.024439)">5 / 5</text>
+   </g>
+   <g id="text_10">
+    <text style="font-size: 9.5px; font-family: 'Noto Sans CJK JP'; fill: #1f2933" transform="translate(567.324417 215.697473)">targeted CTest</text>
+    <text style="font-size: 9.5px; font-family: 'Noto Sans CJK JP'; fill: #1f2933" transform="translate(584.255198 227.14616)">passed</text>
+   </g>
+   <g id="text_11">
+    <text style="font-size: 9px; font-family: 'Noto Sans CJK JP'; fill: #667085" transform="translate(32.076 287.406113)">证据范围：final-readme-evidence-v2 的 38 个 fresh Qwen runs。</text>
+    <text style="font-size: 9px; font-family: 'Noto Sans CJK JP'; fill: #667085" transform="translate(32.076 298.0638)">这些检查说明输出一致、trace 完整和状态收尾；不构成性能或跨环境泛化主张。</text>
+   </g>
+   <g id="text_12">
+    <text style="font-weight: 700; font-size: 16px; font-family: 'Noto Sans CJK JP'; text-anchor: start; fill: #1f2933" x="8.64" y="21.615" transform="rotate(-0 8.64 21.615)">Correctness / Reliability Summary</text>
+   </g>
+  </g>
+ </g>
+ <defs>
+  <clipPath id="p195d027513">
+   <rect x="8.64" y="33.615" width="669.6" height="293.832"/>
+  </clipPath>
+ </defs>
+</svg>
