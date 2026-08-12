@@ -80,3 +80,11 @@ llmop_draft.tex
 
 # Local experiments and large trace artifacts
 experiments/
+
+# Local presentation artifacts
+slides/
+slides-*/
+
+# Local test artifacts
+test/
+test-*/
