@@ -4,6 +4,11 @@
 
 本项目的测试同时覆盖功能正确性、实验数据完整性和性能结论可信度。测试不只检查程序能否运行，还检查一次实验是否具备可比较条件：代码版本、模型、输入、推理参数、缓存状态、内存限制和 trace 完整性必须可追溯。
 
+本文后半部分保留了 7 月阶段的 M1～M4A.1 历史验证记录。8 月 7 日之后代码
+进行了明显收敛：当前 pipeline 只接受 `off` 和 `expert_prefetch`，旧的
+`feedback_slack`、Stage priority、连续 aging 等路线不再作为当前测试入口。最新的
+Memory Object、Calibration Shadow 和 Residency Attribution 以新增的语义/观测链路为主，暂不据此宣称端到端性能收益。
+
 ## 2. 测试环境
 
 - 操作系统：Linux，使用 cgroup v2 的实验需启用统一层级。
@@ -157,7 +162,7 @@ dry-run 应显示四种方案在相邻重复轮次中的位置轮换，并打印
 
 本次 smoke 只出现 3 个 prefill step，没有形成 decode 样本，因此仅证明流水线和证据产物可用，不作为性能结论。正式 N=8 矩阵未在本轮自动执行。
 
-## 10. 双反馈与预测功能验证（2026-07-11）
+## 10. 历史验证：双反馈与预测功能（2026-07-11）
 
 使用 `feedback_slack_predict`、`TRACE_PROFILE=benchmark`、`CACHE_MODE=as-is`、`NUM_TOKENS_PREDICT=1` 完成功能 smoke：
 
@@ -207,7 +212,7 @@ summary/off 使用相同 8-token benchmark、as-is 缓存和既有 prefetch 配�
 
 off 第 3 次 wall time 为 48.44 s，显示 as-is 运行仍有明显换页长尾；因此 wall time 的负增量不解释为 summary 收益。Decode 吞吐和 p95 均未达到文档中的 1%/2%建议门槛，当前 summary 只能视为功能已验证，开销仍需在固定缓存和 delegated cgroup 条件下继续测量或优化。
 
-## 13. M2.5 离线 Stage Scheduling Opportunity Analysis（2026-07-14）
+## 13. 历史验证：M2.5 离线 Stage Scheduling Opportunity Analysis（2026-07-14）
 
 本轮仅在 detail Task 中补充既有 `sequence` 和 `deadline_ts_ns` 的观测输出，并增加独立 Python 离线分析器；C++ comparator、Admission、coalescing、TTL、worker 数量、Slack、Pressure Control 和 Task 生成范围均未修改。新 Evidence 使用仓库现有 `feedback_slack` 配置，因此观测基线确认为 `deadline_score`、priority heap 开启、4 workers。1980 个进入模拟的 Task 全部具有 trace sequence、非零 deadline、真实 ENQUEUE 和 ISSUE→RETURN service duration；26,245 个未入队的 policy reject 和 77 个未 ISSUE 的 cancelled Task 被显式排除。四个 sink 均零丢失。
 
@@ -227,7 +232,7 @@ off 第 3 次 wall time 为 48.44 s，显示 as-is 运行仍有明显换页长�
 
 验证状态：原有 14 项 Python 回归与 8 项新增测试共 22 项全部通过，新增用例覆盖多 worker、相同时间戳、无 inversion、全部 inversion、下一层不可越过当前层和 LATE 饥饿。使用同一 `b26-534942c` 二进制、相同 prompt/seed/3-token 参数的 controller-off 与 `feedback_slack` Evidence 原始输出 SHA-256 完全一致，均为 `3bc92c7b0a1b2a743f4e73623ed811d5e3fff83cc8c7485183fbebf910167a24`。
 
-## 14. 运行时 Stage-aware priority（2026-07-14）
+## 14. 历史验证：运行时 Stage-aware priority（2026-07-14）
 
 新增独立 `stage_deadline_score`，原有 `score/deadline/deadline_score` 保持可选且默认仍为 `score`。已知阶段固定按 step、layer、EARLY/LATE、route score、sequence 排序；UNKNOWN 使用独立 legacy heap，并以原 `deadline_score` 和已知阶段堆头仲裁，不降级或跳过。实现没有增加 Slack Admission、Top-K 缩减或 Chunk 切分。
 
@@ -239,7 +244,7 @@ Trace-On/Trace-Off Release 构建、两项 C++ 定向测试和 24 项 Python 回
 
 相同 workload 的单次 legacy `deadline_score` smoke 中，EARLY deadline-late=1,258、平均/最大 wait=16.65/63.42 ms，LATE=626、16.53/58.15 ms。新 mode 的 Early 指标改善但 Late 平均等待增加约 82.5%、最大等待和 deadline-late 均增加约 26%，明确触发 Late 风险信号；同时两种 mode 的输出 hash 完全一致，均为 `fd0bcd05f8bb917213fe280ce2005495452dfb7f15e6f4262d8baa3a8c8b52c4`。这两次 prefill-only、脏工作区、as-is、非交错 smoke 只用于功能与风险审计，不能据此判断端到端性能或物理内存优劣；是否接受该 Late 退化必须由独立 cold-cache、delegated-cgroup、N=8 矩阵决定。
 
-## 15. M3B 正式 A/B（2026-07-15）
+## 15. 历史验证：M3B 正式 A/B（2026-07-15）
 
 在 clean commit `34c4d15` 的同一 Trace-On binary 上完成 `deadline_score` 与 `stage_deadline_score` 正式 A/B。固定 16.35 GB 模型、prompt、seed=1234、80 个预测 token、benchmark/summary profile、cold cache、8 GiB `memory.max`、2 GiB `memory.swap.max`；为输出 PSS/Swap，两组统一启用 `smaps_rollup`。workers=2/4 各 mode N=8，mode 与 worker 顺序按 repeat 正反轮换。32/32 Run 有效，每 Run 均有 79 个 Decode STEP_END，cold-cache/cgroup 成功、输出 hash 一致、Trace drop=0、lifecycle error=0、aggregate syscall linkage error=0、cgroup OOM=0。
 
@@ -251,7 +256,7 @@ summary 不保存 task-level 分位数、Stage inversion 和分阶段 issue-afte
 
 M2.5 正确预测了 EARLY 提前、LATE 变晚和 2/4 workers 下 LATE logical first-use 仍基本 on-time 的方向，但显著低估了真实长 Decode workload 的等待重排幅度。由于 inversion/EARLY 的机制收益伴随稳定 LATE 退化，且没有 Major Fault、Decode latency 或 throughput 的一致净收益，M3B 最终结论为：**保留为实验基线**。本阶段停止，不进入 M4。
 
-## 16. M4A Stage-conditioned Shadow Slack（2026-07-16）
+## 16. 历史验证：M4A Stage-conditioned Shadow Slack（2026-07-16）
 
 本轮只实现独立 Shadow 预测、Trace/Summary 记录和离线校准。现有
 `ExpertTimingModel`、Task 状态机、Admission、Cancel、Comparator、队列元素、
@@ -330,7 +335,7 @@ Summary N=3 只证明行为等价和记录链路，不能替代 clean commit、�
 结构化报告为同目录 `m4a_summary.md`。三对等价性与第一对附带的全量 lifecycle/
 syscall linkage 结果保存在 `equivalence_r1.json`～`equivalence_r3.json`。
 
-## 17. M4A.1 Shadow Slack 语义对齐与在线校准（2026-07-16）
+## 17. 历史验证：M4A.1 Shadow Slack 语义对齐与在线校准（2026-07-16）
 
 本轮仍为 Shadow-only。实现将 DEQUEUE→RETURN 拆为 pre-issue、syscall service
 和 worker occupied，并把 Issue/Return 预测、实际 Slack、confusion matrix 与
@@ -396,3 +401,30 @@ M4A.1 工程验收为**通过**，模型结论为**需要继续改进 Shadow**�
 - `llama.cpp/trace_output/m4a1_shadow_slack_20260716_report/M4A1_shadow_slack_report.md`；
 - `llama.cpp/trace_output/m4a1_shadow_slack_20260716_report/M4A1_shadow_slack_full.json`；
 - `llama.cpp/trace_output/m4a1_shadow_slack_20260716_report/detail_model_comparison.json`。
+
+## 18. 当前 HEAD 文档同步状态（2026-08-12）
+
+8 月的代码收敛后，当前可执行的性能入口是：
+
+- `LLM_MEM_TRACE_OPT_EXPERT_CONTROLLER=off`：基础 trace/benchmark；
+- `LLM_MEM_TRACE_OPT_EXPERT_CONTROLLER=expert_prefetch`：routed-expert 异步 hint、deadline-score 和相关 gate。
+
+`feedback_slack`、`feedback_slack_predict`、`stage_deadline_score`、continuous aging
+和 reserved service 等名称只代表历史实验，不再纳入当前正式矩阵。
+
+当前新增或保留的语义观察包括：
+
+- Memory Object 的 demand、activation/completion、slot 和终态不变量；
+- Working Set / COLD candidate 与默认关闭的 Calibration Shadow；
+- `TRACE_PROFILE=attribution` 以及 `RESIDENCY_DEMAND` / `RESIDENCY_ATTRIBUTION_SUMMARY`；
+- `run_experiment_4b.sh` 对 Unlimited 与 `MemoryMax=7G` 的对象级 residency 观察。
+
+Residency Attribution 的主要结果是 demand-weighted resident/nonresident bytes、对象
+类别占比和页级摘要。它用于解释对象级驻留风险，不是 Major Fault 的因果分解；同样，
+`madvise` 成功返回也不代表物理页已经完成换入或回收。若没有新的固定环境重复数据，
+本节不写具体性能百分比。
+
+后续正式测试应先在当前 HEAD 上完成 `off`/`expert_prefetch` 的冷缓存重复矩阵，
+再分别打开 Memory Object、Calibration Shadow 或 Residency Attribution，避免把观测
+开销和控制收益混在同一组结果中。历史章节中的数据继续保留作研发记录，不与当前 HEAD
+直接合并排名。

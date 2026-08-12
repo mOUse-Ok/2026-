@@ -55,6 +55,7 @@ Question: Based on the above analysis, what are the three most critical memory b
 NUM_TOKENS_PREDICT="${NUM_TOKENS_PREDICT:-80}"  # Decode enough tokens to observe decode behavior
 NUM_THREADS="${NUM_THREADS:-8}"                 # CPU threads
 BATCH_SIZE="${BATCH_SIZE:-512}"                 # Batch size for prefill
+UBATCH_SIZE="${UBATCH_SIZE:-512}"               # Physical batch size
 CTX_SIZE="${CTX_SIZE:-2048}"                    # Context window size
 TEMP="${TEMP:-0.0}"                             # Deterministic output for reproducibility
 SEED="${SEED:-1234}"                            # Fix sampler RNG
@@ -127,6 +128,16 @@ case "$TRACE_PROFILE" in
         PROFILE_SMAPS=0
         PROFILE_EXPERT_TASK_MODE=off
         ;;
+    5a)
+        PROFILE_TENSOR=0
+        PROFILE_KV=0
+        PROFILE_EXPERT=1
+        PROFILE_MEMORY=1
+        PROFILE_RESIDENCY=0
+        PROFILE_ATTRIBUTION=0
+        PROFILE_SMAPS=0
+        PROFILE_EXPERT_TASK_MODE=detail
+        ;;
     custom)
         PROFILE_TENSOR=1
         PROFILE_KV=1
@@ -138,7 +149,7 @@ case "$TRACE_PROFILE" in
         PROFILE_EXPERT_TASK_MODE=detail
         ;;
     *)
-        echo "ERROR: TRACE_PROFILE must be evidence, benchmark, attribution, or custom" >&2
+        echo "ERROR: TRACE_PROFILE must be evidence, benchmark, attribution, 5a, or custom" >&2
         exit 1
         ;;
 esac
@@ -213,7 +224,7 @@ export LLM_MEM_TRACE=1
 export LLM_MEM_TRACE_DIR="$TRACE_OUT_DIR"
 export LLM_MEM_TRACE_RUN_ID="${LLM_MEM_TRACE_RUN_ID:-$RUN_NAME}"
 export TRACE_PROFILE CACHE_MODE
-export NUM_TOKENS_PREDICT NUM_THREADS BATCH_SIZE CTX_SIZE TEMP SEED GPU_LAYERS
+export NUM_TOKENS_PREDICT NUM_THREADS BATCH_SIZE UBATCH_SIZE CTX_SIZE TEMP SEED GPU_LAYERS
 export LLM_MEM_TRACE_TENSOR="${LLM_MEM_TRACE_TENSOR:-$PROFILE_TENSOR}"
 export LLM_MEM_TRACE_KV="${LLM_MEM_TRACE_KV:-$PROFILE_KV}"
 export LLM_MEM_TRACE_EXPERT="${LLM_MEM_TRACE_EXPERT:-$PROFILE_EXPERT}"
@@ -297,6 +308,7 @@ set +e
     -n "$NUM_TOKENS_PREDICT" \
     -t "$NUM_THREADS" \
     -b "$BATCH_SIZE" \
+    -ub "$UBATCH_SIZE" \
     -c "$CTX_SIZE" \
     --gpu-layers "$GPU_LAYERS" \
     --temp "$TEMP" \

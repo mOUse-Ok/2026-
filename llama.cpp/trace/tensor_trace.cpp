@@ -913,6 +913,205 @@ int expert_prefetch_topk_for_phase(int phase) {
     return global_topk;
 }
 
+const char * expert_prefetch_selection_policy() {
+    static const char * policy = [] {
+        const char * value = std::getenv(
+                "LLM_MEM_TRACE_OPT_EXPERT_PREFETCH_SELECTION");
+        return value && std::strcmp(value, "random") == 0 ? "random" : "router";
+    }();
+    return policy;
+}
+
+uint64_t expert_prefetch_random_seed() {
+    static const uint64_t seed = [] {
+        const char * value = std::getenv(
+                "LLM_MEM_TRACE_OPT_EXPERT_PREFETCH_RANDOM_SEED");
+        if (!value || !value[0]) {
+            value = std::getenv("PREFETCH_RANDOM_SEED");
+        }
+        if (!value || !value[0]) {
+            return uint64_t{1234};
+        }
+        char * end = nullptr;
+        const unsigned long long parsed = std::strtoull(value, &end, 10);
+        return end && *end == '\0' ? (uint64_t) parsed : uint64_t{1234};
+    }();
+    return seed;
+}
+
+uint64_t expert_prefetch_splitmix64(uint64_t value) {
+    value += 0x9e3779b97f4a7c15ull;
+    value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ull;
+    value = (value ^ (value >> 27)) * 0x94d049bb133111ebull;
+    return value ^ (value >> 31);
+}
+
+std::vector<int> expert_prefetch_targets(
+        int phase, uint64_t step, int layer, int token_idx,
+        const std::vector<ExpertTensorInfo> & tensors,
+        const int * router_experts, int router_count, int limit) {
+    std::vector<int> targets;
+    if (std::strcmp(expert_prefetch_selection_policy(), "random") != 0) {
+        for (int i = 0; i < limit && i < router_count; ++i) {
+            targets.push_back(router_experts[i]);
+        }
+        return targets;
+    }
+
+    int total_experts = 0;
+    for (const ExpertTensorInfo & info : tensors) {
+        total_experts = std::max(total_experts, (int) info.n_expert);
+    }
+    total_experts = std::max(total_experts, 256);
+    limit = std::min(limit, total_experts);
+    targets.resize((size_t) total_experts);
+    std::iota(targets.begin(), targets.end(), 0);
+    uint64_t state = expert_prefetch_random_seed();
+    state ^= (uint64_t) (phase + 1) * 0x632be59bd9b4e019ull;
+    state ^= (step + 1) * 0x8cb92baa5f1d6f47ull;
+    state ^= (uint64_t) (layer + 1) * 0x4f1bbcdc676f3a21ull;
+    state ^= (uint64_t) (token_idx + 1) * 0x94d049bb133111ebull;
+    for (int i = 0; i < limit; ++i) {
+        state = expert_prefetch_splitmix64(state);
+        const int remaining = total_experts - i;
+        const int selected = i + (int) (state % (uint64_t) remaining);
+        std::swap(targets[(size_t) i], targets[(size_t) selected]);
+    }
+    targets.resize((size_t) limit);
+    return targets;
+}
+
+const char * expert_prefetch_tensor_type(const char * name) {
+    if (name && std::strstr(name, "ffn_down_exps.weight")) {
+        return "Down";
+    }
+    if (name && (std::strstr(name, "ffn_gate_exps.weight") ||
+            std::strstr(name, "ffn_up_exps.weight") ||
+            std::strstr(name, "ffn_gate_up_exps.weight"))) {
+        return "Gate/Up";
+    }
+    return "Other";
+}
+
+struct ExpertPrefetchSelectionStats {
+    std::atomic<uint64_t> selection_events{0};
+    std::atomic<uint64_t> selected_experts{0};
+    std::atomic<uint64_t> target_events{0};
+    std::atomic<uint64_t> requested_bytes{0};
+    std::atomic<uint64_t> gate_up_bytes{0};
+    std::atomic<uint64_t> down_bytes{0};
+    std::atomic<uint64_t> eligible_targets{0};
+    std::atomic<uint64_t> dedup_skipped{0};
+    std::atomic<uint64_t> task_created{0};
+};
+
+ExpertPrefetchSelectionStats & expert_prefetch_selection_stats() {
+    static ExpertPrefetchSelectionStats stats;
+    return stats;
+}
+
+void write_expert_prefetch_selection_summary() {
+    if (!llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_MEMORY)) {
+        return;
+    }
+    const ExpertPrefetchSelectionStats & stats = expert_prefetch_selection_stats();
+    std::string line;
+    line.reserve(640);
+    line += "{\"event\":\"EXPERT_PREFETCH_SELECTION_SUMMARY\"";
+    line += ",\"selection_policy\":";
+    json_escape_append(line, expert_prefetch_selection_policy());
+    line += ",\"random_seed\":" + std::to_string(expert_prefetch_random_seed());
+    line += ",\"selection_events\":" + std::to_string(
+            stats.selection_events.load(std::memory_order_relaxed));
+    line += ",\"selected_experts\":" + std::to_string(
+            stats.selected_experts.load(std::memory_order_relaxed));
+    line += ",\"target_events\":" + std::to_string(
+            stats.target_events.load(std::memory_order_relaxed));
+    line += ",\"requested_prefetch_bytes\":" + std::to_string(
+            stats.requested_bytes.load(std::memory_order_relaxed));
+    line += ",\"gate_up_bytes\":" + std::to_string(
+            stats.gate_up_bytes.load(std::memory_order_relaxed));
+    line += ",\"down_bytes\":" + std::to_string(
+            stats.down_bytes.load(std::memory_order_relaxed));
+    line += ",\"eligible_targets\":" + std::to_string(
+            stats.eligible_targets.load(std::memory_order_relaxed));
+    line += ",\"dedup_skipped\":" + std::to_string(
+            stats.dedup_skipped.load(std::memory_order_relaxed));
+    line += ",\"task_created\":" + std::to_string(
+            stats.task_created.load(std::memory_order_relaxed));
+    line += "}";
+    llm_mem_trace_write(LLM_MEM_TRACE_SINK_MEMORY, line.c_str(), line.size());
+}
+
+void ensure_expert_prefetch_selection_summary_registered() {
+    (void) expert_prefetch_selection_stats();
+    static const bool registered = [] {
+        std::atexit(write_expert_prefetch_selection_summary);
+        return true;
+    }();
+    (void) registered;
+}
+
+void write_expert_prefetch_selection_event(
+        int phase, uint64_t step, int layer, int token_idx,
+        const std::vector<int> & router_experts,
+        const std::vector<int> & targets) {
+    if (!llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_EXPERT)) {
+        return;
+    }
+    std::string line;
+    line.reserve(256 + targets.size() * 8);
+    line += "{\"event\":\"EXPERT_PREFETCH_SELECTION\",\"phase\":";
+    json_escape_append(line, phase_name(phase));
+    line += ",\"step\":" + std::to_string(step);
+    line += ",\"layer\":" + std::to_string(layer);
+    line += ",\"token_index\":" + std::to_string(token_idx);
+    line += ",\"selection_policy\":";
+    json_escape_append(line, expert_prefetch_selection_policy());
+    line += ",\"selected_experts\":[";
+    for (size_t i = 0; i < targets.size(); ++i) {
+        if (i) line += ",";
+        line += std::to_string(targets[i]);
+    }
+    line += "],\"router_experts\":[";
+    for (size_t i = 0; i < router_experts.size(); ++i) {
+        if (i) line += ",";
+        line += std::to_string(router_experts[i]);
+    }
+    line += "]}";
+    llm_mem_trace_write(LLM_MEM_TRACE_SINK_EXPERT, line.c_str(), line.size());
+}
+
+void write_expert_prefetch_target_event(
+        int phase, uint64_t step, int layer, int token_idx, int expert,
+        const ExpertTensorInfo & info, size_t slice_bytes, bool actual_selected,
+        bool eligible, bool dedup_skipped) {
+    if (!llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_EXPERT)) {
+        return;
+    }
+    std::string line;
+    line.reserve(360);
+    line += "{\"event\":\"EXPERT_PREFETCH_TARGET\",\"phase\":";
+    json_escape_append(line, phase_name(phase));
+    line += ",\"step\":" + std::to_string(step);
+    line += ",\"layer\":" + std::to_string(layer);
+    line += ",\"token_index\":" + std::to_string(token_idx);
+    line += ",\"expert_id\":" + std::to_string(expert);
+    line += ",\"tensor\":";
+    json_escape_append(line, info.name.c_str());
+    line += ",\"tensor_type\":";
+    json_escape_append(line, expert_prefetch_tensor_type(info.name.c_str()));
+    line += ",\"bytes\":" + std::to_string(slice_bytes);
+    line += ",\"selection_policy\":";
+    json_escape_append(line, expert_prefetch_selection_policy());
+    line += ",\"actual_router_selected\":" +
+            std::string(actual_selected ? "true" : "false");
+    line += ",\"eligible\":" + std::string(eligible ? "true" : "false");
+    line += ",\"dedup_skipped\":" + std::string(dedup_skipped ? "true" : "false");
+    line += "}";
+    llm_mem_trace_write(LLM_MEM_TRACE_SINK_EXPERT, line.c_str(), line.size());
+}
+
 bool expert_prefetch_async_enabled() {
     static const bool enabled = os_hint_opt_enabled("LLM_MEM_TRACE_OPT_EXPERT_ASYNC");
     return enabled;
@@ -4397,9 +4596,17 @@ extern "C" void llm_mem_trace_prefetch_expert_layer(int layer, int token_idx, co
     const uint64_t route_hint_ttl = expert_route_hint_ttl_steps_for_phase(phase);
     const int topk = expert_prefetch_topk_for_phase(phase);
     const int limit = topk > 0 ? std::min(n_experts, topk) : n_experts;
-    const int observation_limit = observe_memory_objects ? n_experts : limit;
-    (void) token_idx;
+    const std::vector<int> router_targets(experts, experts + n_experts);
+    const std::vector<int> targets = expert_prefetch_targets(
+            phase, step, layer, token_idx, tensors, experts, n_experts, limit);
     if (prefetch_enabled) {
+        ensure_expert_prefetch_selection_summary_registered();
+        expert_prefetch_selection_stats().selection_events.fetch_add(
+                1, std::memory_order_relaxed);
+        expert_prefetch_selection_stats().selected_experts.fetch_add(
+                targets.size(), std::memory_order_relaxed);
+        write_expert_prefetch_selection_event(
+                phase, step, layer, token_idx, router_targets, targets);
         static const bool registered = [] {
             std::atexit(write_expert_route_hint_summary);
             return true;
@@ -4410,12 +4617,40 @@ extern "C" void llm_mem_trace_prefetch_expert_layer(int layer, int token_idx, co
         ensure_expert_memory_object_summary_registered();
     }
 
-    for (int i = 0; i < observation_limit; ++i) {
-        const int expert = experts[i];
+    // Memory-object demand observation always follows the real Router output;
+    // the 5A random policy is allowed to change only prefetch targets.
+    if (observe_memory_objects) {
+        for (int i = 0; i < n_experts; ++i) {
+            const int expert = experts[i];
+            if (expert < 0) {
+                continue;
+            }
+            for (const ExpertTensorInfo & info : tensors) {
+                uintptr_t slice_addr = 0;
+                size_t slice_bytes = 0;
+                if (expert_slice_range(info, expert, slice_addr, slice_bytes)) {
+                    expert_memory_object_tracker().register_demand(
+                            step, layer, expert, info.name, slice_addr, slice_bytes);
+                }
+            }
+        }
+    }
+
+    std::unordered_set<int> router_expert_set(
+            router_targets.begin(), router_targets.end());
+    for (int expert : targets) {
         if (expert < 0) {
             continue;
         }
-        const double score = scores ? (double) scores[i] : 0.0;
+        const int router_index = [&] {
+            for (int i = 0; i < n_experts; ++i) {
+                if (experts[i] == expert) return i;
+            }
+            return -1;
+        }();
+        const double score = std::strcmp(
+                expert_prefetch_selection_policy(), "router") == 0 &&
+                scores && router_index >= 0 ? (double) scores[router_index] : 0.0;
         // Routed experts are certain to execute; router weights rank their contribution,
         // but are not probabilities that the selected expert will be used.
         const double confidence = 1.0;
@@ -4425,20 +4660,46 @@ extern "C" void llm_mem_trace_prefetch_expert_layer(int layer, int token_idx, co
             if (!expert_slice_range(info, expert, slice_addr, slice_bytes)) {
                 continue;
             }
-            if (observe_memory_objects) {
-                expert_memory_object_tracker().register_demand(
-                        step, layer, expert, info.name, slice_addr, slice_bytes);
-            }
-            if (!prefetch_enabled || i >= limit) {
+            if (!prefetch_enabled) {
                 continue;
             }
-            if (!os_hint_size_allowed(slice_bytes)) {
+            const bool eligible = os_hint_size_allowed(slice_bytes);
+            const char * tensor_type = expert_prefetch_tensor_type(info.name.c_str());
+            expert_prefetch_selection_stats().target_events.fetch_add(
+                    1, std::memory_order_relaxed);
+            expert_prefetch_selection_stats().requested_bytes.fetch_add(
+                    slice_bytes, std::memory_order_relaxed);
+            if (std::strcmp(tensor_type, "Gate/Up") == 0) {
+                expert_prefetch_selection_stats().gate_up_bytes.fetch_add(
+                        slice_bytes, std::memory_order_relaxed);
+            } else if (std::strcmp(tensor_type, "Down") == 0) {
+                expert_prefetch_selection_stats().down_bytes.fetch_add(
+                        slice_bytes, std::memory_order_relaxed);
+            }
+            if (eligible) {
+                expert_prefetch_selection_stats().eligible_targets.fetch_add(
+                        1, std::memory_order_relaxed);
+            }
+
+            if (!eligible) {
+                write_expert_prefetch_target_event(
+                        phase, step, layer, token_idx, expert, info, slice_bytes,
+                        router_expert_set.count(expert) != 0, false, false);
                 continue;
             }
 
             if (!expert_tensor_registry().mark_hinted(step, layer, expert, info.addr, route_hint_ttl)) {
+                expert_prefetch_selection_stats().dedup_skipped.fetch_add(
+                        1, std::memory_order_relaxed);
+                write_expert_prefetch_target_event(
+                        phase, step, layer, token_idx, expert, info, slice_bytes,
+                        router_expert_set.count(expert) != 0, true, true);
                 continue;
             }
+
+            write_expert_prefetch_target_event(
+                    phase, step, layer, token_idx, expert, info, slice_bytes,
+                    router_expert_set.count(expert) != 0, true, false);
 
             const bool hint_slot_acquired = expert_inflight_hint_aggregation_enabled() &&
                     expert_memory_object_tracker().try_acquire_hint_slot(
@@ -4458,6 +4719,8 @@ extern "C" void llm_mem_trace_prefetch_expert_layer(int layer, int token_idx, co
                     slice_bytes,
                     score,
                     confidence);
+            expert_prefetch_selection_stats().task_created.fetch_add(
+                    1, std::memory_order_relaxed);
             task.memory_object_hint_slot_acquired = hint_slot_acquired;
             submit_expert_hint_task(std::move(task));
         }

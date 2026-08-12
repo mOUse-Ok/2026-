@@ -159,6 +159,7 @@ extern "C" void llm_mem_trace_moe_weights(const ggml_tensor * t) {
         if (layer >= 0) {
             line += ",\"layer\":" + std::to_string(layer);
         }
+        line += ",\"token_index\":" + std::to_string(tok);
         if (ubatch && ubatch->token && tok < ubatch_tokens) {
             line += ",\"token\":" + std::to_string(ubatch->token[tok]);
         }

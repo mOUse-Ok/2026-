@@ -38,6 +38,63 @@ struct SmapsRollupData {
     uint64_t swap_kb = 0;
 };
 
+std::string current_cgroup_v2_dir() {
+    FILE * fp = std::fopen("/proc/self/cgroup", "r");
+    if (!fp) {
+        return {};
+    }
+    char line[4096];
+    std::string relative;
+    while (std::fgets(line, sizeof(line), fp)) {
+        if (std::strncmp(line, "0::", 3) == 0) {
+            relative = line + 3;
+            while (!relative.empty() &&
+                    (relative.back() == '\n' || relative.back() == '\r')) {
+                relative.pop_back();
+            }
+            break;
+        }
+    }
+    std::fclose(fp);
+    if (relative.empty() || relative == "/") {
+        return "/sys/fs/cgroup";
+    }
+    return "/sys/fs/cgroup/" + (relative.front() == '/' ? relative.substr(1) : relative);
+}
+
+bool read_cgroup_workingset_refault(uint64_t & value) {
+    const std::string cgroup_dir = current_cgroup_v2_dir();
+    if (cgroup_dir.empty()) {
+        return false;
+    }
+    const std::string path = cgroup_dir + "/memory.stat";
+    FILE * fp = std::fopen(path.c_str(), "r");
+    if (!fp) {
+        return false;
+    }
+    char line[256];
+    uint64_t total = 0;
+    bool found = false;
+    while (std::fgets(line, sizeof(line), fp)) {
+        const bool is_anon = std::strncmp(line, "workingset_refault_anon ", 24) == 0;
+        const bool is_file = std::strncmp(line, "workingset_refault_file ", 24) == 0;
+        if (!is_anon && !is_file) {
+            continue;
+        }
+        char * end = nullptr;
+        const unsigned long long parsed = std::strtoull(line + 24, &end, 10);
+        if (end != line + 24) {
+            total += (uint64_t) parsed;
+            found = true;
+        }
+    }
+    std::fclose(fp);
+    if (found) {
+        value = total;
+    }
+    return found;
+}
+
 bool env_truthy(const char * value) {
     if (!value) {
         return false;
@@ -200,6 +257,17 @@ extern "C" void llm_mem_trace_memory_sample(const char * reason) {
 
     const uint64_t mmap_count = count_maps();
     const SmapsRollupData smaps = read_smaps_rollup();
+    static uint64_t previous_cgroup_refault = 0;
+    static bool have_previous_cgroup_refault = false;
+    uint64_t cgroup_refault = 0;
+    const bool have_cgroup_refault = read_cgroup_workingset_refault(cgroup_refault);
+    const uint64_t cgroup_refault_delta = have_cgroup_refault &&
+            have_previous_cgroup_refault && cgroup_refault >= previous_cgroup_refault ?
+            cgroup_refault - previous_cgroup_refault : 0;
+    if (have_cgroup_refault) {
+        previous_cgroup_refault = cgroup_refault;
+        have_previous_cgroup_refault = true;
+    }
 
     std::string line;
     line.reserve(256);
@@ -216,6 +284,12 @@ extern "C" void llm_mem_trace_memory_sample(const char * reason) {
     line += ",\"minor_faults_delta\":" + std::to_string(minflt_delta);
     line += ",\"major_faults_delta\":" + std::to_string(majflt_delta);
     line += ",\"mmap_count\":" + std::to_string(mmap_count);
+    if (have_cgroup_refault) {
+        line += ",\"cgroup_workingset_refault\":" + std::to_string(cgroup_refault);
+        line += ",\"cgroup_workingset_refault_delta\":" +
+                std::to_string(cgroup_refault_delta);
+        line += ",\"cgroup_workingset_refault_source\":\"cgroup_v2_memory.stat\"";
+    }
     if (smaps.ok) {
         line += ",\"smaps_rss_bytes\":" + std::to_string(smaps.rss_kb * 1024ull);
         line += ",\"pss_bytes\":" + std::to_string(smaps.pss_kb * 1024ull);

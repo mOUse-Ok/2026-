@@ -2,7 +2,7 @@
 
 ## 说明
 
-本文档记录初赛阶段主要开发过程、关键问题、解决方法和阶段性结论。更细粒度的本地实验流水记录保存在 `llama.cpp/trace_output/contest_runs/progress_log.md`，该路径用于本地实验记录，不提交仓库。
+本文档记录初赛阶段以及后续收敛阶段的主要开发过程、关键问题、解决方法和阶段性结论。更细粒度的本地实验流水记录保存在 `llama.cpp/trace_output/contest_runs/progress_log.md`，该路径用于本地实验记录，不提交仓库。
 
 ## 阶段 1：建立 trace 与 baseline
 
@@ -39,7 +39,7 @@ LLM 推理首次访问权重和 MoE expert slice 时存在 major faults 集中�
 
 ### 结论
 
-expert-aware prefetch 能显著降低 major faults 和 decode latency，但会提高 RSS，并产生约 10 万次 hint calls。
+早期样本曾显示 expert-aware prefetch 可能降低 major faults 和 decode latency，但同时提高 RSS 并产生大量 hint calls。该观察受实验条件影响，后续没有直接作为当前性能结论。
 
 ## 阶段 3：Expert cache 替换策略模拟
 
@@ -160,7 +160,7 @@ top-k 会显著破坏 prefetch coverage，major faults 回升明显。coalescing
 
 旧 N=3 数据可用于候选筛选，但证据强度不足以支撑最终排名。下一次正式结论必须来自 clean commit、可验证冷缓存、零丢失 trace、固定 cgroup 条件和 N=8 位置轮换矩阵。
 
-## 阶段 9：双反馈、slack 取消与成本门控预测
+## 阶段 9（历史探索）：双反馈、slack 取消与成本门控预测
 
 ### 问题
 
@@ -179,15 +179,59 @@ top-k 会显著破坏 prefetch coverage，major faults 回升明显。coalescing
 
 `feedback_slack_predict` 短 smoke 中预测 precision 为 60.13%，set hit rate 为 80.13%。当时 WSL 根 cgroup 呈高 PSI/refault，控制器共执行 636 次 hint，其中 72 次来自跨层预测，并按 slack 取消 24 项。该结果说明控制链生效，但不构成性能改善证据。
 
+## 阶段 10：控制器收敛与实验路径清理（2026-08-03～08-07）
+
+### 处理
+
+- 对专家预取任务、Router 读取同步和最大等待保护进行了最后一轮检查。
+- 回退连续 aging、reserved service、复杂 pressure/shadow 和 Stage priority 等支线。
+- 删除不再进入当前主线的实验脚本和测试，并将本地 `experiments/` 归档目录从版本控制中排除。
+
+### 阶段结论
+
+当前可执行 pipeline 收敛为 `off` 与 `expert_prefetch` 两个 controller；旧的
+`feedback_slack`、`feedback_slack_predict`、`stage_deadline_score` 等名称只保留在历史报告中。
+这次清理降低了文档和代码把实验性想法误写成稳定能力的风险。
+
+## 阶段 11：Memory Object 与 Calibration Shadow（2026-08-08）
+
+### 处理
+
+- 增加以 `(layer, expert, tensor)` 为核心的 Memory Object 状态追踪。
+- 增加 Working Set、eviction/probation、slot 和 stale demand 等语义记录。
+- 增加默认关闭的 Calibration Shadow，记录 prefetch、fault 和 COLD candidate 的环境尺度。
+- 为 Memory Object 和 Calibration Shadow 增加定向单元测试。
+
+### 阶段结论
+
+这部分首先验证状态闭环和观测字段，不直接宣称性能收益；后续如果要形成性能结论，仍需单独的受控模型运行。
+
+## 阶段 12：README 与证据整理（2026-08-10）
+
+根据当前 HEAD 的代码和已有实验，对 README、图表、证据边界和技术考古材料进行整理。主要调整是把“可运行机制”“历史结果”“负结果”和“尚未证明的性能收益”分开，避免用早期 N=3 数字代表当前系统。
+
+## 阶段 13：对象级 Residency Attribution（2026-08-12）
+
+### 处理
+
+- 在语义 tensor demand 前增加 `RESIDENCY_DEMAND` 事件。
+- 按 Routed Expert、Shared Expert、Attention、Embedding、Norm 等对象类别统计 resident/nonresident bytes 和页级信息。
+- 增加 `analyze_residency_attribution.py`、`summarize_experiment_4b.py` 和 `run_experiment_4b.sh`。
+- 增加 `TRACE_PROFILE=attribution`，支持 Unlimited 与 `MemoryMax=7G` 的对象级观察实验。
+
+### 阶段结论
+
+Residency Attribution 用于解释“哪些语义对象在使用前更可能不驻留”，不是 Major Fault 的因果归因，也不是性能提升证明。当前仍以 N=1/小规模观察和脚本链路为主，正式结论需要后续人工整理。
+
 ## 当前状态
 
-- 当前正式矩阵候选：baseline、旧 `deadline_score`、`feedback_slack`、`feedback_slack_predict`。
-- 当前只确认它们具备进入受控复测的价值，尚未按新协议确定唯一最优策略。
-- 可信基准工具链已形成，正式 N=8 长时间矩阵留待 clean commit 和稳定 cgroup 环境执行。
+- 当前主线：`off`、`expert_prefetch`、trace 完整性校验、异步 hint 和 deadline-score。
+- 当前实验性扩展：Memory Object、Working Set、Calibration Shadow、`MADV_COLD` 和 Residency Attribution，默认关闭或单独运行。
+- 历史归档：通用 expert cache、Stage priority、slack/pressure 主动控制、跨层预测、continuous aging 和 reserved service。
+- 当前更可信的项目定位是语义内存观测与专家 hint 实验平台，尚未证明跨环境稳定的端到端加速。
 
 ## 后续计划
 
-- 完成新协议下的 N=8 正式矩阵，并如实报告均值、标准差、无效样本和 Pareto 前沿。
-- 在 delegated cgroup 下校准压力、page-in、batch wait 和 value ratio 参数。
-- 只有当预测扩展同时改善端到端 Pareto 指标时，才将其纳入主方案。
-- 在更多内存限制、输入长度、模型和硬件上验证稳定性。
+- 在当前 HEAD 上完成最小 `off`/`expert_prefetch` 受控矩阵，确认输出、trace 和指标口径一致。
+- 单独复核 Memory Object、Calibration Shadow 和 Residency Attribution 的开关影响，避免把观察成本混入性能结果。
+- 根据实验数据补充不同内存上限、输入长度和模型条件；没有足够证据时保持结论为阶段性观察。

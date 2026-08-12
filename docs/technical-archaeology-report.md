@@ -1,7 +1,7 @@
 # 项目技术考古报告：从 Qwen + llama.cpp 到当前系统
 
-考古日期：2026-08-09  
-考察对象：`main@01817a0aab55791fbcb54d2021f78a15e02307ab`，以及其可达 Git 历史、保留的本地实验归档和当前构建产物。
+考古日期：2026-08-12
+考察对象：`main@af1e286438235ab88ab827aaade3a698602c087d`，以及其可达 Git 历史、保留的本地实验归档和当前构建产物。
 
 ## 证据口径与边界
 
@@ -11,7 +11,7 @@
 - **高可信推断**：由多条独立证据共同支持，但缺少一次直接记录。
 - **不确定**：缺少关键一手证据；不会把它写成项目已证明的能力。
 
-已做的可复核检查包括：全量可达提交的 first-parent 时间线、当前代码和构建配置、当前流水线脚本、`experiments/expert_prefetch` 的归档数据与 provenance、以及构建目录中的五个自定义 CTest。后者全部通过：`router-tensor-observation-sync`、`expert-hint-priority`、`expert-task-lifecycle`、`expert-memory-object`、`expert-calibration-shadow`。这证明单元级语义，不证明真实模型上的时延或内存收益。
+已做的可复核检查包括：全量可达提交的 first-parent 时间线、当前代码和构建配置、当前流水线脚本、`experiments/expert_prefetch` 的归档数据与 provenance、以及构建目录中的五个自定义 CTest。后者覆盖 router 同步、priority、task lifecycle、Memory Object 和 Calibration Shadow。新增的 Residency Attribution 还需要通过实际 trace 进一步检查数据质量；这些检查都不自动证明真实模型上的时延或内存收益。
 
 相反，以下事项**不能**由仓库证明：最初的 Qwen 命令行、硬件/内核环境、初始 baseline 的完整原始日志，以及 HEAD 上一组干净、受控、可复现的端到端性能结果。根提交只有 `.gitignore` 和导入的 `llama.cpp`，因此“最初已经在 Qwen 上跑通并得到某数字”是合理背景，却不是 Git 可验证的事实。
 
@@ -21,7 +21,7 @@
 
 **它目前是一个编译期开关保护的 llama.cpp/Linux CPU 实验性运行时：把 MoE router 的实际选择映射为 mmap 专家权重切片的 `madvise(MADV_WILLNEED)` 工作，并用任务—首次使用—OS 内存遥测链条评估该提示；它不是一个已经验证完成的通用动态内存管理器。**
 
-默认关闭 `LLAMA_MEM_TRACE` 时，接口是空实现；打开后才有追踪和可选的专家预取（`llama.cpp/trace/trace_event.h`、`llama.cpp/CMakeLists.txt`、`ggml/src/ggml-cpu/CMakeLists.txt`）。当前 HEAD 还新增了默认关闭的 memory-object 与 calibration-shadow 探索层，但没有相应的 HEAD 端到端实验结论。
+默认关闭 `LLAMA_MEM_TRACE` 时，接口是空实现；打开后才有追踪和可选的专家预取（`llama.cpp/trace/trace_event.h`、`llama.cpp/CMakeLists.txt`、`ggml/src/ggml-cpu/CMakeLists.txt`）。当前 HEAD 还保留默认关闭的 Memory Object、Calibration Shadow 和 Residency Attribution 观察层，但没有由这些开关直接支撑的 HEAD 端到端性能结论。
 
 ## B. 起点：从仓库能确认与不能确认的初始状态
 
@@ -44,8 +44,10 @@
 | 07-28～08-06, `b18c3fb`、`d641099`、`3300e12`、`60814cc` | shadow slack、压力观测、最大等待保护、连续老化/保留服务等大批策略 | 提交增删规模；`d641099` 留下 router 同步修复；连续老化随后回滚 | 策略空间迅速膨胀，但多条支线没有通过受控实验。 |
 | 08-07, `7650056`、`dc44a60` | 大规模删除实验路径并忽略 `experiments/` | 约 36,160 行删除；备份引用 `backup-before-remove-experiments-20260807202154` 指向 `67dcf29` | 这是明确的收缩/归档，不是“所有策略都成为产品能力”。文档未同步。 |
 | 08-08, `01817a0` | memory object、working-set shadow、calibration shadow、可选 `MADV_COLD` 候选 | `expert_memory_object.*`、`expert_calibration_shadow.*` 及单测 | 删除后又开始新的、默认关闭的假设验证；目前仍是实验种子。 |
+| 08-10, `a4079e7` | 更新 README、证据图表和技术考古材料 | `README.md`、`docs/final-readme-evidence-*`、`docs/assets/` | 开始把当前 HEAD 证据、历史结果和负结果分开叙述。 |
+| 08-12, `af1e286` | object-level residency attribution 与 Experiment 4B | `residency_attribution.*`、`analyze_residency_attribution.py`、`run_experiment_4b.sh` | 进一步回答不同语义对象在 demand 前的驻留/缺页风险；当前仍是观察实验，不是因果性能结论。 |
 
-时间线里最重要的转折是 07-11：项目不再把“有一个快一点的样本”当作足够结论，而开始要求 manifest、输入/输出 hash、缓存准备、trace 完整性和重复汇总。第二个转折是 08-07：大量控制器被撤出当前主线，说明仓库的现在不能由 7 月的 PPT/README 直接代表。
+时间线里最重要的转折是 07-11：项目不再把“有一个快一点的样本”当作足够结论，而开始要求 manifest、输入/输出 hash、缓存准备、trace 完整性和重复汇总。第二个转折是 08-07：大量控制器被撤出当前主线。08-10～08-12 的工作则把叙事和观测面补回当前 HEAD，说明仓库现在应由“精简的可执行主线 + 明确标注的实验种子”共同代表。
 
 ## D. 机制谱系：从症状到仍存主线
 
@@ -69,7 +71,8 @@
         │               └─ max-wait/fairness → 尾延迟和锁竞争变差，关闭
         │
         └─ “内存对象”语义化
-                └─ working-set / calibration shadow / COLD candidate（HEAD 新增，默认关闭，未完成验证）
+                ├─ working-set / calibration shadow / COLD candidate（HEAD 新增，默认关闭）
+                └─ residency attribution（HEAD 新增，观察 demand 前的对象级驻留情况）
 ```
 
 仍在主线的关键路径可以逐段复核：
@@ -120,9 +123,9 @@
 | 映射层 | 注册 expert tensor，计算 expert slice/range | 只处理识别到的 MoE 命名/布局；不是所有 GGUF 都自动适配。 |
 | 控制层 | task 生命周期、dedup/TTL、queue、deadline-score 与 `MADV_WILLNEED` | `madvise` 是 hint，不是强制预读或页锁定。 |
 | 解释层 | first-use 匹配、trace metrics、对比/重复统计 | first-use 为逻辑消费证据，不是 residency 真值。 |
-| 新实验层 | memory-object 状态、working-set shadow、calibration shadow、可选 cold reclaim | 需显式环境变量；没有标准 pipeline profile 或 HEAD 性能报告。 |
+| 新实验层 | memory-object 状态、working-set shadow、calibration shadow、可选 cold reclaim、residency attribution | 需显式环境变量或 `attribution` profile；主要是语义/观测证据，没有新的 HEAD 性能报告。 |
 
-当前代码还保留 KV trace 和 `simulate_kv_cache_policy.py`，但没有证据显示它实现了在线 KV 替换策略；不要把“KV 被观测/模拟”说成“项目解决了 KV 内存管理”。
+当前代码还保留 KV trace 和 `simulate_kv_cache_policy.py`，但没有证据显示它实现了在线 KV 替换策略；不要把“KV 被观测/模拟”说成“项目解决了 KV 内存管理”。Residency Attribution 也只解释 demand 前的对象级驻留状态，不替代 `/proc`/cgroup 的全进程 fault 统计。
 
 ## H. 它真正想解决的问题，以及它刻意没有解决什么
 
@@ -170,11 +173,11 @@
 
 ## L. 容易被高估、或需要降级表述的部分
 
-1. **README / design / reproduce / comparison 的“当前 mainline”措辞已过期。** 它们仍提 `feedback_slack`、`feedback_slack_predict`、`stage_deadline_score`、`stage_scheduling_analysis.py` 和专用 matrix 脚本；当前树中这些文件/控制器不存在，且 pipeline 明确只认 off/expert_prefetch。它们应被标作历史阶段材料。
+1. **README / design / reproduce / comparison 的“当前 mainline”措辞曾过期。** 8 月清理后，本轮已将 `feedback_slack`、`feedback_slack_predict`、`stage_deadline_score`、`stage_scheduling_analysis.py` 等内容标为历史阶段材料，并以 `off`/`expert_prefetch` 和当前 attribution 入口为准。
 2. **`MADV_WILLNEED` 成功返回不是预取完成。** 它只能说明 hint 被接受；页是否在 first-use 前到位必须由 OS/时序证据间接评估。
 3. **一次或 N=3 的百分比不是通用性能承诺。** 早期归档缺少严格版本/环境 provenance；其数字最多是探索信号。
 4. **单测通过不是系统收益。** 8 月 8 日新增 memory-object/calibration 的五个相关单测可证明状态机/公式基本语义，不可替代真实 Qwen + 内存压力下的 A/B。
-5. **“动态内存管理”这个名字会过宽。** 当前真正在线动作主要是专家切片的 advice；working set、cold reclaim 与 calibration 默认关闭，也未进入规范的实验矩阵。
+5. **“动态内存管理”这个名字会过宽。** 当前真正在线动作主要是专家切片的 advice；working set、cold reclaim、calibration 和 residency attribution 仍应按默认关闭或观察性实验表述。
 
 ## M. 三种叙事视角
 
@@ -211,6 +214,10 @@
 
 ## 供维护者立即处理的文档债
 
-当前工作树与现有项目叙事最严重的不一致是：`README.md`、`docs/design.md`、`docs/reproduce.md`、`docs/development-log.md`、`docs/comparison.md` 都把已删除的 controller / 脚本写成当前能力。发布、答辩或继续实验前，应将其分为“历史实验线”和“HEAD 可执行路径”两栏；否则读者会以为已经实现并验证了当前树并不存在的 `feedback_slack` 与 `stage_deadline_score`。
+此前工作树与项目叙事的主要不一致是：`docs/design.md`、`docs/reproduce.md`、
+`docs/development-log.md` 和 `docs/comparison.md` 把已删除的 controller / 脚本写成
+当前能力。本轮已将这些内容标为历史，并补充当前的 Memory Object、Calibration
+Shadow 和 Residency Attribution 入口；后续仍应在有新实验数据后再更新具体性能结论。
 
-本报告刻意保留了这个不一致，而没有用新的宣传性文案掩盖它。
+根目录的初赛 PDF/PPT 尚未在本轮修改，若重新导出它们，还需要沿用同一条“历史实验线 /
+HEAD 可执行路径”边界，避免二进制交付物再次落后于 Markdown 文档。

@@ -53,15 +53,14 @@ Trace writer 为每个 sink 记录 `enqueued`、`written` 和 `dropped`。正式
 
 expert slice 使用 `(layer, expert, tensor)` 标识。route 策略根据模型实际路由结果计算分片地址，只对即将使用的专家页发出提示。所有 OS hint 和异步功能均为 opt-in，`LLM_MEM_TRACE_OS_HINTS=0` 时不改变默认推理行为。
 
-支持的实验项包括：
+当前保留并可复现的实验项包括：
 
-- route/LRU/LFU/window-LFU/least-stale 策略；
-- prefill/decode 分阶段 top-k；
-- route hint TTL；
-- 相邻地址 coalescing；
-- 同步或多 worker 异步队列；
-- score、deadline、deadline_score、stage_deadline_score 优先级；
-- `MADV_COLD`、显式 `MADV_DONTNEED` 或 `MADV_PAGEOUT` 回收提示。
+- 基于 routed expert 的 slice 定位和异步 `MADV_WILLNEED` hint；
+- route hint TTL、异步队列、多 worker 和 `deadline_score` 优先级；
+- Memory Object、Working Set、Calibration Shadow 和可选 `MADV_COLD`；
+- tensor residency / object-level attribution 观测。
+
+LRU/LFU、`stage_deadline_score`、slack/pressure 主动控制和跨层预测曾用于探索，现阶段仅作为历史路线保留，不再作为当前主线入口。
 
 ### Expert Prefetch 任务生命周期
 
@@ -82,9 +81,17 @@ ADMITTED/DEQUEUED -> CANCEL -> CANCELLED
 
 离线 Stage 时序分析按 `(run_id, step, layer, expert)` 聚合 trace 提供的 first-use stage。每个 stage 有多条 logical first-use 时使用最早时间戳，并保留多观测诊断；输出总体、PREFILL、DECODE 和逐 Layer 的 EARLY/LATE 配对、先后计数、比率与有符号 `delta_ns` 分位数。该分析只报告观测顺序，不把 EARLY 当作必然早于 LATE。
 
-Stage 分类本身不参与 Task Admission、coalescing、Slack、Pressure Control、worker 数量或预取范围；只有显式选择 `stage_deadline_score` 时，它才参与队列优先级，其他 priority mode 行为保持不变。
+Stage 分类和 first-use 目前主要用于解释任务时序，不再驱动新的 Stage priority。下面的 M2.5/M4A 内容是 7 月的历史探索记录，保留它们是为了说明设计为什么收敛，不代表当前 pipeline 仍提供这些入口。
 
-### M4A Stage-conditioned Shadow Slack 旁路观测
+### 当前保留：Memory Object、Working Set 与 Residency Attribution
+
+8 月收敛后，项目保留了默认关闭的 Memory Object、Semantic Working Set、Calibration Shadow 和 object-level residency attribution 观测。Memory Object 以 `(layer, expert, tensor)` 标识 Expert Slice，并维护 semantic demand、pending/active 状态、hint slot、Working Set membership、eviction/probation 和终态不变量。它的主要价值是把“谁仍需要这段权重、需求是否完成、是否可以进入候选”放到同一条可审计状态链中，不直接等同于性能提升。
+
+`LLM_MEM_TRACE_RESIDENCY_ATTRIBUTION=1` 时，运行时在语义 tensor demand 前记录 `RESIDENCY_DEMAND`，按 Routed Expert、Shared Expert、Attention、Embedding、Norm 等对象类别统计 resident/nonresident bytes 和页级摘要。`analyze_residency_attribution.py` 生成 JSON、CSV 和 Markdown 结果；这些指标用于解释对象级驻留情况，不是 Major Fault 因果归因，也不表示 Linux 已完成 page-in。
+
+Calibration Shadow 同样是 observation-only，默认关闭，不修改 task comparator、admission、hint 范围或模型输出。以上新机制目前以代码、单测和观测链路为主，尚未形成新的端到端性能结论。
+
+### 历史探索：M4A Stage-conditioned Shadow Slack 旁路观测
 
 M4A 新增独立、默认关闭的 `ExpertShadowSlack`，只在
 `LLM_MEM_TRACE_OPT_EXPERT_SLACK_MODE=shadow` 时运行。预测锚点固定为成功
@@ -113,7 +120,7 @@ step 的保留窗口；容量、过期、mismatch、因果错误和 shutdown pen
 独立计数。退出顺序固定为异步队列先 drain，再写 Shadow summary，最后析构
 Shadow；queue 未启动路径也不依赖该顺序。
 
-### M4A.1 Shadow Slack 语义对齐与在线校准
+### 历史探索：M4A.1 Shadow Slack 语义对齐与在线校准
 
 M4A.1 将原 M4A 的单一 Slack 拆成两个不可混用的 Shadow 目标。Issue Slack
 只预测 `first_use_horizon - queue_wait - pre_issue_overhead`，实际标签只允许
@@ -149,9 +156,9 @@ active Slack/feedback/value/cross-layer gate 全关、`deadline_score` 不变；
 仍不参与 Comparator、Admission、Cancel、Task 集合、Hint 范围或其他 Active
 Control。
 
-### M2.5 离线 Stage Scheduling Opportunity Analysis
+### 历史探索：M2.5 离线 Stage Scheduling Opportunity Analysis
 
-M2.5 阶段本身只增加离线分析；detail Task 额外落盘现有队列的 `sequence` 与现有任务的 `deadline_ts_ns`，使模拟不必用文件顺序或零 deadline 代替真实字段。后续运行时实现以独立、默认关闭的 `stage_deadline_score` mode 落地，不改变原有三种 mode。
+M2.5 阶段增加了离线分析和 detail 字段，用于研究 Stage inversion 与 deadline 调度机会。后续的运行时 `stage_deadline_score` 实现已在 8 月清理，当前只保留历史结果和经验。
 
 `no_issued_task` 原因采用显式证据白名单：只在同一 `(run_id, step, layer, expert, tensor)` 上看到明确 TTL duplicate、cache hit、policy reject/skip、queue/worker failure 或终止时仍 pending 的 Task 时才分类；其余全部保留 `other`。输出同时按 phase、stage 和 phase-stage 交叉聚合，不根据缺失事件猜测原因。
 
@@ -159,24 +166,24 @@ Stage inversion 的计数单位是 LATE Task。对每个 LATE Task 取首个 DEQ
 
 离线模拟只纳入具有真实 ENQUEUE、ISSUE 和 RETURN 的 Task，并固定使用观测到的 ISSUE→RETURN service duration。A 策略复现现有 `deadline_score`：非零 deadline 早、score 高、sequence 小；B 策略 `stage_deadline_score` 对已知阶段按 step、layer、EARLY 优先于 LATE、score、sequence 排序，因此下一层 EARLY 不会越过当前层 LATE。UNKNOWN 进入独立 legacy heap，彼此排序及与已知阶段堆头的仲裁均使用 `deadline_score`，不把 UNKNOWN 降为最低级或跳过。模拟分别使用 1/2/4 workers；on-time 严格表示 ISSUE 时间早于 logical first-use。模拟只报告潜在 ISSUE 时间变化和 LATE 变晚风险，不表示物理页驻留完成，也不支持性能提升或 major fault 下降结论。
 
-### 异步 priority queue
+### 当前保留：异步 priority queue
 
-推理线程只构造 `ExpertHintTask` 并入队，worker 执行实际系统调用。控制器使用 layer 执行时间 EWMA 估计 expert 的使用期限，并将任务按真实 `deadline_ts_ns` 和 route score 排序。worker 出队时重新计算预计服务时间；已经错过期限的任务直接取消，不回退到 decode 同步系统调用。
+推理线程只构造 `ExpertHintTask` 并入队，worker 执行实际系统调用。当前 `expert_prefetch` profile 组合使用异步 worker、route score/deadline-score 排序和可选 TTL；`off` profile 不创建有效的预取控制路径。`madvise` 返回只代表 hint 调用返回，不代表页面已完成 page-in。
 
 队列支持短等待窗口内最多 8 项的 micro-batch，并尝试合并同一 tensor、layer、step 中相邻的地址区间。trace 记录 batch 数、输入候选、最终系统调用、合并节省量、队列字节高水位以及 deadline/pressure/value/queue-full 四类取消原因。
 
-`stage_deadline_score` 使用两个 heap：EARLY/LATE 的已知阶段 heap 执行固定五级顺序，UNKNOWN legacy heap 沿用 `deadline_score`，两个堆头也用 legacy 规则仲裁。这样避免混合 comparator 的非传递关系。该 mode 即使关闭 Slack Admission，也会生成 deadline 作为 UNKNOWN 仲裁和 late telemetry；独立 A/B 另为两组设置 `LLM_MEM_TRACE_OPT_EXPERT_DEADLINE_OBSERVE=1`，使 legacy 组拥有同口径 deadline。只有 `LLM_MEM_TRACE_OPT_EXPERT_SLACK=1` 才允许 deadline-missed 取消。固定规则下，同一 step/layer 持续到达的 EARLY 理论上可延迟 LATE；更晚 step/layer 不会越过更早 LATE。本版不加入会改变固定顺序的 aging，风险通过 `late_count_by_stage` 和 `queue_wait_ns_by_stage.<stage>.max_ns` 观测。
+Stage-aware heap 和 Late starvation 风险属于 M2.5 的历史结果；当前 queue 不提供 `stage_deadline_score` 入口，相关数据只用于解释为什么保留较简单的 priority 方案。
 
-### 语义与压力双反馈控制器
+### 历史探索：语义与压力双反馈控制器
 
-设置 `LLM_MEM_TRACE_OPT_EXPERT_CONTROLLER=feedback_slack` 后，控制器联合两类信号：
+7 月曾尝试用 `feedback_slack` 联合两类信号：
 
 - 模型语义：实际 routed expert、router score、当前 layer、phase 和在线 layer 时间 EWMA；真实 routed expert 的使用置信度为 1，router score 只参与优先级。
 - 系统反馈：cgroup v2 的 `memory.current/high/max`、`memory.swap.current`、PSI some/full 和 `memory.stat` workingset refault 增量，以及异步队列积压字节。
 
 压力被分成 low、moderate、high、critical 四级，并把基础 expert 预算动态缩放为 100%、75%、50%、20%。每个任务计算预计 page-in/系统调用成本、可隐藏收益和 value ratio；提交前和出队时各检查一次，因压力或成本变化而失去价值的任务可被取消。当前 page-in 时间使用可配置带宽模型，系统调用时间由运行时 EWMA 更新，属于可验证的一阶在线模型，不宣称是精确 I/O 完成时间。
 
-### 成本门控的相邻层 expert 预测
+### 历史探索：成本门控的相邻层 expert 预测
 
 `feedback_slack_predict` 在上述控制器上增加轻量在线预测。预测器按 token 观察相邻 MoE 层的 routed expert 集合，维护有界的 `(source_layer, source_expert) -> destination_expert` 重频统计；达到最小样本数后，为下一层产生 top-2 候选。目标集合超过容量时采用最小计数替换，避免表无限增长或永久保留最早出现的 expert。
 
@@ -186,7 +193,7 @@ Stage inversion 的计数单位是 LATE Task。对每个 LATE Task 取首个 DEQ
 
 `simulate_expert_cache.py` 使用已有 trace 比较不同 expert cache 预算和替换策略，避免每个候选都重跑大模型。`simulate_kv_cache_policy.py` 估算完整预留、按块提交、KV 量化、滑动窗口和预算策略的内存上界。
 
-`stage_scheduling_analysis.py` 从 detail trace 生成 `stage_scheduling_opportunity.json`，包括 no-issued 原因、总体/phase/Layer inversion，以及 `deadline_score` 与 `stage_deadline_score` 的 1/2/4-worker 对照。它不调用或修改 C++ queue。
+历史脚本 `stage_scheduling_analysis.py` 曾从 detail trace 生成 `stage_scheduling_opportunity.json`；该脚本和对应运行时矩阵已移出当前树，不应作为复现入口。
 
 其中 `paged_blocks` 是保持完整上下文的工程候选；滑动窗口、sink-recent 和 budget-LRU 会丢弃上下文，只能作为压力测试。当前 trace 缺少 attention score，因此不能据此声称已经实现 H2O/heavy-hitter。
 
@@ -208,18 +215,18 @@ Stage inversion 的计数单位是 LATE Task。对每个 LATE Task 取首个 DEQ
 项目目前具有以下系统组合与机制创新：
 
 1. 将真实 MoE routing 语义映射到 Linux 页级提示，而不是通用顺序预取。
-2. 将静态 deadline 启发式升级为受 cgroup 水位、PSI、refault 和队列积压反馈的动态预算控制器。
-3. 在线估计 layer 时间与 hint 服务成本，执行真实 deadline 排序、出队重判和可取消 micro-batch。
-4. 使用有界在线转移预测提出下一层候选，但由收益、I/O、内存压力共同决定是否预取。
-5. 使用同一套 trace 闭环联合评估延迟、faults、RSS、swap、hint、预测质量和正确性。
+2. 通过 Expert Tensor Registry 把 `(layer, expert, tensor)` 语义映射到 mmap 中的实际 slice。
+3. 将 hint、Task lifecycle、logical first-use、OS 指标和输出 hash 放进同一套可审计 trace。
+4. 通过 Memory Object、Working Set 和 Calibration Shadow 记录需求状态、容量行为和环境尺度。
+5. 新增 object-level residency attribution，用于区分不同语义对象在使用前的驻留/缺页风险。
 
-前 3 项组合已经形成可运行的自主控制机制，第 4 项是探索性扩展。当前仍不宣称它已经优于旧策略：page-in 估计是一阶模型，预测只覆盖相邻层，KV 方向仍以离线估算为主，而且尚未完成正式 N=8 cgroup 复测。
+当前主线仍是 `off` 与 `expert_prefetch` 两种 profile；`expert_prefetch` 使用异步队列和 deadline-score。压力反馈、slack、Stage priority、跨层预测等路线已归档，不能再作为当前系统已经具备的稳定能力来表述。
 
-后续重点是根据正式数据校准压力阈值、page-in 带宽、batch wait 和 value ratio，验证控制器能否同时降低 major faults、RSS/swap 与 hint 数，并将 decode p95 保持在旧 `deadline_score` 的 5% 范围内。预测扩展只有在 precision、实际预取覆盖和端到端指标同时改善时才进入主方案。
+项目目前更适合被描述为“语义内存观测与专家 hint 实验平台”，而不是已经证明通用加速的动态内存管理器。Prefetch、COLD 和新 residency 指标都需要在固定环境下分别解释，不能把局部观测直接写成端到端收益。
 
 ## 测试结论状态
 
-初赛 N=3 数据来自探索性运行，缓存状态、统计窗口和固定运行顺序不足以支持最终优劣结论，因此仅作为研发过程记录。完成新的 Linux 受控矩阵并人工复核前，不预设 `deadline_score` 或其他策略必然优于 baseline。
+初赛和 7 月的 N=3/N=8 探索数据来自不同阶段的代码和实验协议，不能直接混合排名。已删除控制器的结果继续作为历史研发记录；当前 HEAD 的 Memory Object、Calibration Shadow 和 Residency Attribution 也暂不代表端到端性能收益。
 
 完整构建、运行和验证命令见 [reproduce.md](reproduce.md)，测试状态见 [test-report.md](test-report.md)。
 

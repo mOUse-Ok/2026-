@@ -78,12 +78,13 @@ cmake --build llama.cpp/build-no-trace --target llama-cli -j"$(nproc)"
 ```bash
 python3 -m py_compile \
   llama.cpp/trace/analyze_trace.py \
+  llama.cpp/trace/analyze_residency_attribution.py \
   llama.cpp/trace/trace_metrics.py \
   llama.cpp/trace/compare_trace_runs.py \
   llama.cpp/trace/simulate_expert_cache.py \
   llama.cpp/trace/simulate_kv_cache_policy.py \
-  llama.cpp/trace/stage_scheduling_analysis.py \
   llama.cpp/trace/summarize_repeat_runs.py \
+  llama.cpp/trace/summarize_experiment_4b.py \
   llama.cpp/trace/prepare_model_cache.py \
   llama.cpp/trace/write_run_manifest.py \
   llama.cpp/trace/validate_trace_summary.py
@@ -93,6 +94,7 @@ python3 -m unittest discover -s llama.cpp/trace/tests -p 'test_*.py' -v
 bash -n llama.cpp/trace/run_trace_pipeline.sh
 bash -n llama.cpp/trace/run_finalist_repeat_matrix.sh
 bash -n llama.cpp/trace/run_cgroup_memory_matrix.sh
+bash -n llama.cpp/trace/run_experiment_4b.sh
 git diff --check
 ```
 
@@ -100,6 +102,7 @@ git diff --check
 
 - `TRACE_PROFILE=evidence`：完整 tensor/KV/expert/memory trace，适合解释行为。
 - `TRACE_PROFILE=benchmark`：关闭高流量 tensor/KV 和驻留采样，适合正式性能对比。
+- `TRACE_PROFILE=attribution`：开启 tensor/memory residency attribution，适合对象级驻留分析。
 - `TRACE_PROFILE=custom`：允许用 `LLM_MEM_TRACE_TENSOR` 等变量逐项指定。
 
 正式结果应分别保留 evidence run 和 benchmark run，不能用高开销全量 trace 的绝对耗时冒充无插桩性能。
@@ -114,9 +117,7 @@ Expert Prefetch 任务 trace 可独立切换：
 
 benchmark profile 仍保留真实 `madvise/posix_fadvise` 调用及错误，但把高流量 skip/reject 明细聚合到 summary。进入正式性能矩阵前，应以 `off` 为基线轮换运行三种模式；建议门槛为 Decode 吞吐下降不超过 1%、Decode p95 增加不超过 2%、trace 零丢失且输出 hash 相同。`detail` 未通过门槛时只能用于 evidence，不能用于性能排名。
 
-`EXPERT_FIRST_USE_SUMMARY` 的 M1 语义检查包括 `eligible_tasks/matched_tasks/unmatched_tasks/ambiguous_matches/duplicate_first_use_ignored/matcher_peak_live_tasks/matcher_expired_tasks`。多 Token ubatch 的同键重复 Task 采用一次 logical first-use 对多 Task 的关联语义。`EXPERT_TASK_SUMMARY` 另记录 `same_stage_issue_groups/cross_stage_issue_groups`。分析结果 `metrics.json` 中的 `expert_stage_pairing` 按 `(run_id, step, layer, expert)` 输出总体、PREFILL、DECODE、逐 Layer 和未匹配原因；分析脚本不得从 tensor 名重新分类 stage。
-
-M2.5 离线调度分析要求 detail Task 中存在真实 `sequence` 和 `deadline_ts_ns`。`analyze_trace.py` 会额外生成 `analysis/stage_scheduling_opportunity.json`；其中 `data_quality` 必须确认 `sequence_semantics=trace_sequence`、没有 deadline 代理，并报告观测到的 priority mode 和 worker 数量。若字段缺失，兼容分析会显式标记代理来源，该结果不能作为正式 M2.5 Evidence。
+`EXPERT_FIRST_USE_SUMMARY` 的 M1 语义检查包括 `eligible_tasks/matched_tasks/unmatched_tasks/ambiguous_matches/duplicate_first_use_ignored/matcher_peak_live_tasks/matcher_expired_tasks`。多 Token ubatch 的同键重复 Task 采用一次 logical first-use 对多 Task 的关联语义。`EXPERT_TASK_SUMMARY` 另记录 `same_stage_issue_groups/cross_stage_issue_groups`。分析结果 `metrics.json` 中的 `expert_stage_pairing` 按 `(run_id, step, layer, expert)` 输出总体、PREFILL、DECODE、逐 Layer 和未匹配原因；分析脚本不得从 tensor 名重新分类 stage。Stage scheduling 的旧分析字段只用于历史报告，不再作为当前复现必需项。
 
 ## 7. 单次 smoke test
 
@@ -133,38 +134,23 @@ LLM_MEM_TRACE_OS_HINTS=0 \
 bash llama.cpp/trace/run_trace_pipeline.sh
 ```
 
-## 8. 单次双反馈控制器运行
+## 8. 单次 Expert Prefetch 运行
+
+当前 pipeline 只接受 `off` 和 `expert_prefetch` 两个 controller。`expert_prefetch`
+会启用 routed-expert hint、异步 worker、deadline-score priority、feedback/value
+gate 和 OS hint；它是可选实验 profile，不代表已经证明端到端加速。
 
 ```bash
-RUN_NAME=feedback_slack \
+RUN_NAME=expert_prefetch \
 TRACE_PROFILE=benchmark \
 CACHE_MODE=cold \
 MODEL_FILE="$MODEL_FILE" \
-LLM_MEM_TRACE_OPT_EXPERT_CONTROLLER=feedback_slack \
+LLM_MEM_TRACE_OPT_EXPERT_CONTROLLER=expert_prefetch \
 bash llama.cpp/trace/run_trace_pipeline.sh
 ```
 
-增加相邻层预测实验时，将控制器改为：
-
-```bash
-LLM_MEM_TRACE_OPT_EXPERT_CONTROLLER=feedback_slack_predict
-```
-
-高层 profile 会启用异步 deadline heap、4 workers、batch=8、100 us batch wait、压力反馈、slack 和 value gate。关键调参接口如下：
-
-| 变量 | 默认值 | 含义 |
-| --- | ---: | --- |
-| `LLM_MEM_TRACE_OPT_EXPERT_CACHE_MB` | 512 | low 压力下的基础预取预算 |
-| `LLM_MEM_TRACE_OPT_EXPERT_PRESSURE_SAMPLE_MS` | 50 | cgroup/PSI/refault 采样周期 |
-| `LLM_MEM_TRACE_OPT_EXPERT_PAGEIN_MBPS` | 512 | page-in 一阶带宽估计 |
-| `LLM_MEM_TRACE_OPT_EXPERT_VALUE_MIN_RATIO` | 1.0 | 最小预计收益/成本比 |
-| `LLM_MEM_TRACE_OPT_EXPERT_ASYNC_BATCH` | 8 | worker 一次最多取出的任务数 |
-| `LLM_MEM_TRACE_OPT_EXPERT_ASYNC_BATCH_WAIT_US` | 100 | 等待相邻任务形成 micro-batch 的上限 |
-| `LLM_MEM_TRACE_OPT_EXPERT_PREDICT_TOPK` | 2 | 下一层预测候选数 |
-| `LLM_MEM_TRACE_OPT_EXPERT_PREDICT_MIN_SAMPLES` | 8 | 启用一条转移统计前的最小样本数 |
-| `LLM_MEM_TRACE_OPT_EXPERT_PREDICT_MIN_CONFIDENCE` | 0.10 | 预测候选最低置信度 |
-
-不要仅根据 prediction precision 选择策略；必须同时检查实际 predicted prefetches、取消原因、hint 数、major faults、RSS/swap 和 decode p95。
+若只想观察当前代码的基础行为，将 controller 改为 `off`。不要再使用旧文档中的
+`feedback_slack`、`feedback_slack_predict` 或 Stage priority 入口；这些属于历史探索。
 
 ## 9. 正式重复矩阵
 
@@ -199,7 +185,7 @@ bash llama.cpp/trace/run_finalist_repeat_matrix.sh
 
 ```bash
 MEMORY_LIMITS_MB=4096,5120,6144 \
-RUN_GROUPS=baseline,deadline_score,feedback_slack,feedback_slack_predict \
+RUN_GROUPS=baseline,expert_prefetch \
 REPEAT_COUNT=1 \
 bash llama.cpp/trace/run_cgroup_memory_matrix.sh
 ```
@@ -210,7 +196,7 @@ bash llama.cpp/trace/run_cgroup_memory_matrix.sh
 RUN_MEMORY_PRESSURE_EXECUTE=1 \
 CGROUP_PARENT=/sys/fs/cgroup/<delegated-parent> \
 MEMORY_LIMITS_MB=4096,5120,6144 \
-RUN_GROUPS=baseline,deadline_score,feedback_slack,feedback_slack_predict \
+RUN_GROUPS=baseline,expert_prefetch \
 REPEAT_COUNT=8 \
 MODEL_FILE="$MODEL_FILE" \
 bash llama.cpp/trace/run_cgroup_memory_matrix.sh
@@ -248,43 +234,40 @@ python3 llama.cpp/trace/simulate_kv_cache_policy.py \
   --trace-dir llama.cpp/trace_output/<run>
 ```
 
-M2.5 Stage Scheduling Opportunity Analysis 使用正常 pipeline 的 detail 输出，不单独启动模型：
-
-```bash
-ALLOW_DIRTY_REPO=1 \
-RUN_NAME=stage_scheduling_opportunity_evidence \
-TRACE_PROFILE=evidence \
-CACHE_MODE=as-is \
-NUM_TOKENS_PREDICT=3 \
-CTX_SIZE=1024 \
-LLM_MEM_TRACE_OPT_EXPERT_CONTROLLER=feedback_slack \
-bash llama.cpp/trace/run_trace_pipeline.sh
-```
-
-`feedback_slack` 在此只用于采集仓库现有 `deadline_score` 配置的真实非零 deadline、sequence 和 4-worker Task。分析阶段离线重放同一批已 ISSUE Task，并输出 1/2/4-worker A/B 模拟；分析脚本本身不会修改 C++ queue。复用已有 trace 时可执行：
+复用已有 trace 重新分析时可执行：
 
 ```bash
 python3 llama.cpp/trace/analyze_trace.py \
-  --trace-dir llama.cpp/trace_output/<detail-run> \
-  --output-dir llama.cpp/trace_output/<detail-run>/analysis
+  --trace-dir llama.cpp/trace_output/<run> \
+  --output-dir llama.cpp/trace_output/<run>/analysis
 ```
 
-运行时 Stage priority 使用独立矩阵，不改 `run_finalist_repeat_matrix.sh`：
+### 12.1 Experiment 4B：对象级 Residency Attribution
+
+该实验只做观察，不打开 Expert Prefetch、COLD 或 Runtime Rescue。默认 dry-run；
+需要真实运行时再设置 `RUN_EXPERIMENT_4B_EXECUTE=1`。脚本会准备 Unlimited 与
+`MemoryMax=7G` 两组 N=1 运行，并把结果汇总到 `trace_output/experiment_4b/report/`。
 
 ```bash
-# 先检查两组命令；默认不执行模型。
-REPEAT_COUNT=1 \
-bash llama.cpp/trace/run_stage_deadline_score_repeat_matrix.sh
-
-# 正式 A/B 建议 delegated cgroup、cold cache 和 N=8。
-RUN_STAGE_PRIORITY_EXECUTE=1 \
-REPEAT_COUNT=8 \
-MEMORY_MAX=6G \
-MEMORY_SWAP_MAX=2G \
-bash llama.cpp/trace/run_stage_deadline_score_repeat_matrix.sh
+MODEL_FILE="$MODEL_FILE" \
+RUN_EXPERIMENT_4B_EXECUTE=1 \
+bash llama.cpp/trace/run_experiment_4b.sh
 ```
 
-该矩阵只比较 `deadline_score` 与 `stage_deadline_score`，默认分别测试 2/4 workers，并对 mode 和 worker 顺序做 repeat 级轮换；可用 `WORKER_COUNTS="2 4"` 显式覆盖。两组均使用全部 routed experts（`PREFETCH_TOPK=0`）、单任务 batch、无 coalescing，并关闭 Slack/feedback/value admission、跨层预测和 Expert TTL；不配置 Chunk 切分。两组设置 `LLM_MEM_TRACE_OPT_EXPERT_DEADLINE_OBSERVE=1` 以生成同口径 deadline，且新 mode 默认也会估计 deadline 供 UNKNOWN legacy 仲裁和 late telemetry 使用；Slack 关闭时不会据此拒绝或取消任务。正式结果须核对输出 hash、零 trace loss、每阶段 late count 及 `queue_wait_ns_by_stage` 的 `max_ns`。为输出 PSS/Swap，独立矩阵默认对两组统一启用 `smaps_rollup`；不需要该指标时可设置 `TRACE_SMAPS=0`。
+单次 attribution profile 也可以直接运行：
+
+```bash
+RUN_NAME=residency_attribution_smoke \
+TRACE_PROFILE=attribution \
+CACHE_MODE=as-is \
+NUM_TOKENS_PREDICT=1 \
+MODEL_FILE="$MODEL_FILE" \
+bash llama.cpp/trace/run_trace_pipeline.sh
+```
+
+报告包含 `residency_attribution.json`、`.csv` 和 `.md`。其中
+`nonresident_before_use_bytes` 是对象级驻留观察指标，不是 Major Fault 的因果归因，
+也不能理解为 `madvise` 或 `mincore` 已证明页面完成换入。
 
 ## 13. 常见问题
 
