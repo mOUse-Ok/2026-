@@ -84,6 +84,9 @@ experiments/
 # Local presentation artifacts
 slides/
 slides-*/
+defense-slides/
+defense-slides-screenshots/
+defense_slides/
 
 # Local test artifacts
 test/

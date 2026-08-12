@@ -103,6 +103,7 @@ case "$TRACE_PROFILE" in
         PROFILE_EXPERT=1
         PROFILE_MEMORY=1
         PROFILE_RESIDENCY=1
+        PROFILE_ATTRIBUTION=0
         PROFILE_SMAPS=1
         PROFILE_EXPERT_TASK_MODE=detail
         ;;
@@ -112,8 +113,19 @@ case "$TRACE_PROFILE" in
         PROFILE_EXPERT=1
         PROFILE_MEMORY=1
         PROFILE_RESIDENCY=0
+        PROFILE_ATTRIBUTION=0
         PROFILE_SMAPS=0
         PROFILE_EXPERT_TASK_MODE=summary
+        ;;
+    attribution)
+        PROFILE_TENSOR=1
+        PROFILE_KV=0
+        PROFILE_EXPERT=0
+        PROFILE_MEMORY=1
+        PROFILE_RESIDENCY=1
+        PROFILE_ATTRIBUTION=1
+        PROFILE_SMAPS=0
+        PROFILE_EXPERT_TASK_MODE=off
         ;;
     custom)
         PROFILE_TENSOR=1
@@ -121,11 +133,12 @@ case "$TRACE_PROFILE" in
         PROFILE_EXPERT=1
         PROFILE_MEMORY=1
         PROFILE_RESIDENCY=1
+        PROFILE_ATTRIBUTION=0
         PROFILE_SMAPS=1
         PROFILE_EXPERT_TASK_MODE=detail
         ;;
     *)
-        echo "ERROR: TRACE_PROFILE must be evidence, benchmark, or custom" >&2
+        echo "ERROR: TRACE_PROFILE must be evidence, benchmark, attribution, or custom" >&2
         exit 1
         ;;
 esac
@@ -209,6 +222,7 @@ export LLM_MEM_TRACE_QUEUE_LIMIT="${LLM_MEM_TRACE_QUEUE_LIMIT:-65536}"
 export LLM_MEM_TRACE_ALLOW_DROP="${LLM_MEM_TRACE_ALLOW_DROP:-0}"
 export LLM_MEM_TRACE_EXPERT_TASK_MODE="${LLM_MEM_TRACE_EXPERT_TASK_MODE:-$PROFILE_EXPERT_TASK_MODE}"
 export LLM_MEM_TRACE_RESIDENCY="${LLM_MEM_TRACE_RESIDENCY:-$PROFILE_RESIDENCY}"
+export LLM_MEM_TRACE_RESIDENCY_ATTRIBUTION="${LLM_MEM_TRACE_RESIDENCY_ATTRIBUTION:-$PROFILE_ATTRIBUTION}"
 export LLM_MEM_TRACE_RESIDENCY_MAX_PAGES="${LLM_MEM_TRACE_RESIDENCY_MAX_PAGES:-4096}"
 export LLM_MEM_TRACE_SMAPS="${LLM_MEM_TRACE_SMAPS:-$PROFILE_SMAPS}"
 export LLM_MEM_TRACE_OS_HINTS="${LLM_MEM_TRACE_OS_HINTS:-$CONTROLLER_OS_HINTS}"
@@ -366,10 +380,17 @@ echo ""
 echo "[3/4] Running trace analysis & visualization..."
 echo ""
 
-python3 "$ANALYSIS_SCRIPT" \
-    --trace-dir "$TRACE_OUT_DIR" \
-    --output-dir "$TRACE_OUT_DIR/analysis" \
-    --num-generate "$NUM_TOKENS_PREDICT"
+if [ "$TRACE_PROFILE" = "attribution" ]; then
+    python3 "$SCRIPT_DIR/analyze_residency_attribution.py" \
+        --trace-dir "$TRACE_OUT_DIR" \
+        --output-dir "$TRACE_OUT_DIR/analysis" \
+        --condition-label "${MEMORY_MAX:+MemoryMax=7G}"
+else
+    python3 "$ANALYSIS_SCRIPT" \
+        --trace-dir "$TRACE_OUT_DIR" \
+        --output-dir "$TRACE_OUT_DIR/analysis" \
+        --num-generate "$NUM_TOKENS_PREDICT"
+fi
 
 echo ""
 echo "[4/4] Pipeline complete!"

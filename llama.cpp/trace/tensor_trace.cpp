@@ -8,6 +8,7 @@
 #include "expert_tensor_stage.h"
 #include "expert_task_lifecycle.h"
 #include "expert_first_use_matcher.h"
+#include "residency_attribution.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -754,6 +755,97 @@ bool is_expert_weight_tensor_name(const char * name) {
             std::strstr(name, "ffn_up_exps.weight") ||
             std::strstr(name, "ffn_down_exps.weight") ||
             std::strstr(name, "ffn_gate_up_exps.weight"));
+}
+
+const char * residency_object_class(const char * name) {
+    if (!name) {
+        return "Other";
+    }
+    if (std::strstr(name, "_exps.weight")) {
+        return "Routed Expert";
+    }
+    if (std::strstr(name, "_shexp.")) {
+        return "Shared Expert";
+    }
+    if (std::strstr(name, "ffn_gate_inp.weight")) {
+        return "Router/Gate";
+    }
+    if (std::strcmp(name, "token_embd.weight") == 0) {
+        return "Embedding";
+    }
+    if (std::strcmp(name, "output.weight") == 0) {
+        return "Output";
+    }
+    if (std::strstr(name, ".attn_")) {
+        return "Attention";
+    }
+    if (std::strstr(name, ".ssm_") || std::strstr(name, ".ssm_a") ||
+            std::strstr(name, ".ssm_b") || std::strstr(name, ".ssm_conv1d")) {
+        return "SSM";
+    }
+    if (std::strstr(name, "norm")) {
+        return "Norm";
+    }
+    return "Other";
+}
+
+const char * residency_tensor_subclass(const char * name) {
+    if (!name) {
+        return "";
+    }
+    if (std::strstr(name, "ffn_down_exps.weight")) {
+        return "Down";
+    }
+    if (std::strstr(name, "ffn_gate_exps.weight") ||
+            std::strstr(name, "ffn_up_exps.weight") ||
+            std::strstr(name, "ffn_gate_up_exps.weight")) {
+        return "Gate/Up";
+    }
+    return "";
+}
+
+bool host_readable_tensor(const ggml_tensor * t);
+int read_expert_id(const ggml_tensor * ids, int64_t index0, int64_t index1);
+
+void observe_param_residency_demand(
+        const ggml_tensor * t,
+        const ggml_tensor * operation) {
+    if (!llm_mem_trace_residency_attribution_enabled() || !t) {
+        return;
+    }
+    const char * name = ggml_get_name(t);
+    // Routed Expert tensors are accounted by their actual selected Expert
+    // slices in observe_expert_logical_first_use(). Never charge the full
+    // container tensor here.
+    if (!is_param_tensor(t) || is_expert_weight_tensor_name(name)) {
+        return;
+    }
+    if (std::strcmp(name, "token_embd.weight") == 0 && operation &&
+            operation->op == GGML_OP_GET_ROWS && operation->src[1] &&
+            host_readable_tensor(operation->src[1]) &&
+            (operation->src[1]->type == GGML_TYPE_I32 ||
+             operation->src[1]->type == GGML_TYPE_I64)) {
+        const size_t row_bytes = ggml_row_size(t->type, t->ne[0]);
+        std::unordered_set<int> rows;
+        for (int64_t i1 = 0; i1 < operation->src[1]->ne[1]; ++i1) {
+            for (int64_t i0 = 0; i0 < operation->src[1]->ne[0]; ++i0) {
+                const int row = read_expert_id(operation->src[1], i0, i1);
+                if (row >= 0 && row < t->ne[1]) {
+                    rows.insert(row);
+                }
+            }
+        }
+        for (int row : rows) {
+            llm_mem_trace_residency_attribution_observe(
+                    "Embedding", name, "Token Row",
+                    parse_layer_from_name(name), -1,
+                    tensor_addr(t) + (uintptr_t) row * t->nb[1], row_bytes);
+        }
+        return;
+    }
+    llm_mem_trace_residency_attribution_observe(
+            residency_object_class(name), name, residency_tensor_subclass(name),
+            parse_layer_from_name(name), -1, tensor_addr(t), ggml_nbytes(t));
 }
 
 uint64_t expert_prefetch_budget_bytes() {
@@ -3832,7 +3924,10 @@ void log_tensor_event(const ggml_tensor * t, const char * access_kind) {
     llm_mem_trace_write(LLM_MEM_TRACE_SINK_TENSOR, line.c_str(), line.size());
 }
 
-void log_param_access(const ggml_tensor * t, const char * parent_name) {
+void log_param_access(
+        const ggml_tensor * t,
+        const ggml_tensor * parent,
+        const char * parent_name) {
     if (!llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_TENSOR)) {
         return;
     }
@@ -3847,6 +3942,7 @@ void log_param_access(const ggml_tensor * t, const char * parent_name) {
     const char * backend = tensor_backend_name(t);
     const uint64_t ts = llm_mem_trace_time_ns();
 
+    observe_param_residency_demand(t, parent);
     bool first = first_touch().mark(t);
 
     char addr_buf[32];
@@ -4076,7 +4172,8 @@ int read_expert_id(const ggml_tensor * ids, int64_t index0, int64_t index1) {
 void observe_expert_logical_first_use(const ggml_tensor * operation) {
     const bool observe_tasks = expert_task_trace_mode() != ExpertTaskTraceMode::Off;
     const bool observe_memory_objects = expert_memory_objects_enabled();
-    if ((!observe_tasks && !observe_memory_objects) || !operation ||
+    const bool observe_residency = llm_mem_trace_residency_attribution_enabled();
+    if ((!observe_tasks && !observe_memory_objects && !observe_residency) || !operation ||
             operation->op != GGML_OP_MUL_MAT_ID) {
         return;
     }
@@ -4125,6 +4222,12 @@ void observe_expert_logical_first_use(const ggml_tensor * operation) {
         size_t slice_bytes = 0;
         if (!expert_slice_range(info, expert, slice_addr, slice_bytes)) {
             continue;
+        }
+        if (observe_residency) {
+            llm_mem_trace_residency_attribution_observe(
+                    "Routed Expert", info.name.c_str(),
+                    residency_tensor_subclass(info.name.c_str()), info.layer, expert,
+                    slice_addr, slice_bytes);
         }
         if (observe_memory_objects) {
             expert_memory_object_tracker().observe_first_use(
@@ -4204,10 +4307,10 @@ extern "C" void llm_mem_trace_tensor_begin(const ggml_tensor * t) {
     layer_tracker().on_begin(layer);
 
     if (t->src[0]) {
-        log_param_access(t->src[0], name);
+        log_param_access(t->src[0], t, name);
     }
     if (t->src[1]) {
-        log_param_access(t->src[1], name);
+        log_param_access(t->src[1], t, name);
     }
 }
 
