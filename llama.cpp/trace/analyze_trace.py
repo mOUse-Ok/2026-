@@ -1600,11 +1600,11 @@ def generate_recommendations(metrics: dict, data: dict[str, list[dict]]) -> list
             "title": "降低峰值物理内存 RSS",
             "finding": f"推理过程中峰值 RSS 达到 {rss_peak:.2f} GB。",
             "recommendation": (
-                "实现逐层权重流式释放：每层计算完成后，对该层权重 tensor 使用 "
-                "madvise(MADV_DONTNEED)。由于 layer 计算是顺序执行的，已经完成计算的层可以释放其物理页，"
-                "不影响正确性。"
+                "在内存压力下，仅对已退出 Semantic Working Set、无 pending/active/in-flight hint、"
+                "经过 grace steps 且经文件映射校验的 Expert Slice 尝试 MADV_DONTNEED；"
+                "同时限制每个 Decode step 的 reclaim 字节数，并验证输出一致性与 major faults。"
             ),
-            "expected_benefit": "对使用 mmap 加载的大模型，理论上可降低 40-60% 的峰值 RSS。"
+            "expected_benefit": "可能降低 RSS；需以受限内存下的完成性、输出 hash 与进程级指标验证。"
         })
 
     # 2. Page fault analysis

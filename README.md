@@ -19,9 +19,9 @@
 
 Linux 虚拟内存看到的是 page、`mmap`、page fault 与 RSS；LLM Runtime 知道的却是 token、layer、Router、expert、tensor 和 logical first-use。两者之间缺少可复核的语义连接。本项目不修改 Linux 内核，而是在两者之间补充语义内存管理层：Runtime 的对象状态经由 Memory Object 和 Semantic Working Set 组织后，再以 OS advice 与运行时反馈连接到 Linux VM。
 
-本项目在 `llama.cpp` 的 CPU/MoE 路径中建立这条连接：模型加载阶段登记 Expert Tensor，MoE Router 的实际选择定位到 Expert Slice，异步任务将需求送往 Linux `MADV_WILLNEED` hint 路径，并把 Task、First-use 和 OS 指标写入同一组 trace。当前系统还实现了 Memory Object Lifecycle、Semantic Working Set，以及默认关闭的 `MADV_COLD` / Runtime Rescue 研究控制机制。
+本项目在 `llama.cpp` 的 CPU/MoE 路径中建立这条连接：模型加载阶段登记 Expert Tensor，MoE Router 的实际选择定位到 Expert Slice，异步任务将需求送往 Linux `MADV_WILLNEED` hint 路径，并把 Task、First-use 和 OS 指标写入同一组 trace。当前系统还实现了 Memory Object Lifecycle、Semantic Working Set，以及默认关闭的 `MADV_COLD`、受限 `MADV_DONTNEED` / Runtime Rescue 研究控制机制。
 
-这不是一个已证明通用加速的内存管理器，也不声称实现了 KV Cache 在线替换或内核页回收。最终系统解决的问题是：**如何把 LLM Runtime 已知的模型语义转化为 OS 可以观测、管理和验证的内存对象、工作集与控制信号。**
+这不是一个已证明通用加速的内存管理器，也不声称实现了 KV Cache 在线替换或可保证的内核页回收。最终系统解决的问题是：**如何把 LLM Runtime 已知的模型语义转化为 OS 可以观测、管理和验证的内存对象、工作集与控制信号。**
 
 ## 2. Motivation：为什么 LLM 推理需要 OS 语义
 
@@ -93,7 +93,7 @@ protected object 可以使预算短时间无法满足；这恰恰说明 budget �
 
 ### 4.6 OS Memory Actions
 
-`MADV_WILLNEED` 用于 expert hint；`MADV_COLD` 是受研究开关保护的冷对象 advice。二者都只是 Linux 建议，不提供物理页回收或 page-in 完成的保证。
+`MADV_WILLNEED` 用于 expert hint；`MADV_COLD` 是受研究开关保护的冷对象 advice；`MADV_DONTNEED` 只处理已经 shadow eviction、无 pending/active/in-flight hint、经过 grace steps 的 Expert Slice。DONTNEED 还要求 Slice 的完整范围位于 `/proc/self/maps` 识别的文件映射中，并只建议 Slice 内部的完整页。三者都只是 Linux 建议，不提供物理页回收或 page-in 完成的保证。
 
 ### 4.7 Runtime Rescue
 
@@ -224,6 +224,7 @@ current HEAD 的 Shadow-only 与 Shadow + COLD 对照为 N=3/组；唯一实验�
 | Mechanism | Status |
 | --- | --- |
 | `MADV_COLD` | research controller，默认 OFF；未证明稳定净收益 |
+| `MADV_DONTNEED` | memory-pressure reclaim controller，默认 OFF；待场景 A 验证 |
 | Runtime Rescue | experimental guard；具备条件性状态机证据 |
 | Calibration Shadow / Controller | observation / research mechanism，非默认主线 |
 
@@ -331,7 +332,26 @@ bash llama.cpp/trace/run_trace_pipeline.sh
 
 该 profile 没有 `STEP_END`，因此不报告 decode p95；用 `process_metrics.json` 的 whole-process wall time、major faults、max RSS 做重复实验聚合。`summarize_repeat_runs.py` 已支持该指标口径。需要逐 token 或 p95 延迟时使用 `TRACE_PROFILE=benchmark`，不能将两种 trace profile 混在同一对照组。
 
-### 10.7 相关 CTest
+### 10.7 受限 DONTNEED 回收
+
+`LLM_MEM_TRACE_OPT_EXPERT_MADV_DONTNEED_RECLAIM=1` 只在 Decode 的 layer end 尝试回收。它要求 Working Set 已经 shadow eviction、`pending_users == 0`、`active_users == 0`、没有 in-flight hint，并等待 `LLM_MEM_TRACE_OPT_EXPERT_RECLAIM_GRACE_STEPS`（默认 3）个 step。每个候选还要经 `find_file_mapping` 检查，并只对 Slice 内部完整页调用 `MADV_DONTNEED`。
+
+触发门控为 `memory.current / effective cgroup limit >= 85%`（优先 `memory.high`，否则 `memory.max`）或 `workingset refault_delta >= 1024`；二者均可通过环境变量调整。全 Decode step 的总建议上限由 `LLM_MEM_TRACE_OPT_EXPERT_RECLAIM_MAX_MB_PER_STEP` 控制，默认 64 MiB。DONTNEED 与 COLD 同时启用时，DONTNEED 优先，避免同一 eviction episode 收到两种 reclaim advice。
+
+```bash
+MODEL_FILE=/path/to/Qwen3.5-35B-A3B-Q3_K_M.gguf \
+RUN_NAME=survival_dontneed \
+LLM_MEM_TRACE_OPT_EXPERT_PROFILE=survival \
+TRACE_PROFILE=control \
+LLM_MEM_TRACE_OPT_EXPERT_WORKING_SET_MB=256 \
+LLM_MEM_TRACE_OPT_EXPERT_MADV_DONTNEED_RECLAIM=1 \
+LLM_MEM_TRACE_OPT_EXPERT_RECLAIM_MAX_MB_PER_STEP=64 \
+bash llama.cpp/trace/run_trace_pipeline.sh
+```
+
+`EXPERT_MEMORY_OBJECT_SUMMARY` 会报告候选、issued/failed bytes、预算延后、in-flight 跳过、映射/页对齐拒绝和 DONTNEED 后 readmission。该机制默认关闭；`madvise` 成功不表示物理页一定已经释放。场景 A 的完成性和输出一致性实验留到下一项执行。
+
+### 10.8 相关 CTest
 
 ```bash
 ctest --test-dir llama.cpp/build --output-on-failure \
@@ -356,7 +376,7 @@ ctest --test-dir llama.cpp/build --output-on-failure \
 - 当前闭合测试主要针对 `Qwen3.5-35B-A3B`、CPU-only、当前 WSL/Linux 与冷缓存环境；不应外推为跨硬件或跨模型结论。
 - 当前控制机制尚未证明稳定端到端性能提升：Prefetch 未稳定加速，`MADV_COLD` 在当前 N=3 对照中与更高 wall time 和 major faults 相关。
 - Runtime Rescue 只有条件性机制证据；尚无严格状态匹配的整体性能因果证明。
-- `madvise` 是 Linux hint；不应由此推断 page-in 完成、物理页回收或精确驻留状态。
+- `madvise` 是 Linux hint；不应由此推断 page-in 完成、物理页回收或精确驻留状态，包括受限 DONTNEED 成功返回。
 - Working Set 是 semantic capacity constraint，不是严格物理 memory cap。
 - Memory Object Lifecycle 在该 workload 上有可测运行开销与高方差；其核心证据是状态正确性。
 - 未可靠采集 swap peak，因此不报告 swap peak 性能结论。

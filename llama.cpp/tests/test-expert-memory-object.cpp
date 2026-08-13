@@ -319,6 +319,67 @@ static void test_protected_objects_never_become_cold_candidates() {
             "protected object reached the COLD candidate path");
 }
 
+static void test_dontneed_candidate_requires_idle_noninflight_probation() {
+    ExpertMemoryObjectTracker tracker(1024);
+    const char * victim = "blk.19.ffn_gate_exps.weight";
+    require(tracker.register_demand(10, 19, 1, victim, 0x19000, 1024),
+            "DONTNEED victim demand was not registered");
+    tracker.end_layer(19);
+    require(tracker.register_demand(10, 20, 1, "blk.20.ffn_gate_exps.weight", 0x1a000, 1024),
+            "DONTNEED eviction trigger was not registered");
+
+    require(tracker.try_acquire_hint_slot(19, 1, victim),
+            "DONTNEED inflight guard setup failed");
+    require(tracker.end_layer_and_collect_madv_dontneed_candidates(19, 13, 3, 1024).empty(),
+            "inflight DONTNEED candidate was not rejected");
+    require(tracker.release_hint_slot(19, 1, victim, false),
+            "DONTNEED inflight guard was not released");
+
+    const std::vector<ExpertMadVDontNeedCandidate> candidates =
+            tracker.end_layer_and_collect_madv_dontneed_candidates(19, 13, 3, 1024);
+    require(candidates.size() == 1, "grace-expired idle victim was not a DONTNEED candidate");
+    require(candidates[0].layer == 19 && candidates[0].nbytes == 1024,
+            "DONTNEED candidate identity is wrong");
+    tracker.record_madv_dontneed_result(true, candidates[0].nbytes);
+    require(tracker.end_layer_and_collect_madv_dontneed_candidates(19, 14, 3, 1024).empty(),
+            "DONTNEED probation episode emitted twice");
+
+    require(tracker.register_demand(14, 19, 1, victim, 0x19000, 1024),
+            "post-DONTNEED demand did not readmit the victim");
+    const ExpertMemoryObjectCounters counters = tracker.counters();
+    require(counters.madv_dontneed_inflight_skipped == 1,
+            "DONTNEED inflight skip count is wrong");
+    require(counters.madv_dontneed_candidates == 1 && counters.madv_dontneed_issued == 1,
+            "DONTNEED candidate/issued count is wrong");
+    require(counters.madv_dontneed_failed == 0 && counters.madv_dontneed_bytes == 1024,
+            "DONTNEED result accounting is wrong");
+    require(counters.post_dontneed_readmissions == 1,
+            "post-DONTNEED readmission was not counted");
+}
+
+static void test_dontneed_candidate_collection_respects_budget() {
+    ExpertMemoryObjectTracker tracker(2048);
+    require(tracker.register_demand(10, 21, 1, "blk.21.ffn_gate_exps.weight", 0x21000, 1024),
+            "first DONTNEED budget victim was not registered");
+    require(tracker.register_demand(10, 21, 2, "blk.21.ffn_up_exps.weight", 0x22000, 1024),
+            "second DONTNEED budget victim was not registered");
+    tracker.end_layer(21);
+    require(tracker.register_demand(10, 22, 1, "blk.22.ffn_gate_exps.weight", 0x23000, 1024),
+            "first DONTNEED budget eviction trigger was not registered");
+    tracker.end_layer(22);
+    require(tracker.register_demand(10, 23, 1, "blk.23.ffn_gate_exps.weight", 0x24000, 1024),
+            "second DONTNEED budget eviction trigger was not registered");
+
+    const std::vector<ExpertMadVDontNeedCandidate> candidates =
+            tracker.end_layer_and_collect_madv_dontneed_candidates(21, 13, 3, 1024);
+    require(candidates.size() == 1, "DONTNEED collection exceeded the supplied byte budget");
+    const ExpertMemoryObjectCounters counters = tracker.counters();
+    require(counters.madv_dontneed_budget_deferred_candidates == 1,
+            "DONTNEED budget deferral was not counted");
+    require(counters.madv_dontneed_budget_deferred_bytes == 1024,
+            "DONTNEED deferred byte count is wrong");
+}
+
 int main() {
     test_demand_merge_activation_and_completion();
     test_cross_step_demand_and_stale_cleanup();
@@ -334,5 +395,7 @@ int main() {
     test_probation_grace_and_single_cold_candidate();
     test_post_cold_readmission_is_allowed();
     test_protected_objects_never_become_cold_candidates();
+    test_dontneed_candidate_requires_idle_noninflight_probation();
+    test_dontneed_candidate_collection_respects_budget();
     return 0;
 }

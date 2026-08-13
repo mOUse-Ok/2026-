@@ -29,6 +29,9 @@ struct ExpertMemoryObject {
     // Set before the external MADV_COLD syscall so one probation episode has
     // at most one cold-hint attempt.
     bool cold_hint_issued_for_current_eviction = false;
+    // Kept independent from COLD: a DONTNEED experiment has one reclaim
+    // attempt per eviction episode and must not inherit COLD's state.
+    bool dontneed_hint_issued_for_current_eviction = false;
     // Set when this episode's bytes have been counted into
     // cold_eligible_candidate_bytes; prevents scan-only modes from counting
     // the same deferred episode once per layer end. Reset on each eviction.
@@ -36,6 +39,14 @@ struct ExpertMemoryObject {
 };
 
 struct ExpertMadVColdCandidate {
+    int layer = -1;
+    int expert = -1;
+    std::string tensor;
+    uintptr_t addr = 0;
+    size_t nbytes = 0;
+};
+
+struct ExpertMadVDontNeedCandidate {
     int layer = -1;
     int expert = -1;
     std::string tensor;
@@ -111,6 +122,17 @@ struct ExpertMemoryObjectCounters {
     // COLD was actually eligible" scale, distinct from the budget-limited
     // madv_cold_bytes that was actually issued. Accumulates across all steps.
     uint64_t cold_eligible_candidate_bytes = 0;
+    uint64_t madv_dontneed_candidates = 0;
+    uint64_t madv_dontneed_issued = 0;
+    uint64_t madv_dontneed_failed = 0;
+    uint64_t madv_dontneed_bytes = 0;
+    uint64_t madv_dontneed_budget_deferred_candidates = 0;
+    uint64_t madv_dontneed_budget_deferred_bytes = 0;
+    uint64_t madv_dontneed_inflight_skipped = 0;
+    uint64_t madv_dontneed_protected_skipped = 0;
+    uint64_t madv_dontneed_mapping_rejected = 0;
+    uint64_t madv_dontneed_inner_page_skipped = 0;
+    uint64_t post_dontneed_readmissions = 0;
 };
 
 class ExpertMemoryObjectTracker {
@@ -144,6 +166,14 @@ public:
             uint64_t grace_steps,
             uint64_t max_collect_bytes = 0);
     void record_madv_cold_result(bool issued, size_t nbytes);
+    std::vector<ExpertMadVDontNeedCandidate> end_layer_and_collect_madv_dontneed_candidates(
+            int layer,
+            uint64_t step,
+            uint64_t grace_steps,
+            uint64_t max_collect_bytes);
+    void record_madv_dontneed_result(bool issued, size_t advised_bytes);
+    void record_madv_dontneed_mapping_rejected();
+    void record_madv_dontneed_inner_page_skipped();
     void record_cold_skipped_ttl_nonzero();
     ExpertMemoryObjectCounters counters() const;
 

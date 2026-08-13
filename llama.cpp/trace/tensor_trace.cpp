@@ -149,6 +149,12 @@ bool expert_madv_cold_reclaim_requested() {
     return requested;
 }
 
+bool expert_madv_dontneed_reclaim_requested() {
+    static const bool requested = env_truthy(
+            std::getenv("LLM_MEM_TRACE_OPT_EXPERT_MADV_DONTNEED_RECLAIM"));
+    return requested;
+}
+
 uint64_t expert_madv_cold_reclaim_grace_steps() {
     static const uint64_t grace_steps = [] {
         const char * value = std::getenv("LLM_MEM_TRACE_OPT_EXPERT_RECLAIM_GRACE_STEPS");
@@ -184,8 +190,34 @@ bool expert_working_set_requested() {
     return expert_working_set_budget_bytes() > 0;
 }
 
+uint64_t expert_madv_dontneed_reclaim_max_bytes() {
+    static const uint64_t max_bytes = [] {
+        constexpr uint64_t mib = 1024ull * 1024ull;
+        const char * value = std::getenv("LLM_MEM_TRACE_OPT_EXPERT_RECLAIM_MAX_MB_PER_STEP");
+        if (!value || !value[0]) {
+            return uint64_t{64} * mib;
+        }
+        char * end = nullptr;
+        const uint64_t mb = (uint64_t) std::strtoull(value, &end, 10);
+        if (!end || *end != '\0') {
+            return uint64_t{64} * mib;
+        }
+        return mb > std::numeric_limits<uint64_t>::max() / mib ?
+                std::numeric_limits<uint64_t>::max() : mb * mib;
+    }();
+    return max_bytes;
+}
+
+bool expert_madv_dontneed_reclaim_enabled() {
+    return expert_madv_dontneed_reclaim_requested() && expert_working_set_requested() &&
+            expert_madv_dontneed_reclaim_max_bytes() > 0 && llm_mem_trace_enabled();
+}
+
 bool expert_madv_cold_reclaim_enabled() {
-    return expert_madv_cold_reclaim_requested() && expert_working_set_requested() &&
+    // DONTNEED is an explicit reclamation experiment and takes precedence over
+    // COLD so an eviction episode cannot receive both forms of advice.
+    return expert_madv_cold_reclaim_requested() && !expert_madv_dontneed_reclaim_enabled() &&
+            expert_working_set_requested() &&
             llm_mem_trace_enabled();
 }
 
@@ -194,7 +226,7 @@ bool expert_memory_objects_enabled() {
             std::getenv("LLM_MEM_TRACE_OPT_EXPERT_MEMORY_OBJECTS"));
     return (lifecycle_enabled || expert_inflight_hint_aggregation_requested() ||
             expert_semantic_stale_cancel_requested() || expert_working_set_requested() ||
-            expert_madv_cold_reclaim_enabled()) &&
+            expert_madv_cold_reclaim_enabled() || expert_madv_dontneed_reclaim_enabled()) &&
             llm_mem_trace_enabled();
 }
 
@@ -631,6 +663,50 @@ bool find_file_mapping(uintptr_t addr, FileMapping & out) {
 
     std::fclose(fp);
     return false;
+}
+
+bool file_mapping_contains_range(
+        const FileMapping & mapping,
+        uintptr_t addr,
+        size_t nbytes) {
+    if (addr < mapping.start || nbytes == 0 ||
+            nbytes > std::numeric_limits<uintptr_t>::max() - addr) {
+        return false;
+    }
+    const uintptr_t end = addr + nbytes;
+    return end > addr && end <= mapping.end;
+}
+
+// DONTNEED must cover only complete pages wholly contained by the semantic
+// Expert Slice.  Rounding outward could discard a page shared with a neighbor.
+bool page_aligned_inner_file_range(
+        const FileMapping & mapping,
+        uintptr_t addr,
+        size_t nbytes,
+        uintptr_t & start,
+        size_t & len) {
+    if (!file_mapping_contains_range(mapping, addr, nbytes)) {
+        return false;
+    }
+    const long sys_page_size = sysconf(_SC_PAGESIZE);
+    if (sys_page_size <= 0) {
+        return false;
+    }
+    const uintptr_t page_size = (uintptr_t) sys_page_size;
+    if (addr > std::numeric_limits<uintptr_t>::max() - (page_size - 1)) {
+        return false;
+    }
+    start = ((addr + page_size - 1) / page_size) * page_size;
+    const uintptr_t end = (addr + nbytes) / page_size * page_size;
+    if (end <= start || start < mapping.start || end > mapping.end) {
+        return false;
+    }
+    const uintptr_t range_len = end - start;
+    if (range_len > std::numeric_limits<size_t>::max()) {
+        return false;
+    }
+    len = (size_t) range_len;
+    return true;
 }
 #endif
 
@@ -2347,7 +2423,7 @@ struct ExpertPressureController {
 
     ExpertPressureSnapshot snapshot(bool force = false) {
         const uint64_t base_budget = expert_prefetch_budget_bytes();
-        if (!expert_feedback_enabled()) {
+        if (!expert_feedback_enabled() && !expert_madv_dontneed_reclaim_enabled()) {
             ExpertPressureSnapshot out;
             out.prefetch_budget_bytes = base_budget;
             return out;
@@ -2481,6 +2557,69 @@ struct ExpertPressureController {
 ExpertPressureController & expert_pressure_controller() {
     static ExpertPressureController controller;
     return controller;
+}
+
+bool expert_madv_dontneed_pressure_allows(const ExpertPressureSnapshot & pressure) {
+    if (!pressure.available) {
+        return false;
+    }
+    const double memory_ratio_threshold = env_double_or_default(
+            "LLM_MEM_TRACE_OPT_EXPERT_RECLAIM_MEMORY_RATIO_PCT", 85.0);
+    const uint64_t refault_delta_threshold = env_u64_or_default(
+            "LLM_MEM_TRACE_OPT_EXPERT_RECLAIM_REFAULT_DELTA", 1024);
+    return pressure.memory_ratio_pct >= memory_ratio_threshold ||
+            pressure.refault_delta >= refault_delta_threshold;
+}
+
+struct ExpertDontNeedStepBudgetSnapshot {
+    uint64_t last_step = 0;
+    uint64_t last_step_reserved_bytes = 0;
+    uint64_t peak_step_reserved_bytes = 0;
+};
+
+class ExpertDontNeedStepBudget {
+public:
+    uint64_t remaining(uint64_t step) {
+        std::lock_guard<std::mutex> lock(mu_);
+        reset_for_step_unlocked(step);
+        const uint64_t max_bytes = expert_madv_dontneed_reclaim_max_bytes();
+        return max_bytes > reserved_bytes_ ? max_bytes - reserved_bytes_ : 0;
+    }
+
+    bool try_reserve(uint64_t step, uint64_t bytes) {
+        std::lock_guard<std::mutex> lock(mu_);
+        reset_for_step_unlocked(step);
+        const uint64_t max_bytes = expert_madv_dontneed_reclaim_max_bytes();
+        if (bytes == 0 || bytes > max_bytes || reserved_bytes_ > max_bytes - bytes) {
+            return false;
+        }
+        reserved_bytes_ += bytes;
+        peak_step_reserved_bytes_ = std::max(peak_step_reserved_bytes_, reserved_bytes_);
+        return true;
+    }
+
+    ExpertDontNeedStepBudgetSnapshot snapshot() const {
+        std::lock_guard<std::mutex> lock(mu_);
+        return { last_step_, reserved_bytes_, peak_step_reserved_bytes_ };
+    }
+
+private:
+    void reset_for_step_unlocked(uint64_t step) {
+        if (step != last_step_) {
+            last_step_ = step;
+            reserved_bytes_ = 0;
+        }
+    }
+
+    mutable std::mutex mu_;
+    uint64_t last_step_ = 0;
+    uint64_t reserved_bytes_ = 0;
+    uint64_t peak_step_reserved_bytes_ = 0;
+};
+
+ExpertDontNeedStepBudget & expert_madv_dontneed_step_budget() {
+    static ExpertDontNeedStepBudget budget;
+    return budget;
 }
 
 struct ExpertTimingModel {
@@ -3010,8 +3149,10 @@ void write_expert_memory_object_summary() {
         return;
     }
     const ExpertMemoryObjectCounters counters = expert_memory_object_tracker().counters();
+    const ExpertDontNeedStepBudgetSnapshot dontneed_budget =
+            expert_madv_dontneed_step_budget().snapshot();
     std::string line;
-    line.reserve(400);
+    line.reserve(800);
     line += "{\"event\":\"EXPERT_MEMORY_OBJECT_SUMMARY\",\"ts_ns\":" +
             std::to_string(llm_mem_trace_time_ns());
     line += ",\"enabled\":true";
@@ -3025,6 +3166,18 @@ void write_expert_memory_object_summary() {
             expert_madv_cold_reclaim_enabled() ? "true" : "false");
     line += ",\"madv_cold_grace_steps\":" +
             std::to_string(expert_madv_cold_reclaim_grace_steps());
+    line += ",\"madv_dontneed_reclaim_enabled\":" + std::string(
+            expert_madv_dontneed_reclaim_enabled() ? "true" : "false");
+    line += ",\"madv_dontneed_grace_steps\":" +
+            std::to_string(expert_madv_cold_reclaim_grace_steps());
+    line += ",\"madv_dontneed_max_bytes_per_decode_step\":" +
+            std::to_string(expert_madv_dontneed_reclaim_max_bytes());
+    line += ",\"madv_dontneed_memory_ratio_threshold_pct\":" +
+            std::to_string(env_double_or_default(
+                    "LLM_MEM_TRACE_OPT_EXPERT_RECLAIM_MEMORY_RATIO_PCT", 85.0));
+    line += ",\"madv_dontneed_refault_delta_threshold\":" +
+            std::to_string(env_u64_or_default(
+                    "LLM_MEM_TRACE_OPT_EXPERT_RECLAIM_REFAULT_DELTA", 1024));
     line += ",\"memory_objects_created\":" +
             std::to_string(counters.memory_objects_created);
     line += ",\"semantic_demands_registered\":" +
@@ -3132,6 +3285,34 @@ void write_expert_memory_object_summary() {
             std::to_string(counters.madv_cold_budget_deferred_bytes);
     line += ",\"cold_eligible_candidate_bytes\":" +
             std::to_string(counters.cold_eligible_candidate_bytes);
+    line += ",\"madv_dontneed_candidates\":" +
+            std::to_string(counters.madv_dontneed_candidates);
+    line += ",\"madv_dontneed_issued\":" +
+            std::to_string(counters.madv_dontneed_issued);
+    line += ",\"madv_dontneed_failed\":" +
+            std::to_string(counters.madv_dontneed_failed);
+    line += ",\"madv_dontneed_bytes\":" +
+            std::to_string(counters.madv_dontneed_bytes);
+    line += ",\"madv_dontneed_budget_deferred_candidates\":" +
+            std::to_string(counters.madv_dontneed_budget_deferred_candidates);
+    line += ",\"madv_dontneed_budget_deferred_bytes\":" +
+            std::to_string(counters.madv_dontneed_budget_deferred_bytes);
+    line += ",\"madv_dontneed_inflight_skipped\":" +
+            std::to_string(counters.madv_dontneed_inflight_skipped);
+    line += ",\"madv_dontneed_protected_skipped\":" +
+            std::to_string(counters.madv_dontneed_protected_skipped);
+    line += ",\"madv_dontneed_mapping_rejected\":" +
+            std::to_string(counters.madv_dontneed_mapping_rejected);
+    line += ",\"madv_dontneed_inner_page_skipped\":" +
+            std::to_string(counters.madv_dontneed_inner_page_skipped);
+    line += ",\"post_dontneed_readmissions\":" +
+            std::to_string(counters.post_dontneed_readmissions);
+    line += ",\"madv_dontneed_last_step\":" +
+            std::to_string(dontneed_budget.last_step);
+    line += ",\"madv_dontneed_last_step_reserved_bytes\":" +
+            std::to_string(dontneed_budget.last_step_reserved_bytes);
+    line += ",\"madv_dontneed_peak_step_reserved_bytes\":" +
+            std::to_string(dontneed_budget.peak_step_reserved_bytes);
     line += "}";
     llm_mem_trace_write(LLM_MEM_TRACE_SINK_MEMORY, line.c_str(), line.size());
 }
@@ -4180,6 +4361,82 @@ void log_param_access(
     llm_mem_trace_write(LLM_MEM_TRACE_SINK_TENSOR, line.c_str(), line.size());
 }
 
+void end_expert_layer_with_madv_dontneed_reclaim(int layer, uint64_t step) {
+    ExpertMemoryObjectTracker & tracker = expert_memory_object_tracker();
+    if (llm_mem_trace_get_phase() != LLM_MEM_TRACE_PHASE_DECODE) {
+        tracker.end_layer(layer);
+        return;
+    }
+
+    const ExpertPressureSnapshot pressure = expert_pressure_controller().snapshot();
+    if (!expert_madv_dontneed_pressure_allows(pressure)) {
+        tracker.end_layer(layer);
+        return;
+    }
+
+    ExpertDontNeedStepBudget & step_budget = expert_madv_dontneed_step_budget();
+    const uint64_t remaining_bytes = step_budget.remaining(step);
+    if (remaining_bytes == 0) {
+        tracker.end_layer(layer);
+        return;
+    }
+
+    const std::vector<ExpertMadVDontNeedCandidate> candidates =
+            tracker.end_layer_and_collect_madv_dontneed_candidates(
+                    layer, step, expert_madv_cold_reclaim_grace_steps(), remaining_bytes);
+    for (const ExpertMadVDontNeedCandidate & candidate : candidates) {
+#ifdef __linux__
+        FileMapping mapping;
+        if (!find_file_mapping(candidate.addr, mapping) ||
+                !file_mapping_contains_range(mapping, candidate.addr, candidate.nbytes)) {
+            tracker.record_madv_dontneed_mapping_rejected();
+            tracker.record_madv_dontneed_result(false, 0);
+            write_os_hint_event(
+                    "expert_madvise_dontneed",
+                    "expert_reclaim_mapping_rejected",
+                    candidate.tensor.c_str(), candidate.layer, candidate.expert,
+                    candidate.addr, candidate.nbytes, 0, -1, ENOENT);
+            continue;
+        }
+
+        uintptr_t advised_addr = 0;
+        size_t advised_bytes = 0;
+        if (!page_aligned_inner_file_range(
+                    mapping, candidate.addr, candidate.nbytes, advised_addr, advised_bytes)) {
+            tracker.record_madv_dontneed_inner_page_skipped();
+            tracker.record_madv_dontneed_result(false, 0);
+            write_os_hint_event(
+                    "expert_madvise_dontneed",
+                    "expert_reclaim_inner_page_rejected",
+                    candidate.tensor.c_str(), candidate.layer, candidate.expert,
+                    candidate.addr, candidate.nbytes, 0, -1, EINVAL);
+            continue;
+        }
+
+        // Candidate collection reserved against the remaining budget using the
+        // larger semantic slice size.  Reserve the actual inner page range as
+        // a second, explicit guard for the whole Decode step.
+        if (!step_budget.try_reserve(step, advised_bytes)) {
+            tracker.record_madv_dontneed_result(false, 0);
+            continue;
+        }
+        const int rc = apply_madvise_hint(
+                "expert_madvise_dontneed",
+                MADV_DONTNEED,
+                "expert_probation_reclaim",
+                candidate.tensor.c_str(),
+                candidate.layer,
+                candidate.expert,
+                advised_addr,
+                advised_bytes);
+        tracker.record_madv_dontneed_result(rc == 0, advised_bytes);
+#else
+        (void) candidate;
+        tracker.record_madv_dontneed_result(false, 0);
+#endif
+    }
+}
+
 struct LayerTracker {
     std::mutex mu;
     uint64_t step_id = 0;
@@ -4233,6 +4490,9 @@ struct LayerTracker {
         }
 
         if (expert_memory_objects_enabled()) {
+            if (expert_madv_dontneed_reclaim_enabled()) {
+                end_expert_layer_with_madv_dontneed_reclaim(layer, step);
+            } else {
             const int cold_mode = expert_runtime_rescue_cold_issue_mode();
             const bool calibrated = expert_calibrated_control_enabled() &&
                     expert_madv_cold_reclaim_enabled();
@@ -4323,6 +4583,7 @@ struct LayerTracker {
                 }
             } else {
                 expert_memory_object_tracker().end_layer(layer);
+            }
             }
         }
 

@@ -39,12 +39,15 @@ void ExpertMemoryObjectTracker::admit_to_working_set_unlocked(
 
     if (!object_was_created && object.has_shadow_eviction_record) {
         subtract_unlocked(counters_.current_probation_objects, 1);
-        if (object.cold_hint_issued_for_current_eviction) {
+        if (object.dontneed_hint_issued_for_current_eviction) {
+            counters_.post_dontneed_readmissions++;
+        } else if (object.cold_hint_issued_for_current_eviction) {
             counters_.post_cold_readmissions++;
         } else {
             counters_.probation_canceled_by_readmission++;
         }
         object.cold_hint_issued_for_current_eviction = false;
+        object.dontneed_hint_issued_for_current_eviction = false;
     }
 
     object.in_working_set = true;
@@ -121,6 +124,7 @@ void ExpertMemoryObjectTracker::evict_to_working_set_budget_unlocked(uint64_t st
         victim->last_shadow_eviction_step = step;
         victim->has_shadow_eviction_record = true;
         victim->cold_hint_issued_for_current_eviction = false;
+        victim->dontneed_hint_issued_for_current_eviction = false;
         victim->eligible_counted_for_current_eviction = false;
         subtract_unlocked(counters_.working_set_current_bytes, (uint64_t) victim->nbytes);
         subtract_unlocked(counters_.working_set_objects, 1);
@@ -435,6 +439,90 @@ void ExpertMemoryObjectTracker::record_madv_cold_result(bool issued, size_t nbyt
     } else {
         counters_.madv_cold_bytes += (uint64_t) nbytes;
     }
+}
+
+std::vector<ExpertMadVDontNeedCandidate>
+ExpertMemoryObjectTracker::end_layer_and_collect_madv_dontneed_candidates(
+        int layer,
+        uint64_t step,
+        uint64_t grace_steps,
+        uint64_t max_collect_bytes) {
+    std::vector<ExpertMadVDontNeedCandidate> candidates;
+    if (layer < 0 || max_collect_bytes == 0) {
+        return candidates;
+    }
+
+    std::lock_guard<std::mutex> lock(mu_);
+    end_layer_unlocked(layer);
+    uint64_t collected_bytes = 0;
+    for (auto & entry : objects_) {
+        ExpertMemoryObject & object = entry.second;
+        if (object.layer != layer || object.in_working_set ||
+                !object.has_shadow_eviction_record ||
+                object.dontneed_hint_issued_for_current_eviction) {
+            continue;
+        }
+        if (object.pending_users > 0 || object.active_users > 0) {
+            counters_.madv_dontneed_protected_skipped++;
+            continue;
+        }
+        if (object.hint_inflight) {
+            counters_.madv_dontneed_inflight_skipped++;
+            continue;
+        }
+        if (step < object.last_shadow_eviction_step) {
+            counters_.invariant_violations++;
+            continue;
+        }
+        if (step - object.last_shadow_eviction_step < grace_steps) {
+            continue;
+        }
+        if (object.nbytes > max_collect_bytes ||
+                collected_bytes > max_collect_bytes - object.nbytes) {
+            // Leave the episode available to a later Decode step.  The caller
+            // supplies the remaining whole-step budget, not a per-layer cap.
+            counters_.madv_dontneed_budget_deferred_candidates++;
+            counters_.madv_dontneed_budget_deferred_bytes += (uint64_t) object.nbytes;
+            continue;
+        }
+
+        object.dontneed_hint_issued_for_current_eviction = true;
+        collected_bytes += (uint64_t) object.nbytes;
+        counters_.madv_dontneed_candidates++;
+        ExpertMadVDontNeedCandidate candidate;
+        candidate.layer = object.layer;
+        candidate.expert = object.expert;
+        candidate.tensor = object.tensor;
+        candidate.addr = object.addr;
+        candidate.nbytes = object.nbytes;
+        candidates.push_back(std::move(candidate));
+    }
+    return candidates;
+}
+
+void ExpertMemoryObjectTracker::record_madv_dontneed_result(bool issued, size_t advised_bytes) {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (!issued) {
+        counters_.madv_dontneed_failed++;
+        return;
+    }
+    counters_.madv_dontneed_issued++;
+    if (advised_bytes > std::numeric_limits<uint64_t>::max() - counters_.madv_dontneed_bytes) {
+        counters_.madv_dontneed_bytes = std::numeric_limits<uint64_t>::max();
+        counters_.invariant_violations++;
+    } else {
+        counters_.madv_dontneed_bytes += (uint64_t) advised_bytes;
+    }
+}
+
+void ExpertMemoryObjectTracker::record_madv_dontneed_mapping_rejected() {
+    std::lock_guard<std::mutex> lock(mu_);
+    counters_.madv_dontneed_mapping_rejected++;
+}
+
+void ExpertMemoryObjectTracker::record_madv_dontneed_inner_page_skipped() {
+    std::lock_guard<std::mutex> lock(mu_);
+    counters_.madv_dontneed_inner_page_skipped++;
 }
 
 void ExpertMemoryObjectTracker::record_cold_skipped_ttl_nonzero() {
