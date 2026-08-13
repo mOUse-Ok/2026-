@@ -2040,6 +2040,20 @@ def main():
         if metrics["process_max_rss_gb"] > 0:
             metrics["rss_peak_gb_trace"] = metrics.get("rss_peak_gb", 0)
             metrics["rss_peak_gb"] = metrics["process_max_rss_gb"]
+
+    trace_profile = os.environ.get("TRACE_PROFILE", "")
+    manifest_path = os.path.join(trace_dir, "run_manifest.json")
+    if not trace_profile and os.path.exists(manifest_path):
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            manifest = json.load(f)
+        trace_profile = str(manifest.get("experiment", {}).get("trace_profile", ""))
+    if trace_profile == "control":
+        # This profile deliberately writes no STEP_END records.  Whole-process
+        # wall time from GNU time is the comparable latency metric instead.
+        metrics["trace_profile"] = "control"
+        metrics["control_trace_only"] = True
+        metrics["latency_metric_source"] = "process_wall_time"
+        metrics["decode_steps"] = 0
     for k, v in metrics.items():
         if isinstance(v, float):
             print(f"      {k}: {v:.2f}")

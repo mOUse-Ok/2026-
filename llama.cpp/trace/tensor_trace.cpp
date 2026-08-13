@@ -489,7 +489,7 @@ void write_os_hint_event(
         int error_code,
         uint64_t file_offset = 0,
         const OsHintMeta * meta = nullptr) {
-    if (!llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_MEMORY)) {
+    if (!llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_MEMORY) || llm_mem_trace_control_only()) {
         return;
     }
     char addr_buf[32];
@@ -1694,7 +1694,7 @@ struct ExpertRuntimeRescueController {
         }
         counters.reentry_step_budget_used_bytes = 0;
 
-        if (!llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_MEMORY)) {
+        if (!llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_MEMORY) || llm_mem_trace_control_only()) {
             return;
         }
         std::string line;
@@ -2131,7 +2131,7 @@ struct ExpertCalibratedController {
                 break;
         }
 
-        if (!llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_MEMORY)) {
+        if (!llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_MEMORY) || llm_mem_trace_control_only()) {
             return;
         }
         std::string line;
@@ -2454,7 +2454,7 @@ struct ExpertPressureController {
     }
 
     void write_event_unlocked(const ExpertPressureSnapshot & value) const {
-        if (!llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_MEMORY)) {
+        if (!llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_MEMORY) || llm_mem_trace_control_only()) {
             return;
         }
         std::string line;
@@ -4208,7 +4208,7 @@ struct LayerTracker {
 
         const uint64_t ts = llm_mem_trace_time_ns();
         expert_timing_model().on_layer_begin(step, layer, llm_mem_trace_get_phase(), ts);
-        if (!llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_MEMORY)) {
+        if (!llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_MEMORY) || llm_mem_trace_control_only()) {
             return;
         }
         std::string line;
@@ -4328,7 +4328,7 @@ struct LayerTracker {
 
         const uint64_t ts = llm_mem_trace_time_ns();
         expert_timing_model().on_layer_end(step, layer, llm_mem_trace_get_phase(), ts);
-        if (!llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_MEMORY)) {
+        if (!llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_MEMORY) || llm_mem_trace_control_only()) {
             return;
         }
         std::string line;

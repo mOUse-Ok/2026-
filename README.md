@@ -316,11 +316,26 @@ TRACE_PROFILE=benchmark \
 bash llama.cpp/trace/run_trace_pipeline.sh
 ```
 
-### 10.6 相关 CTest
+### 10.6 控制期 Trace profile
+
+`TRACE_PROFILE=control` 用于测量管理策略本身，严格关闭 Tensor、KV、Expert、驻留、smaps、详细 Task 以及逐 step 的 Memory JSONL。Router 解析、cgroup/压力读取、Working Set 状态和控制器状态仍执行；`memory_trace.jsonl` 只接受进程结束时的 `*_SUMMARY` 与 `CONTROL_TRACE_SUMMARY`。`summary.json` 会记录 `"control_only": true`。
+
+```bash
+MODEL_FILE=/path/to/Qwen3.5-35B-A3B-Q3_K_M.gguf \
+RUN_NAME=balanced_control \
+LLM_MEM_TRACE_OPT_EXPERT_PROFILE=balanced \
+TRACE_PROFILE=control \
+LLM_MEM_TRACE_OPT_EXPERT_CONTROLLER=expert_prefetch \
+bash llama.cpp/trace/run_trace_pipeline.sh
+```
+
+该 profile 没有 `STEP_END`，因此不报告 decode p95；用 `process_metrics.json` 的 whole-process wall time、major faults、max RSS 做重复实验聚合。`summarize_repeat_runs.py` 已支持该指标口径。需要逐 token 或 p95 延迟时使用 `TRACE_PROFILE=benchmark`，不能将两种 trace profile 混在同一对照组。
+
+### 10.7 相关 CTest
 
 ```bash
 ctest --test-dir llama.cpp/build --output-on-failure \
-  -R '^(test-router-tensor-observation-sync|test-expert-hint-priority|test-expert-task-lifecycle|test-expert-memory-object|test-expert-calibration-shadow)$'
+  -R '^(test-router-tensor-observation-sync|test-router-control-decoupling|test-trace-control-profile|test-expert-hint-priority|test-expert-task-lifecycle|test-expert-memory-object|test-expert-calibration-shadow)$'
 ```
 
 这些测试检查局部同步、priority、task lifecycle、Memory Object 与 calibration shadow 语义；单测通过不构成性能收益。

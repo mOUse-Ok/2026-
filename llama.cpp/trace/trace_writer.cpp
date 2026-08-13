@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 #include <time.h>
@@ -125,6 +126,7 @@ struct TraceWriter {
 
 struct TraceState {
     bool enabled = false;
+    bool control_only = false;
     bool sink_enabled[4] = { false, false, false, false };
     std::string dir;
     size_t queue_limit = 65536;
@@ -206,7 +208,8 @@ void write_summary() {
         return;
     }
 
-    std::string line = "{\"schema_version\":2";
+    std::string line = "{\"schema_version\":3";
+    line += ",\"control_only\":" + std::string(s.control_only ? "true" : "false");
     line += ",\"allow_drop\":" + std::string(s.allow_drop ? "true" : "false");
     line += ",\"queue_limit\":" + std::to_string(s.queue_limit);
     const auto append_counts = [&line](const char * name, const TraceWriter & writer, bool enabled, bool comma) {
@@ -252,6 +255,7 @@ extern "C" void llm_mem_trace_init(const char * dir) {
         }
 
         s.enabled = true;
+        s.control_only = env_bool_or_default("LLM_MEM_TRACE_CONTROL_ONLY", false);
         s.dir = dir && dir[0] ? std::string(dir) : env_str("LLM_MEM_TRACE_DIR", "trace");
 
         std::error_code ec;
@@ -275,10 +279,12 @@ extern "C" void llm_mem_trace_init(const char * dir) {
         }
         if (s.sink_enabled[LLM_MEM_TRACE_SINK_MEMORY]) {
             s.memory.start(s.dir + "/memory_trace.jsonl", s.queue_limit, s.allow_drop);
-            const uint64_t ts = llm_mem_trace_time_ns();
-            const std::string line = "{\"event\":\"TRACE_START\",\"ts_ns\":" + std::to_string(ts) + "}";
-            llm_mem_trace_write(LLM_MEM_TRACE_SINK_MEMORY, line.c_str(), line.size());
-            llm_mem_trace_memory_sample("trace_init");
+            if (!s.control_only) {
+                const uint64_t ts = llm_mem_trace_time_ns();
+                const std::string line = "{\"event\":\"TRACE_START\",\"ts_ns\":" + std::to_string(ts) + "}";
+                llm_mem_trace_write(LLM_MEM_TRACE_SINK_MEMORY, line.c_str(), line.size());
+                llm_mem_trace_memory_sample("trace_init");
+            }
         }
 
         std::atexit(llm_mem_trace_shutdown);
@@ -292,9 +298,14 @@ extern "C" void llm_mem_trace_shutdown(void) {
     }
 
     if (s.sink_enabled[LLM_MEM_TRACE_SINK_MEMORY]) {
-        llm_mem_trace_memory_sample("trace_shutdown");
         const uint64_t ts = llm_mem_trace_time_ns();
-        const std::string line = "{\"event\":\"TRACE_END\",\"ts_ns\":" + std::to_string(ts) + "}";
+        if (!s.control_only) {
+            llm_mem_trace_memory_sample("trace_shutdown");
+        }
+        const std::string line = s.control_only ?
+                "{\"event\":\"CONTROL_TRACE_SUMMARY\",\"ts_ns\":" + std::to_string(ts) +
+                        ",\"event_policy\":\"process_end_summary_only\"}" :
+                "{\"event\":\"TRACE_END\",\"ts_ns\":" + std::to_string(ts) + "}";
         llm_mem_trace_write(LLM_MEM_TRACE_SINK_MEMORY, line.c_str(), line.size());
     }
 
@@ -318,6 +329,11 @@ extern "C" int llm_mem_trace_sink_enabled(int sink) {
     return state().enabled && state().sink_enabled[sink];
 }
 
+extern "C" int llm_mem_trace_control_only(void) {
+    const auto & s = state();
+    return s.enabled && s.control_only ? 1 : 0;
+}
+
 extern "C" void llm_mem_trace_set_ubatch(const struct llama_ubatch * ubatch, int phase, uint64_t step_id) {
     auto & ctx = context();
     ctx.phase.store(phase, std::memory_order_release);
@@ -325,7 +341,7 @@ extern "C" void llm_mem_trace_set_ubatch(const struct llama_ubatch * ubatch, int
     ctx.step_begin_ts.store(0, std::memory_order_release);
     ctx.ubatch.store(ubatch, std::memory_order_release);
 
-    if (ubatch) {
+    if (ubatch && !llm_mem_trace_control_only()) {
         std::lock_guard<std::mutex> lock(ctx.token_mu);
         ctx.token_begin_ts.assign(ubatch->n_tokens, 0);
     }
@@ -364,6 +380,9 @@ extern "C" void llm_mem_trace_step_begin(void) {
     }
     const uint64_t ts = llm_mem_trace_time_ns();
     ctx.step_begin_ts.store(ts, std::memory_order_release);
+    if (llm_mem_trace_control_only()) {
+        return;
+    }
 
     std::string line;
     line.reserve(192);
@@ -386,20 +405,22 @@ extern "C" void llm_mem_trace_step_end(void) {
     }
     const uint64_t ts = llm_mem_trace_time_ns();
 
-    std::string line;
-    line.reserve(224);
-    line += "{\"event\":\"STEP_END\",\"ts_ns\":" + std::to_string(ts);
-    line += ",\"phase\":\"" + std::string(phase_name(llm_mem_trace_get_phase())) + "\"";
-    line += ",\"step\":" + std::to_string(llm_mem_trace_get_step());
-    line += ",\"n_tokens\":" + std::to_string(ubatch->n_tokens);
-    line += ",\"latency_ns\":" + std::to_string(ts - start_ts) + "}";
-    llm_mem_trace_write(LLM_MEM_TRACE_SINK_MEMORY, line.c_str(), line.size());
-    llm_mem_trace_memory_sample("step_end");
+    if (!llm_mem_trace_control_only()) {
+        std::string line;
+        line.reserve(224);
+        line += "{\"event\":\"STEP_END\",\"ts_ns\":" + std::to_string(ts);
+        line += ",\"phase\":\"" + std::string(phase_name(llm_mem_trace_get_phase())) + "\"";
+        line += ",\"step\":" + std::to_string(llm_mem_trace_get_step());
+        line += ",\"n_tokens\":" + std::to_string(ubatch->n_tokens);
+        line += ",\"latency_ns\":" + std::to_string(ts - start_ts) + "}";
+        llm_mem_trace_write(LLM_MEM_TRACE_SINK_MEMORY, line.c_str(), line.size());
+        llm_mem_trace_memory_sample("step_end");
+    }
     llm_mem_trace_runtime_rescue_step_end(ts - start_ts);
 }
 
 extern "C" void llm_mem_trace_token_begin(int token_idx) {
-    if (!llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_MEMORY)) {
+    if (!llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_MEMORY) || llm_mem_trace_control_only()) {
         return;
     }
     const llama_ubatch * ubatch = llm_mem_trace_get_ubatch();
@@ -437,7 +458,7 @@ extern "C" void llm_mem_trace_token_begin(int token_idx) {
 }
 
 extern "C" void llm_mem_trace_token_end(int token_idx) {
-    if (!llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_MEMORY)) {
+    if (!llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_MEMORY) || llm_mem_trace_control_only()) {
         return;
     }
     const llama_ubatch * ubatch = llm_mem_trace_get_ubatch();
@@ -485,6 +506,10 @@ extern "C" void llm_mem_trace_write(int sink, const char * line, size_t len) {
         return;
     }
     if (sink < 0 || sink >= 4 || !s.sink_enabled[sink]) {
+        return;
+    }
+    if (sink == LLM_MEM_TRACE_SINK_MEMORY && s.control_only &&
+            std::string_view(line, len).find("_SUMMARY\"") == std::string_view::npos) {
         return;
     }
 

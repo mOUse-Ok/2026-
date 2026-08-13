@@ -231,6 +231,20 @@ if (LLAMA_MEM_TRACE)
     set_property(TEST test-router-control-decoupling PROPERTY LABELS main)
 
     add_executable(
+        test-trace-control-profile
+        test-trace-control-profile.cpp
+    )
+    target_include_directories(test-trace-control-profile PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../trace
+    )
+    target_link_libraries(test-trace-control-profile PRIVATE ggml-cpu)
+    add_test(
+        NAME test-trace-control-profile
+        COMMAND $<TARGET_FILE:test-trace-control-profile>
+    )
+    set_property(TEST test-trace-control-profile PROPERTY LABELS main)
+
+    add_executable(
         test-expert-hint-priority
         test-expert-hint-priority.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../trace/expert_hint_priority.cpp

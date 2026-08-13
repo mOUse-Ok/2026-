@@ -28,6 +28,9 @@ void llm_mem_trace_init(const char * dir);
 void llm_mem_trace_shutdown(void);
 int  llm_mem_trace_enabled(void);
 int  llm_mem_trace_sink_enabled(int sink);
+// Control-only keeps runtime policy state, but suppresses per-operation JSONL.
+// The MEMORY sink then accepts only process-end *_SUMMARY events.
+int  llm_mem_trace_control_only(void);
 
 uint64_t llm_mem_trace_time_ns(void);
 uint64_t llm_mem_trace_next_step(void);
@@ -66,6 +69,7 @@ static inline void llm_mem_trace_init(const char * dir) { (void) dir; }
 static inline void llm_mem_trace_shutdown(void) {}
 static inline int  llm_mem_trace_enabled(void) { return 0; }
 static inline int  llm_mem_trace_sink_enabled(int sink) { (void) sink; return 0; }
+static inline int  llm_mem_trace_control_only(void) { return 0; }
 
 static inline uint64_t llm_mem_trace_time_ns(void) { return 0; }
 static inline uint64_t llm_mem_trace_next_step(void) { return 0; }

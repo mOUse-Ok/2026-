@@ -134,6 +134,7 @@ def validate_runs(base_dir: Path, runs: list[str]) -> dict[str, Any]:
             raise ValueError(f"{run}: missing required artifacts: {', '.join(missing)}")
 
         manifest = load_json(run_dir / "run_manifest.json")
+        experiment = manifest.get("experiment", {})
         cache = load_json(run_dir / "cache_preparation.json")
         process = load_json(run_dir / "process_metrics.json")
         summary = load_json(run_dir / "summary.json")
@@ -149,10 +150,16 @@ def validate_runs(base_dir: Path, runs: list[str]) -> dict[str, Any]:
             raise ValueError(f"{run}: process exit code is not zero")
         if metrics.get("fault_metric_source") != "gnu_time_process":
             raise ValueError(f"{run}: whole-process fault metrics are missing")
-        if metrics.get("latency_metric_source") != "step_end":
-            raise ValueError(f"{run}: STEP_END latency metrics are missing")
-        if int(metrics.get("decode_steps", 0)) <= 0:
-            raise ValueError(f"{run}: decode STEP_END samples are missing")
+        if experiment.get("trace_profile") == "control":
+            if metrics.get("latency_metric_source") != "process_wall_time":
+                raise ValueError(f"{run}: control trace must use GNU time wall-time metrics")
+            if float(metrics.get("process_wall_time_s", 0)) <= 0:
+                raise ValueError(f"{run}: control trace is missing a positive process wall time")
+        else:
+            if metrics.get("latency_metric_source") != "step_end":
+                raise ValueError(f"{run}: STEP_END latency metrics are missing")
+            if int(metrics.get("decode_steps", 0)) <= 0:
+                raise ValueError(f"{run}: decode STEP_END samples are missing")
 
         sinks = summary.get("sinks")
         if not isinstance(sinks, dict) or not sinks:
@@ -168,7 +175,6 @@ def validate_runs(base_dir: Path, runs: list[str]) -> dict[str, Any]:
         model = manifest.get("model", {})
         prompt = manifest.get("prompt", {})
         binary = manifest.get("binary", {})
-        experiment = manifest.get("experiment", {})
         environment = manifest.get("environment", {})
         cgroup = experiment.get("cgroup", {})
         if cache.get("mode") != experiment.get("cache_mode"):

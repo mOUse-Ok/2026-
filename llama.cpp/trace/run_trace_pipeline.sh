@@ -113,7 +113,7 @@ TEMP="${TEMP:-0.0}"                             # Deterministic output for repro
 SEED="${SEED:-1234}"                            # Fix sampler RNG
 GPU_LAYERS="${GPU_LAYERS:-0}"                  # Route tracing requires CPU-resident experts
 CACHE_MODE="${CACHE_MODE:-cold}"                # cold, warm, or as-is
-TRACE_PROFILE="${TRACE_PROFILE:-evidence}"      # evidence, benchmark, or custom
+TRACE_PROFILE="${TRACE_PROFILE:-evidence}"      # evidence, benchmark, control, attribution, 5a, or custom
 ALLOW_DROPPED_EVENTS="${ALLOW_DROPPED_EVENTS:-0}"
 ALLOW_DIRTY_REPO="${ALLOW_DIRTY_REPO:-0}"
 EXPERT_CONTROLLER="${LLM_MEM_TRACE_OPT_EXPERT_CONTROLLER:-off}"
@@ -149,6 +149,7 @@ case "$EXPERT_CONTROLLER" in
         ;;
 esac
 
+PROFILE_CONTROL_ONLY=0
 case "$TRACE_PROFILE" in
     evidence)
         PROFILE_TENSOR=1
@@ -169,6 +170,20 @@ case "$TRACE_PROFILE" in
         PROFILE_ATTRIBUTION=0
         PROFILE_SMAPS=0
         PROFILE_EXPERT_TASK_MODE=summary
+        ;;
+    control)
+        # Keep the MEMORY sink available to the controller, while its writer
+        # accepts only process-end *_SUMMARY records.  Router parsing and
+        # pressure feedback remain live; Task-1 evidence events do not.
+        PROFILE_TENSOR=0
+        PROFILE_KV=0
+        PROFILE_EXPERT=0
+        PROFILE_MEMORY=1
+        PROFILE_RESIDENCY=0
+        PROFILE_ATTRIBUTION=0
+        PROFILE_SMAPS=0
+        PROFILE_EXPERT_TASK_MODE=off
+        PROFILE_CONTROL_ONLY=1
         ;;
     attribution)
         PROFILE_TENSOR=1
@@ -201,10 +216,23 @@ case "$TRACE_PROFILE" in
         PROFILE_EXPERT_TASK_MODE=detail
         ;;
     *)
-        echo "ERROR: TRACE_PROFILE must be evidence, benchmark, attribution, 5a, or custom" >&2
+        echo "ERROR: TRACE_PROFILE must be evidence, benchmark, control, attribution, 5a, or custom" >&2
         exit 1
         ;;
 esac
+
+# `control` is intentionally strict: allowing a caller to turn a raw sink
+# back on would silently invalidate an overhead comparison labelled control.
+if [ "$TRACE_PROFILE" = "control" ]; then
+    if [ "${LLM_MEM_TRACE_TENSOR:-0}" != "0" ] ||
+       [ "${LLM_MEM_TRACE_KV:-0}" != "0" ] ||
+       [ "${LLM_MEM_TRACE_EXPERT:-0}" != "0" ] ||
+       [ "${LLM_MEM_TRACE_MEMORY:-1}" = "0" ] ||
+       [ "${LLM_MEM_TRACE_CONTROL_ONLY:-1}" = "0" ]; then
+        echo "ERROR: TRACE_PROFILE=control requires TENSOR/KV/EXPERT=0, MEMORY=1, and CONTROL_ONLY=1" >&2
+        exit 1
+    fi
+fi
 
 case "$CACHE_MODE" in
     cold|warm|as-is) ;;
@@ -285,6 +313,7 @@ export LLM_MEM_TRACE_TENSOR="${LLM_MEM_TRACE_TENSOR:-$PROFILE_TENSOR}"
 export LLM_MEM_TRACE_KV="${LLM_MEM_TRACE_KV:-$PROFILE_KV}"
 export LLM_MEM_TRACE_EXPERT="${LLM_MEM_TRACE_EXPERT:-$PROFILE_EXPERT}"
 export LLM_MEM_TRACE_MEMORY="${LLM_MEM_TRACE_MEMORY:-$PROFILE_MEMORY}"
+export LLM_MEM_TRACE_CONTROL_ONLY="${LLM_MEM_TRACE_CONTROL_ONLY:-$PROFILE_CONTROL_ONLY}"
 export LLM_MEM_TRACE_QUEUE_LIMIT="${LLM_MEM_TRACE_QUEUE_LIMIT:-65536}"
 export LLM_MEM_TRACE_ALLOW_DROP="${LLM_MEM_TRACE_ALLOW_DROP:-0}"
 export LLM_MEM_TRACE_EXPERT_TASK_MODE="${LLM_MEM_TRACE_EXPERT_TASK_MODE:-$PROFILE_EXPERT_TASK_MODE}"

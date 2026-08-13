@@ -22,7 +22,10 @@ class RepeatValidationTest(unittest.TestCase):
             run: str,
             *,
             commit: str = "abc",
-            output_hash: str = "a" * 64) -> None:
+            output_hash: str = "a" * 64,
+            trace_profile: str = "benchmark",
+            latency_metric_source: str = "step_end",
+            decode_steps: int = 80) -> None:
         run_dir = base / run
         (run_dir / "analysis").mkdir(parents=True)
         manifest = {
@@ -33,7 +36,7 @@ class RepeatValidationTest(unittest.TestCase):
             "binary": {"sha256": "binary-sha"},
             "host": {"kernel": "test", "cpu": "test"},
             "experiment": {
-                "trace_profile": "benchmark",
+                "trace_profile": trace_profile,
                 "cache_mode": "cold",
                 "repeat_index": "1",
                 "order_position": "1",
@@ -60,8 +63,9 @@ class RepeatValidationTest(unittest.TestCase):
             },
             "analysis/metrics.json": {
                 "fault_metric_source": "gnu_time_process",
-                "latency_metric_source": "step_end",
-                "decode_steps": 80,
+                "latency_metric_source": latency_metric_source,
+                "decode_steps": decode_steps,
+                "process_wall_time_s": 1.5,
             },
         }
         for relative, content in files.items():
@@ -92,6 +96,26 @@ class RepeatValidationTest(unittest.TestCase):
             self.write_run(base, "optimized", output_hash="b" * 64)
             with self.assertRaisesRegex(ValueError, "output hashes disagree"):
                 validate_runs(base, ["baseline", "optimized"])
+
+    def test_control_runs_use_whole_process_wall_time(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            self.write_run(
+                base,
+                "control-baseline",
+                trace_profile="control",
+                latency_metric_source="process_wall_time",
+                decode_steps=0,
+            )
+            self.write_run(
+                base,
+                "control-optimized",
+                trace_profile="control",
+                latency_metric_source="process_wall_time",
+                decode_steps=0,
+            )
+            result = validate_runs(base, ["control-baseline", "control-optimized"])
+            self.assertTrue(result["valid"])
 
 
 if __name__ == "__main__":

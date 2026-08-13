@@ -232,7 +232,7 @@ uint64_t count_maps() {
 } // namespace
 
 extern "C" void llm_mem_trace_memory_sample(const char * reason) {
-    if (!llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_MEMORY)) {
+    if (!llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_MEMORY) || llm_mem_trace_control_only()) {
         return;
     }
 
