@@ -110,6 +110,13 @@ def main() -> None:
     parser.add_argument("--run-name", required=True)
     parser.add_argument("--trace-profile", required=True)
     parser.add_argument("--cache-mode", required=True)
+    parser.add_argument("--expert-profile", required=True)
+    parser.add_argument("--cache-type-k", required=True)
+    parser.add_argument("--cache-type-v", required=True)
+    parser.add_argument("--flash-attn", required=True)
+    parser.add_argument("--batch-size", required=True, type=int)
+    parser.add_argument("--ubatch-size", required=True, type=int)
+    parser.add_argument("--ctx-size", required=True, type=int)
     parser.add_argument("--repeat-index", default="")
     parser.add_argument("--order-position", default="")
     parser.add_argument("--order-mode", default="")
@@ -134,7 +141,12 @@ def main() -> None:
             "NUM_TOKENS_PREDICT",
             "NUM_THREADS",
             "BATCH_SIZE",
+            "UBATCH_SIZE",
             "CTX_SIZE",
+            "EXPERT_PROFILE",
+            "KV_CACHE_TYPE_K",
+            "KV_CACHE_TYPE_V",
+            "FLASH_ATTN",
             "TEMP",
             "SEED",
             "GPU_LAYERS",
@@ -162,7 +174,7 @@ def main() -> None:
         raise SystemExit("requested swap limit is not active in the current cgroup")
 
     manifest = {
-        "schema_version": 2,
+        "schema_version": 3,
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "run_name": args.run_name,
         "git_commit": git_output(args.project, "rev-parse", "HEAD"),
@@ -195,6 +207,15 @@ def main() -> None:
         "experiment": {
             "trace_profile": args.trace_profile,
             "cache_mode": args.cache_mode,
+            "inference_config": {
+                "expert_profile": args.expert_profile,
+                "cache_type_k": args.cache_type_k,
+                "cache_type_v": args.cache_type_v,
+                "flash_attn": args.flash_attn,
+                "batch_size": args.batch_size,
+                "ubatch_size": args.ubatch_size,
+                "ctx_size": args.ctx_size,
+            },
             "repeat_index": args.repeat_index or None,
             "order_position": args.order_position or None,
             "order_mode": args.order_mode or None,

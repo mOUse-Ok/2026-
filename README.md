@@ -293,7 +293,28 @@ llama.cpp/trace_output/<RUN_NAME>/
 └── analysis/
 ```
 
-### 10.5 相关 CTest
+### 10.5 启动期内存配置模板
+
+`LLM_MEM_TRACE_OPT_EXPERT_PROFILE` 只在创建 `llama_context` 前选择 KV 类型、上下文容量和 ubatch；运行中不会改变这些参数。显式设置 `CTX_SIZE`、`UBATCH_SIZE`、`BATCH_SIZE`、`KV_CACHE_TYPE_K`、`KV_CACHE_TYPE_V` 或 `FLASH_ATTN` 时，显式值优先。每次运行会将最终配置写入 `run_manifest.json`。
+
+| Profile | K/V KV 类型 | ctx | ubatch |
+| --- | --- | ---: | ---: |
+| `survival` | `q8_0` / `f16` | 1024 | 64 |
+| `balanced` | `q8_0` / `f16` | 1536 | 128 |
+| `performance` | `f16` / `f16` | 2048 | 512 |
+| `custom`（默认） | `f16` / `f16` | 2048 | 512 |
+
+`survival` 的默认 ctx 取 1024，而不是 512，避免固定测试 Prompt 加生成预算超过上下文。若实际请求所需上下文更大，应显式设置 `CTX_SIZE`；若量化 V，必须同时设定兼容的 `FLASH_ATTN=on`。
+
+```bash
+MODEL_FILE=/path/to/Qwen3.5-35B-A3B-Q3_K_M.gguf \
+RUN_NAME=survival_static \
+LLM_MEM_TRACE_OPT_EXPERT_PROFILE=survival \
+TRACE_PROFILE=benchmark \
+bash llama.cpp/trace/run_trace_pipeline.sh
+```
+
+### 10.6 相关 CTest
 
 ```bash
 ctest --test-dir llama.cpp/build --output-on-failure \

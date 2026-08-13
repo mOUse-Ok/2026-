@@ -52,11 +52,63 @@ Question: Based on the above analysis, what are the three most critical memory b
 # ------------------------------------------------------------------
 # Configuration
 # ------------------------------------------------------------------
+# A profile selects only startup-time inference parameters.  KV type, context
+# capacity and ubatch allocation are fixed when llama_context is created, so
+# they must not be changed by an in-flight pressure controller.
+#
+# "custom" preserves the historical defaults and lets callers supply every
+# parameter directly.  Explicit BATCH_SIZE/UBATCH_SIZE/CTX_SIZE/
+# KV_CACHE_TYPE_K/KV_CACHE_TYPE_V/FLASH_ATTN values always override a profile.
+EXPERT_PROFILE="${LLM_MEM_TRACE_OPT_EXPERT_PROFILE:-custom}"
+case "$EXPERT_PROFILE" in
+    custom)
+        PROFILE_CACHE_TYPE_K=f16
+        PROFILE_CACHE_TYPE_V=f16
+        PROFILE_BATCH_SIZE=512
+        PROFILE_UBATCH_SIZE=512
+        PROFILE_CTX_SIZE=2048
+        PROFILE_FLASH_ATTN=auto
+        ;;
+    survival)
+        # 1024 is deliberately larger than the old 512 proposal: the bundled
+        # prompt plus generation budget can exceed 512 model tokens.
+        PROFILE_CACHE_TYPE_K=q8_0
+        PROFILE_CACHE_TYPE_V=f16
+        PROFILE_BATCH_SIZE=512
+        PROFILE_UBATCH_SIZE=64
+        PROFILE_CTX_SIZE=1024
+        PROFILE_FLASH_ATTN=auto
+        ;;
+    balanced)
+        PROFILE_CACHE_TYPE_K=q8_0
+        PROFILE_CACHE_TYPE_V=f16
+        PROFILE_BATCH_SIZE=512
+        PROFILE_UBATCH_SIZE=128
+        PROFILE_CTX_SIZE=1536
+        PROFILE_FLASH_ATTN=auto
+        ;;
+    performance)
+        PROFILE_CACHE_TYPE_K=f16
+        PROFILE_CACHE_TYPE_V=f16
+        PROFILE_BATCH_SIZE=512
+        PROFILE_UBATCH_SIZE=512
+        PROFILE_CTX_SIZE=2048
+        PROFILE_FLASH_ATTN=auto
+        ;;
+    *)
+        echo "ERROR: LLM_MEM_TRACE_OPT_EXPERT_PROFILE must be custom, survival, balanced, or performance" >&2
+        exit 1
+        ;;
+esac
+
 NUM_TOKENS_PREDICT="${NUM_TOKENS_PREDICT:-80}"  # Decode enough tokens to observe decode behavior
 NUM_THREADS="${NUM_THREADS:-8}"                 # CPU threads
-BATCH_SIZE="${BATCH_SIZE:-512}"                 # Batch size for prefill
-UBATCH_SIZE="${UBATCH_SIZE:-512}"               # Physical batch size
-CTX_SIZE="${CTX_SIZE:-2048}"                    # Context window size
+BATCH_SIZE="${BATCH_SIZE:-$PROFILE_BATCH_SIZE}" # Logical batch size for prefill
+UBATCH_SIZE="${UBATCH_SIZE:-$PROFILE_UBATCH_SIZE}" # Physical batch / compute buffer size
+CTX_SIZE="${CTX_SIZE:-$PROFILE_CTX_SIZE}"       # Context window size
+KV_CACHE_TYPE_K="${KV_CACHE_TYPE_K:-$PROFILE_CACHE_TYPE_K}"
+KV_CACHE_TYPE_V="${KV_CACHE_TYPE_V:-$PROFILE_CACHE_TYPE_V}"
+FLASH_ATTN="${FLASH_ATTN:-$PROFILE_FLASH_ATTN}"
 TEMP="${TEMP:-0.0}"                             # Deterministic output for reproducibility
 SEED="${SEED:-1234}"                            # Fix sampler RNG
 GPU_LAYERS="${GPU_LAYERS:-0}"                  # Route tracing requires CPU-resident experts
@@ -201,6 +253,8 @@ echo "      Predict tokens: $NUM_TOKENS_PREDICT"
 echo "      Trace profile: $TRACE_PROFILE"
 echo "      Cache mode: $CACHE_MODE"
 echo "      Expert controller: $EXPERT_CONTROLLER"
+echo "      Expert startup profile: $EXPERT_PROFILE"
+echo "      Startup memory config: K=$KV_CACHE_TYPE_K, V=$KV_CACHE_TYPE_V, ctx=$CTX_SIZE, batch=$BATCH_SIZE, ubatch=$UBATCH_SIZE, flash-attn=$FLASH_ATTN"
 echo "      Output dir: $TRACE_OUT_DIR"
 echo ""
 
@@ -225,6 +279,8 @@ export LLM_MEM_TRACE_DIR="$TRACE_OUT_DIR"
 export LLM_MEM_TRACE_RUN_ID="${LLM_MEM_TRACE_RUN_ID:-$RUN_NAME}"
 export TRACE_PROFILE CACHE_MODE
 export NUM_TOKENS_PREDICT NUM_THREADS BATCH_SIZE UBATCH_SIZE CTX_SIZE TEMP SEED GPU_LAYERS
+export EXPERT_PROFILE KV_CACHE_TYPE_K KV_CACHE_TYPE_V FLASH_ATTN
+export LLM_MEM_TRACE_OPT_EXPERT_PROFILE="$EXPERT_PROFILE"
 export LLM_MEM_TRACE_TENSOR="${LLM_MEM_TRACE_TENSOR:-$PROFILE_TENSOR}"
 export LLM_MEM_TRACE_KV="${LLM_MEM_TRACE_KV:-$PROFILE_KV}"
 export LLM_MEM_TRACE_EXPERT="${LLM_MEM_TRACE_EXPERT:-$PROFILE_EXPERT}"
@@ -280,6 +336,13 @@ MANIFEST_ARGS=(
     --run-name "$RUN_NAME"
     --trace-profile "$TRACE_PROFILE"
     --cache-mode "$CACHE_MODE"
+    --expert-profile "$EXPERT_PROFILE"
+    --cache-type-k "$KV_CACHE_TYPE_K"
+    --cache-type-v "$KV_CACHE_TYPE_V"
+    --flash-attn "$FLASH_ATTN"
+    --batch-size "$BATCH_SIZE"
+    --ubatch-size "$UBATCH_SIZE"
+    --ctx-size "$CTX_SIZE"
     --repeat-index "${REPEAT_INDEX:-}"
     --order-position "${ORDER_POSITION:-}"
     --order-mode "${ORDER_MODE:-}"
@@ -310,6 +373,9 @@ set +e
     -b "$BATCH_SIZE" \
     -ub "$UBATCH_SIZE" \
     -c "$CTX_SIZE" \
+    --cache-type-k "$KV_CACHE_TYPE_K" \
+    --cache-type-v "$KV_CACHE_TYPE_V" \
+    --flash-attn "$FLASH_ATTN" \
     --gpu-layers "$GPU_LAYERS" \
     --temp "$TEMP" \
     --seed "$SEED" \
