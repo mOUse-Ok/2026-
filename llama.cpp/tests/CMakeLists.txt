@@ -216,6 +216,21 @@ if (LLAMA_MEM_TRACE)
     set_property(TEST test-router-tensor-observation-sync PROPERTY LABELS main)
 
     add_executable(
+        test-router-control-decoupling
+        test-router-control-decoupling.cpp
+    )
+    target_include_directories(test-router-control-decoupling PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../trace
+        ${CMAKE_CURRENT_SOURCE_DIR}/../ggml/include
+    )
+    target_link_libraries(test-router-control-decoupling PRIVATE ggml-cpu)
+    add_test(
+        NAME test-router-control-decoupling
+        COMMAND $<TARGET_FILE:test-router-control-decoupling>
+    )
+    set_property(TEST test-router-control-decoupling PROPERTY LABELS main)
+
+    add_executable(
         test-expert-hint-priority
         test-expert-hint-priority.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../trace/expert_hint_priority.cpp

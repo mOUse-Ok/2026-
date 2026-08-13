@@ -337,6 +337,10 @@ bool os_hint_opt_enabled(const char * key) {
     return os_hints_enabled() && env_truthy(std::getenv(key));
 }
 
+bool expert_prefetch_control_enabled() {
+    return os_hint_opt_enabled("LLM_MEM_TRACE_OPT_EXPERT_PREFETCH");
+}
+
 // Phase 2E-A: observation-only shadow calibration. Default OFF; enabled via
 // LLM_MEM_TRACE_OS_HINTS + LLM_MEM_TRACE_OPT_EXPERT_CALIBRATION_SHADOW.
 // Strictly additive — never affects any control behavior (spec §15).
@@ -4204,6 +4208,9 @@ struct LayerTracker {
 
         const uint64_t ts = llm_mem_trace_time_ns();
         expert_timing_model().on_layer_begin(step, layer, llm_mem_trace_get_phase(), ts);
+        if (!llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_MEMORY)) {
+            return;
+        }
         std::string line;
         line.reserve(128);
         line += "{\"event\":\"LAYER_BEGIN\",\"ts_ns\":" + std::to_string(ts);
@@ -4321,6 +4328,9 @@ struct LayerTracker {
 
         const uint64_t ts = llm_mem_trace_time_ns();
         expert_timing_model().on_layer_end(step, layer, llm_mem_trace_get_phase(), ts);
+        if (!llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_MEMORY)) {
+            return;
+        }
         std::string line;
         line.reserve(128);
         line += "{\"event\":\"LAYER_END\",\"ts_ns\":" + std::to_string(ts);
@@ -4577,9 +4587,15 @@ extern "C" void llm_mem_trace_tensor_loaded(const ggml_tensor * t, const char * 
     llm_mem_trace_write(LLM_MEM_TRACE_SINK_TENSOR, line.c_str(), line.size());
 }
 
+extern "C" int llm_mem_trace_moe_control_requires_router(void) {
+    if (!llm_mem_trace_enabled()) {
+        return 0;
+    }
+    return expert_prefetch_control_enabled() || expert_memory_objects_enabled();
+}
+
 extern "C" void llm_mem_trace_prefetch_expert_layer(int layer, int token_idx, const int * experts, const float * scores, int n_experts, const char * reason) {
-    const bool prefetch_enabled =
-            os_hints_enabled() && os_hint_opt_enabled("LLM_MEM_TRACE_OPT_EXPERT_PREFETCH");
+    const bool prefetch_enabled = expert_prefetch_control_enabled();
     const bool observe_memory_objects = expert_memory_objects_enabled();
     if ((!prefetch_enabled && !observe_memory_objects) ||
             layer < 0 || !experts || n_experts <= 0) {
@@ -4593,26 +4609,6 @@ extern "C" void llm_mem_trace_prefetch_expert_layer(int layer, int token_idx, co
 
     const uint64_t step = llm_mem_trace_get_step();
     const int phase = llm_mem_trace_get_phase();
-    const uint64_t route_hint_ttl = expert_route_hint_ttl_steps_for_phase(phase);
-    const int topk = expert_prefetch_topk_for_phase(phase);
-    const int limit = topk > 0 ? std::min(n_experts, topk) : n_experts;
-    const std::vector<int> router_targets(experts, experts + n_experts);
-    const std::vector<int> targets = expert_prefetch_targets(
-            phase, step, layer, token_idx, tensors, experts, n_experts, limit);
-    if (prefetch_enabled) {
-        ensure_expert_prefetch_selection_summary_registered();
-        expert_prefetch_selection_stats().selection_events.fetch_add(
-                1, std::memory_order_relaxed);
-        expert_prefetch_selection_stats().selected_experts.fetch_add(
-                targets.size(), std::memory_order_relaxed);
-        write_expert_prefetch_selection_event(
-                phase, step, layer, token_idx, router_targets, targets);
-        static const bool registered = [] {
-            std::atexit(write_expert_route_hint_summary);
-            return true;
-        }();
-        (void) registered;
-    }
     if (observe_memory_objects) {
         ensure_expert_memory_object_summary_registered();
     }
@@ -4635,6 +4631,32 @@ extern "C" void llm_mem_trace_prefetch_expert_layer(int layer, int token_idx, co
             }
         }
     }
+
+    // Memory Object demand tracking consumes the raw Router result above.  It
+    // does not need prefetch target selection, score ordering, task lifecycle,
+    // or any EXPERT-sink event construction.
+    if (!prefetch_enabled) {
+        return;
+    }
+
+    const uint64_t route_hint_ttl = expert_route_hint_ttl_steps_for_phase(phase);
+    const int topk = expert_prefetch_topk_for_phase(phase);
+    const int limit = topk > 0 ? std::min(n_experts, topk) : n_experts;
+    const std::vector<int> router_targets(experts, experts + n_experts);
+    const std::vector<int> targets = expert_prefetch_targets(
+            phase, step, layer, token_idx, tensors, experts, n_experts, limit);
+    ensure_expert_prefetch_selection_summary_registered();
+    expert_prefetch_selection_stats().selection_events.fetch_add(
+            1, std::memory_order_relaxed);
+    expert_prefetch_selection_stats().selected_experts.fetch_add(
+            targets.size(), std::memory_order_relaxed);
+    write_expert_prefetch_selection_event(
+            phase, step, layer, token_idx, router_targets, targets);
+    static const bool registered = [] {
+        std::atexit(write_expert_route_hint_summary);
+        return true;
+    }();
+    (void) registered;
 
     std::unordered_set<int> router_expert_set(
             router_targets.begin(), router_targets.end());

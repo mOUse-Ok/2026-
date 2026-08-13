@@ -54,6 +54,9 @@ void llm_mem_trace_kv_reuse(uint32_t n_tokens, uint32_t reused);
 
 int  llm_mem_trace_moe_weights_requires_sync(const struct ggml_tensor * t);
 void llm_mem_trace_moe_weights(const struct ggml_tensor * t);
+// Runtime control may need Router output even when the EXPERT sink is disabled.
+// This query deliberately describes control dependency, not trace output.
+int  llm_mem_trace_moe_control_requires_router(void);
 
 void llm_mem_trace_memory_sample(const char * reason);
 
@@ -91,6 +94,7 @@ static inline void llm_mem_trace_kv_reuse(uint32_t n_tokens, uint32_t reused) { 
 
 static inline int llm_mem_trace_moe_weights_requires_sync(const struct ggml_tensor * t) { (void) t; return 0; }
 static inline void llm_mem_trace_moe_weights(const struct ggml_tensor * t) { (void) t; }
+static inline int llm_mem_trace_moe_control_requires_router(void) { return 0; }
 
 static inline void llm_mem_trace_memory_sample(const char * reason) { (void) reason; }
 

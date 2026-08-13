@@ -105,7 +105,18 @@ int read_idx(const ggml_tensor * ids, const char * base, size_t offset) {
 } // namespace
 
 extern "C" int llm_mem_trace_moe_weights_requires_sync(const ggml_tensor * t) {
-    if (!llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_EXPERT) || !t) {
+    if (!t) {
+        return 0;
+    }
+
+    // EXPERT sink controls only whether raw Router events are persisted.  A
+    // runtime controller still needs the completed Router tensor to update
+    // prefetch or Memory Object state when that sink is deliberately off.
+    const bool route_event_enabled =
+            llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_EXPERT);
+    const bool router_control_enabled =
+            llm_mem_trace_moe_control_requires_router() != 0;
+    if (!route_event_enabled && !router_control_enabled) {
         return 0;
     }
 
@@ -119,6 +130,9 @@ extern "C" void llm_mem_trace_moe_weights(const ggml_tensor * t) {
     if (!llm_mem_trace_moe_weights_requires_sync(t)) {
         return;
     }
+
+    const bool route_event_enabled =
+            llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_EXPERT);
 
     const char * name = ggml_get_name(t);
     if (!is_host_tensor(t)) {
@@ -151,18 +165,6 @@ extern "C" void llm_mem_trace_moe_weights(const ggml_tensor * t) {
     const char * ids_base = reinterpret_cast<const char *>(ids->data);
 
     for (int64_t tok = 0; tok < n_tokens; ++tok) {
-        std::string line;
-        line.reserve(256 + (size_t) n_expert_used * 8);
-        line += "{\"event\":\"EXPERT_ROUTE\",\"ts_ns\":" + std::to_string(llm_mem_trace_time_ns());
-        line += ",\"phase\":\"" + std::string(phase_name(llm_mem_trace_get_phase())) + "\"";
-        line += ",\"step\":" + std::to_string(llm_mem_trace_get_step());
-        if (layer >= 0) {
-            line += ",\"layer\":" + std::to_string(layer);
-        }
-        line += ",\"token_index\":" + std::to_string(tok);
-        if (ubatch && ubatch->token && tok < ubatch_tokens) {
-            line += ",\"token\":" + std::to_string(ubatch->token[tok]);
-        }
         int experts[64];
         float scores[64];
         bool valid = n_expert_used <= (int64_t) (sizeof(experts) / sizeof(experts[0]));
@@ -185,6 +187,22 @@ extern "C" void llm_mem_trace_moe_weights(const ggml_tensor * t) {
 
         llm_mem_trace_prefetch_expert_layer(layer, (int) tok, experts, scores, (int) n_expert_used, "moe_route");
 
+        if (!route_event_enabled) {
+            continue;
+        }
+
+        std::string line;
+        line.reserve(256 + (size_t) n_expert_used * 8);
+        line += "{\"event\":\"EXPERT_ROUTE\",\"ts_ns\":" + std::to_string(llm_mem_trace_time_ns());
+        line += ",\"phase\":\"" + std::string(phase_name(llm_mem_trace_get_phase())) + "\"";
+        line += ",\"step\":" + std::to_string(llm_mem_trace_get_step());
+        if (layer >= 0) {
+            line += ",\"layer\":" + std::to_string(layer);
+        }
+        line += ",\"token_index\":" + std::to_string(tok);
+        if (ubatch && ubatch->token && tok < ubatch_tokens) {
+            line += ",\"token\":" + std::to_string(ubatch->token[tok]);
+        }
         line += ",\"top_k\":" + std::to_string(n_expert_used);
         line += ",\"experts\":[";
 

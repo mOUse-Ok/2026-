@@ -306,6 +306,8 @@ llama.cpp/trace_output/<RUN_NAME>/
 
 `survival` 的默认 ctx 取 1024，而不是 512，避免固定测试 Prompt 加生成预算超过上下文。若实际请求所需上下文更大，应显式设置 `CTX_SIZE`；若量化 V，必须同时设定兼容的 `FLASH_ATTN=on`。
 
+Router 解析、Memory Object 状态更新与 JSONL 写出已分离：关闭 `LLM_MEM_TRACE_EXPERT=0` 只关闭原始 `EXPERT_ROUTE` 事件，不会在已启用的 Expert Prefetch 或 Memory Object 管理中丢失 Router 语义。关闭 MEMORY sink 也不会停止这两类状态更新；它只不再写入对应事件和汇总。
+
 ```bash
 MODEL_FILE=/path/to/Qwen3.5-35B-A3B-Q3_K_M.gguf \
 RUN_NAME=survival_static \
