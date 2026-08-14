@@ -65,6 +65,13 @@ void llm_mem_trace_moe_weights(const struct ggml_tensor * t);
 // This query deliberately describes control dependency, not trace output.
 int  llm_mem_trace_moe_control_requires_router(void);
 
+// Admission control for llama-server KV slots. This is evaluated only while
+// a new request is about to be assigned to an idle slot; it never mutates an
+// in-flight context or its KV cache. The controller is fully environment
+// gated and returns allow when disabled or when no finite cgroup budget can be
+// observed.
+int  llm_mem_trace_kv_slot_admission_allows(uint32_t active_slots, uint32_t total_slots);
+
 void llm_mem_trace_memory_sample(const char * reason);
 
 void llm_mem_trace_write(int sink, const char * line, size_t len);
@@ -104,6 +111,9 @@ static inline void llm_mem_trace_kv_reuse(uint32_t n_tokens, uint32_t reused) { 
 static inline int llm_mem_trace_moe_weights_requires_sync(const struct ggml_tensor * t) { (void) t; return 0; }
 static inline void llm_mem_trace_moe_weights(const struct ggml_tensor * t) { (void) t; }
 static inline int llm_mem_trace_moe_control_requires_router(void) { return 0; }
+static inline int llm_mem_trace_kv_slot_admission_allows(uint32_t active_slots, uint32_t total_slots) {
+    (void) active_slots; (void) total_slots; return 1;
+}
 
 static inline void llm_mem_trace_memory_sample(const char * reason) { (void) reason; }
 

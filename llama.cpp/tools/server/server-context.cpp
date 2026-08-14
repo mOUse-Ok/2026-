@@ -14,6 +14,7 @@
 #include "speculative.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
+#include "trace/trace_event.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -1785,6 +1786,16 @@ private:
         return free_slots;
     }
 
+    uint32_t count_processing_slots() const {
+        uint32_t count = 0;
+        for (const auto & slot : slots) {
+            if (slot.is_processing()) {
+                ++count;
+            }
+        }
+        return count;
+    }
+
     // launch multiple slots for parent + child tasks
     bool launch_slots_with_parent_task(server_slot & parent_slot, std::vector<server_slot *> & child_slots, server_task && parent_task) {
         GGML_ASSERT(!parent_slot.is_processing());
@@ -1885,6 +1896,18 @@ private:
                     if (slot->is_processing()) {
                         // if requested slot is unavailable, we defer this task for processing later
                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", id_task);
+                        queue_tasks.defer(std::move(task));
+                        break;
+                    }
+
+                    // KV admission is intentionally evaluated after a real
+                    // idle Slot was found and before any state is attached to
+                    // it. It therefore cannot alter an in-flight request.
+                    // Parent tasks reserve several Slots atomically and keep
+                    // the server's established all-or-defer behavior.
+                    if (!task.is_parent() && !llm_mem_trace_kv_slot_admission_allows(
+                            count_processing_slots(), (uint32_t) slots.size())) {
+                        SRV_INF("KV admission deferred task, id_task = %d\n", id_task);
                         queue_tasks.defer(std::move(task));
                         break;
                     }

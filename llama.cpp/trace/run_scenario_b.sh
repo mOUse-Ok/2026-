@@ -165,6 +165,13 @@ run_group() {
         "LLM_MEM_TRACE_EXPERT_TASK_MODE=summary"
         "LLM_MEM_TRACE_CONTROL_ONLY=1"
         "LLM_MEM_TRACE_OPT_EXPERT_PROFILE=custom"
+        # Scenario B measures Router-selected Expert hints. Keep the new
+        # multi-request KV admission path explicitly off so inherited shell
+        # settings cannot change this established single-slot comparison.
+        "LLM_MEM_TRACE_OPT_KV_SLOT_ADMISSION=0"
+        "KV_UNIFIED=0"
+        "KV_CACHE_RAM_MB=0"
+        "KV_CACHE_IDLE_SLOTS=0"
         "LLM_MEM_TRACE_OPT_EXPERT_CONTROLLER=$controller"
         "LLM_MEM_TRACE_OS_HINTS=1"
         "LLM_MEM_TRACE_OPT_EXPERT_PREFETCH=$([ "$controller" = expert_prefetch ] && echo 1 || echo 0)"

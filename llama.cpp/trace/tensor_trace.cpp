@@ -373,6 +373,15 @@ bool expert_prefetch_control_enabled() {
     return os_hint_opt_enabled("LLM_MEM_TRACE_OPT_EXPERT_PREFETCH");
 }
 
+// This controller is deliberately independent of Expert prefetch/reclaim.
+// It protects only the request-to-KV-slot admission boundary in llama-server;
+// it never changes the size, type, or contents of an active KV cache.
+bool kv_slot_admission_enabled() {
+    static const bool enabled = env_truthy(
+            std::getenv("LLM_MEM_TRACE_OPT_KV_SLOT_ADMISSION"));
+    return enabled && llm_mem_trace_enabled();
+}
+
 // Phase 2E-A: observation-only shadow calibration. Default OFF; enabled via
 // LLM_MEM_TRACE_OS_HINTS + LLM_MEM_TRACE_OPT_EXPERT_CALIBRATION_SHADOW.
 // Strictly additive — never affects any control behavior (spec §15).
@@ -2433,7 +2442,8 @@ struct ExpertPressureController {
 
     ExpertPressureSnapshot snapshot(bool force = false) {
         const uint64_t base_budget = expert_prefetch_budget_bytes();
-        if (!expert_feedback_enabled() && !expert_madv_dontneed_reclaim_enabled()) {
+        if (!expert_feedback_enabled() && !expert_madv_dontneed_reclaim_enabled() &&
+                !kv_slot_admission_enabled()) {
             ExpertPressureSnapshot out;
             out.prefetch_budget_bytes = base_budget;
             return out;
@@ -2567,6 +2577,129 @@ struct ExpertPressureController {
 ExpertPressureController & expert_pressure_controller() {
     static ExpertPressureController controller;
     return controller;
+}
+
+struct KvSlotAdmissionCounters {
+    std::atomic<uint64_t> checks{0};
+    std::atomic<uint64_t> allowed{0};
+    std::atomic<uint64_t> deferred{0};
+    std::atomic<uint64_t> unavailable{0};
+    std::array<std::atomic<uint64_t>, 4> checks_by_pressure{};
+    std::array<std::atomic<uint64_t>, 4> deferred_by_pressure{};
+};
+
+KvSlotAdmissionCounters & kv_slot_admission_counters() {
+    static KvSlotAdmissionCounters counters;
+    return counters;
+}
+
+uint64_t kv_slot_admission_max_active(
+        ExpertPressureLevel level,
+        uint64_t total_slots) {
+    // A value of zero for Moderate selects a conservative, topology-aware
+    // default. High and Critical always retain one service slot so a request
+    // cannot be deferred forever solely because pressure is already high.
+    const uint64_t safe_total = std::max<uint64_t>(1, total_slots);
+    switch (level) {
+        case ExpertPressureLevel::Low:
+            return safe_total;
+        case ExpertPressureLevel::Moderate: {
+            const uint64_t configured = env_u64_or_default(
+                    "LLM_MEM_TRACE_OPT_KV_SLOT_ADMISSION_MODERATE_MAX_ACTIVE", 0);
+            return std::min<uint64_t>(safe_total, configured == 0 ?
+                    std::max<uint64_t>(1, (safe_total + 1) / 2) : configured);
+        }
+        case ExpertPressureLevel::High: {
+            const uint64_t configured = env_u64_or_default(
+                    "LLM_MEM_TRACE_OPT_KV_SLOT_ADMISSION_HIGH_MAX_ACTIVE", 1);
+            return std::min<uint64_t>(safe_total, std::max<uint64_t>(1, configured));
+        }
+        case ExpertPressureLevel::Critical: {
+            const uint64_t configured = env_u64_or_default(
+                    "LLM_MEM_TRACE_OPT_KV_SLOT_ADMISSION_CRITICAL_MAX_ACTIVE", 1);
+            return std::min<uint64_t>(safe_total, std::max<uint64_t>(1, configured));
+        }
+    }
+    return safe_total;
+}
+
+void write_kv_slot_admission_summary() {
+    if (!kv_slot_admission_enabled() ||
+            !llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_MEMORY)) {
+        return;
+    }
+    const KvSlotAdmissionCounters & counters = kv_slot_admission_counters();
+    std::string line;
+    line.reserve(400);
+    line += "{\"event\":\"KV_SLOT_ADMISSION_SUMMARY\",\"ts_ns\":" +
+            std::to_string(llm_mem_trace_time_ns());
+    line += ",\"enabled\":true";
+    line += ",\"checks\":" +
+            std::to_string(counters.checks.load(std::memory_order_relaxed));
+    line += ",\"allowed\":" +
+            std::to_string(counters.allowed.load(std::memory_order_relaxed));
+    line += ",\"deferred\":" +
+            std::to_string(counters.deferred.load(std::memory_order_relaxed));
+    line += ",\"pressure_unavailable\":" +
+            std::to_string(counters.unavailable.load(std::memory_order_relaxed));
+    line += ",\"checks_by_pressure\":{";
+    for (size_t i = 0; i < counters.checks_by_pressure.size(); ++i) {
+        if (i != 0) {
+            line += ",";
+        }
+        line += "\"" + std::string(expert_pressure_level_name(
+                static_cast<ExpertPressureLevel>(i))) + "\":" +
+                std::to_string(counters.checks_by_pressure[i].load(std::memory_order_relaxed));
+    }
+    line += "},\"deferred_by_pressure\":{";
+    for (size_t i = 0; i < counters.deferred_by_pressure.size(); ++i) {
+        if (i != 0) {
+            line += ",";
+        }
+        line += "\"" + std::string(expert_pressure_level_name(
+                static_cast<ExpertPressureLevel>(i))) + "\":" +
+                std::to_string(counters.deferred_by_pressure[i].load(std::memory_order_relaxed));
+    }
+    line += "}}";
+    llm_mem_trace_write(LLM_MEM_TRACE_SINK_MEMORY, line.c_str(), line.size());
+}
+
+void ensure_kv_slot_admission_summary_registered() {
+    (void) kv_slot_admission_counters();
+    static const bool registered = [] {
+        std::atexit(write_kv_slot_admission_summary);
+        return true;
+    }();
+    (void) registered;
+}
+
+bool kv_slot_admission_allows(uint32_t active_slots, uint32_t total_slots) {
+    if (!kv_slot_admission_enabled()) {
+        return true;
+    }
+
+    ensure_kv_slot_admission_summary_registered();
+    KvSlotAdmissionCounters & counters = kv_slot_admission_counters();
+    counters.checks.fetch_add(1, std::memory_order_relaxed);
+
+    const ExpertPressureSnapshot pressure = expert_pressure_controller().snapshot();
+    if (!pressure.available || pressure.memory_limit_bytes == 0) {
+        counters.unavailable.fetch_add(1, std::memory_order_relaxed);
+        counters.allowed.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+
+    const size_t level_index = static_cast<size_t>(pressure.level);
+    counters.checks_by_pressure[level_index].fetch_add(1, std::memory_order_relaxed);
+    const uint64_t max_active = kv_slot_admission_max_active(pressure.level, total_slots);
+    const bool allowed = active_slots < max_active;
+    if (allowed) {
+        counters.allowed.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        counters.deferred.fetch_add(1, std::memory_order_relaxed);
+        counters.deferred_by_pressure[level_index].fetch_add(1, std::memory_order_relaxed);
+    }
+    return allowed;
 }
 
 bool expert_madv_dontneed_pressure_allows(const ExpertPressureSnapshot & pressure) {
@@ -5089,6 +5222,12 @@ extern "C" int llm_mem_trace_moe_control_requires_router(void) {
         return 0;
     }
     return expert_prefetch_control_enabled() || expert_memory_objects_enabled();
+}
+
+extern "C" int llm_mem_trace_kv_slot_admission_allows(
+        uint32_t active_slots,
+        uint32_t total_slots) {
+    return kv_slot_admission_allows(active_slots, total_slots) ? 1 : 0;
 }
 
 extern "C" void llm_mem_trace_prefetch_expert_layer(int layer, int token_idx, const int * experts, const float * scores, int n_experts, const char * reason) {
