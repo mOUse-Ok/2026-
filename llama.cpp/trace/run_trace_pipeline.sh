@@ -354,6 +354,11 @@ export LLM_MEM_TRACE_OPT_EXPERT_RECLAIM_MEMORY_RATIO_PCT="${LLM_MEM_TRACE_OPT_EX
 export LLM_MEM_TRACE_OPT_EXPERT_RECLAIM_REFAULT_DELTA="${LLM_MEM_TRACE_OPT_EXPERT_RECLAIM_REFAULT_DELTA:-1024}"
 export LLM_MEM_TRACE_OPT_TARGETS="${LLM_MEM_TRACE_OPT_TARGETS:-token_embd.weight,output.weight,ffn_down_exps.weight}"
 export LLM_MEM_TRACE_OPT_MAX_BYTES="${LLM_MEM_TRACE_OPT_MAX_BYTES:-536870912}"
+INFERENCE_OOM_SCORE_ADJ="${LLM_MEM_TRACE_INFERENCE_OOM_SCORE_ADJ:-}"
+OOM_SCORE_PREFIX=()
+if [ -n "$INFERENCE_OOM_SCORE_ADJ" ]; then
+    OOM_SCORE_PREFIX=("$SCRIPT_DIR/run_with_oom_score_adj.sh" "$INFERENCE_OOM_SCORE_ADJ")
+fi
 
 # Write prompt to temp file for -f flag (avoids pipe issues)
 PROMPT_FILE="$TRACE_OUT_DIR/test_prompt.txt"
@@ -400,7 +405,7 @@ set +e
 "$TIME_BIN" -q \
     -f '{"wall_time_s":%e,"user_time_s":%U,"system_time_s":%S,"max_rss_kb":%M,"major_faults":%F,"minor_faults":%R,"file_inputs":%I,"file_outputs":%O,"exit_code":%x}' \
     -o "$TRACE_OUT_DIR/process_metrics.json" \
-    "$LLAMA_CLI" \
+    "${OOM_SCORE_PREFIX[@]}" "$LLAMA_CLI" \
     -m "$MODEL_FILE" \
     -f "$PROMPT_FILE" \
     -n "$NUM_TOKENS_PREDICT" \
@@ -423,6 +428,15 @@ set +e
     > "$TRACE_OUT_DIR/inference_output.txt" 2>"$TRACE_OUT_DIR/inference_stderr.txt"
 INFERENCE_STATUS=$?
 set -e
+
+CGROUP_SNAPSHOT_ARGS=(
+    --output "$TRACE_OUT_DIR/cgroup_after_inference.json"
+    --stage after_inference
+)
+if [ -n "${MEMORY_MAX:-}" ]; then
+    CGROUP_SNAPSHOT_ARGS+=(--expected-memory-max "$MEMORY_MAX")
+fi
+python3 "$SCRIPT_DIR/capture_cgroup_snapshot.py" "${CGROUP_SNAPSHOT_ARGS[@]}"
 
 if [ "$INFERENCE_STATUS" -ne 0 ]; then
     echo "ERROR: llama-cli exited with status $INFERENCE_STATUS" >&2
