@@ -1673,6 +1673,10 @@ bool llama_model_loader::load_all_data(
                 }
             }
         }
+        // This is the first point at which the complete Expert registry is
+        // available and every CPU-resident tensor has a stable mmap address.
+        // The trace implementation applies its own cgroup budget guard.
+        llm_mem_trace_expert_preload_after_model_load((uint64_t) size_data);
         if (progress_callback) {
             // Even though the model is done loading, we still honor
             // cancellation since we need to free allocations.

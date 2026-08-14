@@ -599,20 +599,30 @@ int apply_madvise_hint(
         int expert,
         uintptr_t addr,
         size_t nbytes,
-        const OsHintMeta * meta = nullptr) {
+        const OsHintMeta * meta = nullptr,
+        int * error_out = nullptr) {
 #ifdef __linux__
     uintptr_t start = 0;
     size_t len = 0;
     if (!page_aligned_range(addr, nbytes, start, len)) {
+        if (error_out) {
+            *error_out = EINVAL;
+        }
         return -1;
     }
     errno = 0;
     const int rc = madvise(reinterpret_cast<void *>(start), len, advice);
     const int err = rc == 0 ? 0 : errno;
+    if (error_out) {
+        *error_out = err;
+    }
     write_os_hint_event(action, trigger, tensor_name, layer, expert, addr, nbytes, len, rc, err, 0, meta);
     return rc;
 #else
     (void) action; (void) advice; (void) trigger; (void) tensor_name; (void) layer; (void) expert; (void) addr; (void) nbytes; (void) meta;
+    if (error_out) {
+        *error_out = ENOSYS;
+    }
     return -1;
 #endif
 }
@@ -2569,6 +2579,228 @@ bool expert_madv_dontneed_pressure_allows(const ExpertPressureSnapshot & pressur
             "LLM_MEM_TRACE_OPT_EXPERT_RECLAIM_REFAULT_DELTA", 1024);
     return pressure.memory_ratio_pct >= memory_ratio_threshold ||
             pressure.refault_delta >= refault_delta_threshold;
+}
+
+// Performance profile startup preload -------------------------------------------------
+//
+// This deliberately runs only after the complete model is mapped.  A successful
+// POPULATE_READ means madvise accepted the request; it is not reported as a
+// guarantee that every page will remain resident until the first request.
+
+bool expert_performance_preload_enabled() {
+    return env_truthy(std::getenv("LLM_MEM_TRACE_OPT_EXPERT_PRELOAD")) &&
+            llm_mem_trace_enabled();
+}
+
+uint64_t expert_preload_mib_reserve(const char * name) {
+    constexpr uint64_t mib = 1024ull * 1024ull;
+    const uint64_t value = env_u64_or_default(name, 0);
+    return value > std::numeric_limits<uint64_t>::max() / mib ?
+            std::numeric_limits<uint64_t>::max() : value * mib;
+}
+
+uint64_t saturating_add_u64(uint64_t left, uint64_t right) {
+    return left > std::numeric_limits<uint64_t>::max() - right ?
+            std::numeric_limits<uint64_t>::max() : left + right;
+}
+
+struct ExpertPreloadState {
+    bool enabled = false;
+    bool called = false;
+    bool budget_allowed = false;
+    bool populate_read_supported = false;
+    bool summary_written = false;
+    uint64_t model_size_bytes = 0;
+    uint64_t cgroup_current_bytes = 0;
+    uint64_t cgroup_limit_bytes = 0;
+    uint64_t safety_limit_bytes = 0;
+    uint64_t kv_reserve_bytes = 0;
+    uint64_t buffer_reserve_bytes = 0;
+    uint64_t projected_bytes = 0;
+    uint64_t candidate_tensors = 0;
+    uint64_t file_mapped_tensors = 0;
+    uint64_t mapping_rejected = 0;
+    uint64_t inner_page_rejected = 0;
+    uint64_t requested_bytes = 0;
+    uint64_t populate_issued = 0;
+    uint64_t populate_bytes = 0;
+    uint64_t populate_failed = 0;
+    uint64_t willneed_issued = 0;
+    uint64_t willneed_bytes = 0;
+    uint64_t willneed_failed = 0;
+    std::string decision = "disabled";
+};
+
+ExpertPreloadState & expert_preload_state() {
+    static ExpertPreloadState state;
+    return state;
+}
+
+void write_expert_preload_summary() {
+    ExpertPreloadState & state = expert_preload_state();
+    if (state.summary_written || !state.enabled ||
+            !llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_MEMORY)) {
+        return;
+    }
+    std::string line;
+    line.reserve(960);
+    line += "{\"event\":\"EXPERT_PRELOAD_SUMMARY\",\"ts_ns\":" +
+            std::to_string(llm_mem_trace_time_ns());
+    line += ",\"enabled\":true";
+    line += ",\"called\":" + std::string(state.called ? "true" : "false");
+    line += ",\"budget_allowed\":" + std::string(state.budget_allowed ? "true" : "false");
+    line += ",\"populate_read_supported\":" +
+            std::string(state.populate_read_supported ? "true" : "false");
+    line += ",\"decision\":";
+    json_escape_append(line, state.decision.c_str());
+    line += ",\"model_size_bytes\":" + std::to_string(state.model_size_bytes);
+    line += ",\"cgroup_current_bytes\":" + std::to_string(state.cgroup_current_bytes);
+    line += ",\"cgroup_limit_bytes\":" + std::to_string(state.cgroup_limit_bytes);
+    line += ",\"safety_limit_bytes\":" + std::to_string(state.safety_limit_bytes);
+    line += ",\"kv_reserve_bytes\":" + std::to_string(state.kv_reserve_bytes);
+    line += ",\"buffer_reserve_bytes\":" + std::to_string(state.buffer_reserve_bytes);
+    line += ",\"projected_bytes\":" + std::to_string(state.projected_bytes);
+    line += ",\"candidate_tensors\":" + std::to_string(state.candidate_tensors);
+    line += ",\"file_mapped_tensors\":" + std::to_string(state.file_mapped_tensors);
+    line += ",\"mapping_rejected\":" + std::to_string(state.mapping_rejected);
+    line += ",\"inner_page_rejected\":" + std::to_string(state.inner_page_rejected);
+    line += ",\"requested_bytes\":" + std::to_string(state.requested_bytes);
+    line += ",\"populate_issued\":" + std::to_string(state.populate_issued);
+    line += ",\"populate_bytes\":" + std::to_string(state.populate_bytes);
+    line += ",\"populate_failed\":" + std::to_string(state.populate_failed);
+    line += ",\"willneed_issued\":" + std::to_string(state.willneed_issued);
+    line += ",\"willneed_bytes\":" + std::to_string(state.willneed_bytes);
+    line += ",\"willneed_failed\":" + std::to_string(state.willneed_failed);
+    line += "}";
+    llm_mem_trace_write(LLM_MEM_TRACE_SINK_MEMORY, line.c_str(), line.size());
+    state.summary_written = true;
+}
+
+void ensure_expert_preload_summary_registered() {
+    static const bool registered = [] {
+        std::atexit(write_expert_preload_summary);
+        return true;
+    }();
+    (void) registered;
+}
+
+bool expert_preload_fallback_error(int error_code) {
+    return error_code == EINVAL || error_code == ENOSYS || error_code == EOPNOTSUPP;
+}
+
+void expert_preload_after_model_load(uint64_t model_size_bytes) {
+    if (!expert_performance_preload_enabled()) {
+        return;
+    }
+
+    ExpertPreloadState & state = expert_preload_state();
+    if (state.called) {
+        return;
+    }
+    state.enabled = true;
+    state.called = true;
+    state.model_size_bytes = model_size_bytes;
+    state.cgroup_current_bytes = rescue_read_memory_current();
+    state.cgroup_limit_bytes = rescue_read_memory_limit();
+#ifdef MADV_POPULATE_READ
+    // Report build-time availability even if the budget rejects preload before
+    // any individual mapping is considered.
+    state.populate_read_supported = true;
+#endif
+    state.kv_reserve_bytes = expert_preload_mib_reserve(
+            "LLM_MEM_TRACE_OPT_EXPERT_PRELOAD_KV_MB");
+    state.buffer_reserve_bytes = expert_preload_mib_reserve(
+            "LLM_MEM_TRACE_OPT_EXPERT_PRELOAD_BUFFER_MB");
+    const uint64_t safety_pct = std::min<uint64_t>(
+            env_u64_or_default("LLM_MEM_TRACE_OPT_EXPERT_PRELOAD_SAFETY_PCT", 80), 99);
+    state.safety_limit_bytes = state.cgroup_limit_bytes / 100 * safety_pct;
+    state.projected_bytes = saturating_add_u64(
+            saturating_add_u64(state.cgroup_current_bytes, state.model_size_bytes),
+            saturating_add_u64(state.kv_reserve_bytes, state.buffer_reserve_bytes));
+    ensure_expert_preload_summary_registered();
+    // The scenario-B server is terminated after its request sequence.  Record
+    // the immutable startup decision now instead of depending on process-exit
+    // handlers to flush it after a signal.
+    struct WritePreloadSummaryOnReturn {
+        ~WritePreloadSummaryOnReturn() {
+            write_expert_preload_summary();
+        }
+    } write_summary_on_return;
+
+    if (model_size_bytes == 0) {
+        state.decision = "invalid_model_size";
+        return;
+    }
+    if (state.cgroup_limit_bytes == 0 || safety_pct == 0) {
+        state.decision = "no_finite_cgroup_limit";
+        return;
+    }
+    // Strict inequality deliberately leaves a non-zero headroom after all
+    // projected model, KV and compute allocations are accounted for.
+    if (state.projected_bytes >= state.safety_limit_bytes) {
+        state.decision = "budget_rejected";
+        return;
+    }
+    state.budget_allowed = true;
+
+    const std::vector<ExpertTensorInfo> tensors = expert_tensor_registry().all();
+    if (tensors.empty()) {
+        state.decision = "no_registered_expert_tensors";
+        return;
+    }
+
+    for (const ExpertTensorInfo & info : tensors) {
+        state.candidate_tensors++;
+#ifdef __linux__
+        FileMapping mapping;
+        if (!find_file_mapping(info.addr, mapping) ||
+                !file_mapping_contains_range(mapping, info.addr, info.nbytes)) {
+            state.mapping_rejected++;
+            continue;
+        }
+        state.file_mapped_tensors++;
+        uintptr_t advised_addr = 0;
+        size_t advised_bytes = 0;
+        if (!page_aligned_inner_file_range(
+                    mapping, info.addr, info.nbytes, advised_addr, advised_bytes)) {
+            state.inner_page_rejected++;
+            continue;
+        }
+        state.requested_bytes = saturating_add_u64(state.requested_bytes, advised_bytes);
+        int error_code = 0;
+#ifdef MADV_POPULATE_READ
+        const int rc = apply_madvise_hint(
+                "expert_preload_populate_read", MADV_POPULATE_READ,
+                "performance_model_load", info.name.c_str(), info.layer, -1,
+                advised_addr, advised_bytes, nullptr, &error_code);
+        if (rc == 0) {
+            state.populate_issued++;
+            state.populate_bytes = saturating_add_u64(state.populate_bytes, advised_bytes);
+            continue;
+        }
+        state.populate_failed++;
+        if (!expert_preload_fallback_error(error_code)) {
+            continue;
+        }
+#endif
+        error_code = 0;
+        const int fallback_rc = apply_madvise_hint(
+                "expert_preload_willneed", MADV_WILLNEED,
+                "performance_model_load_fallback", info.name.c_str(), info.layer, -1,
+                advised_addr, advised_bytes, nullptr, &error_code);
+        if (fallback_rc == 0) {
+            state.willneed_issued++;
+            state.willneed_bytes = saturating_add_u64(state.willneed_bytes, advised_bytes);
+        } else {
+            state.willneed_failed++;
+        }
+#else
+        (void) info;
+        state.mapping_rejected++;
+#endif
+    }
+    state.decision = state.populate_issued + state.willneed_issued > 0 ?
+            "issued" : "no_preload_advice_issued";
 }
 
 struct ExpertDontNeedStepBudgetSnapshot {
@@ -4722,6 +4954,10 @@ void observe_expert_logical_first_use(const ggml_tensor * operation) {
 }
 
 } // namespace
+
+extern "C" void llm_mem_trace_expert_preload_after_model_load(uint64_t model_size_bytes) {
+    expert_preload_after_model_load(model_size_bytes);
+}
 
 extern "C" void llm_mem_trace_runtime_rescue_step_end(uint64_t latency_ns) {
     // Phase 2E-A: shadow calibration step-end (observation-only, NOT gated on rescue).

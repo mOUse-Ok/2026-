@@ -30,6 +30,11 @@ void ExpertTensorRegistry::add(const ggml_tensor * t, const char * name, int lay
     tensors.push_back({name ? name : "", layer, addr, nbytes, n_expert, expert_stride});
 }
 
+std::vector<ExpertTensorInfo> ExpertTensorRegistry::all() {
+    std::lock_guard<std::mutex> lock(mu);
+    return tensors;
+}
+
 std::vector<ExpertTensorInfo> ExpertTensorRegistry::for_layer(int layer) {
     std::vector<ExpertTensorInfo> out;
     std::lock_guard<std::mutex> lock(mu);

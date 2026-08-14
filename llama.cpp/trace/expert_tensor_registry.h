@@ -24,6 +24,7 @@ struct ExpertTensorRegistry {
     uint64_t route_hint_ttl_skipped = 0;
 
     void add(const ggml_tensor * t, const char * name, int layer, uintptr_t addr, size_t nbytes);
+    std::vector<ExpertTensorInfo> all();
     std::vector<ExpertTensorInfo> for_layer(int layer);
     bool was_hinted(uint64_t step, int layer, int expert, uintptr_t addr, uint64_t ttl_steps);
     bool mark_hinted(uint64_t step, int layer, int expert, uintptr_t addr, uint64_t ttl_steps);

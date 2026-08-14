@@ -31,10 +31,11 @@ def parse_kv(text: str | None) -> dict[str, int | str] | None:
     return values
 
 
-def current_cgroup_dir() -> Path:
-    cgroup_text = read_text(Path("/proc/self/cgroup"))
+def cgroup_dir_for_pid(pid: int | None) -> Path:
+    source_pid = pid if pid is not None else "self"
+    cgroup_text = read_text(Path("/proc") / str(source_pid) / "cgroup")
     if cgroup_text is None:
-        raise SystemExit("cannot read /proc/self/cgroup")
+        raise SystemExit(f"cannot read /proc/{source_pid}/cgroup")
     for line in cgroup_text.splitlines():
         hierarchy, _, relative = line.partition("::")
         if hierarchy == "0" and relative:
@@ -42,7 +43,7 @@ def current_cgroup_dir() -> Path:
             if directory.is_dir():
                 return directory
             raise SystemExit(f"cgroup directory is unavailable: {directory}")
-    raise SystemExit("cgroup v2 entry is unavailable in /proc/self/cgroup")
+    raise SystemExit(f"cgroup v2 entry is unavailable in /proc/{source_pid}/cgroup")
 
 
 def expected_bytes(value: str) -> int:
@@ -64,13 +65,14 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--stage", required=True)
+    parser.add_argument("--pid", type=int)
     parser.add_argument("--expected-memory-max")
     args = parser.parse_args()
 
     if args.output.exists():
         raise SystemExit(f"refusing to overwrite snapshot: {args.output}")
 
-    directory = current_cgroup_dir()
+    directory = cgroup_dir_for_pid(args.pid)
     scalar_names = (
         "memory.current",
         "memory.high",
@@ -93,6 +95,7 @@ def main() -> None:
         "schema_version": 1,
         "captured_at_utc": datetime.now(timezone.utc).isoformat(),
         "stage": args.stage,
+        "target_pid": args.pid,
         "cgroup_path": str(directory),
         "memory": values,
         "memory_events": parse_kv(read_text(directory / "memory.events")),
