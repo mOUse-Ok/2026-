@@ -351,36 +351,30 @@ bash llama.cpp/trace/run_trace_pipeline.sh
 
 `EXPERT_MEMORY_OBJECT_SUMMARY` 会报告候选、issued/failed bytes、预算延后、in-flight 跳过、映射/页对齐拒绝和 DONTNEED 后 readmission。该机制默认关闭；`madvise` 成功不表示物理页一定已经释放。
 
-### 10.8 场景 B：有预算保护的启动预加载
+### 10.8 场景 B：中等内存压力下的 Router 预取
 
-`performance` profile 在模型完成映射后，遍历已登记的 Expert Tensor。每个范围必须完整位于文件映射内，并裁剪为映射内部的完整页；随后优先调用 `MADV_POPULATE_READ`，内核返回 `EINVAL`、`ENOSYS` 或 `EOPNOTSUPP` 时回退到 `MADV_WILLNEED`。
+场景 B 不把“内存充足”定义为完整模型全部驻留。默认 `MemoryMax=12G`，模型可运行但不能长期保留完整 15 GiB 工作集；这是介于场景 A 的完成性压力和全模型驻留状态之间的代表性档位。
 
-预加载只在以下严格条件成立时执行：
+两个独立的 `systemd-run --user --scope` 持久 `llama-server` 进程使用相同模型、相同 KV 配置和相同冷缓存准备。基线关闭控制器；performance 组仅对 Router 每层选择的 1 个 Expert 发出 `MADV_WILLNEED`，基础预算为 64 MiB。它不再调用模型加载后的批量 `MADV_POPULATE_READ`，因此不会将完整模型重复计入预算。
 
-```text
-memory.current + model_size + KV_reserve + buffer_reserve < 0.8 × effective_cgroup_limit
-```
+报告包含：
 
-`effective_cgroup_limit` 优先取有限的 `memory.high`，否则取有限的 `memory.max`。没有有限 cgroup 上限、模型大小无效或预算不足时，机制拒绝预加载并在 `EXPERT_PRELOAD_SUMMARY` 写出原因；不会为了预加载触发 OOM。`madvise` 成功仅表示内核接受建议，不能据此声称页面会一直驻留。
-
-场景 B 使用两个独立的 `systemd-run --user --scope` 持久 `llama-server` 进程：基线关闭预加载，performance 组开启预加载。每组都在启动前执行 `posix_fadvise(DONTNEED)`，每个进程顺序处理至少两个请求。报告包含：
-
-- 冷启动总时间（从启动 scope 到 `/health` 就绪，包含模型加载和预加载）；
+- 冷启动总时间（从启动 scope 到 `/health` 就绪，包含模型加载）；
 - 第一个请求 TTFT；
 - 后续请求的流式生成事件间隔 p95、服务端平均 decode/token 时间 p95；
 - 从 scope 启动前到请求结束的 `pgmajfault` 增量；
-- 输出 hash 一致性和 `EXPERT_PRELOAD_SUMMARY` 的实际 advice 数量。
+- 输出 hash 一致性、Router 实际选择数量和实际发出的 hint 数量。
 
-在物理可用内存小于 `model_size + KV_reserve + buffer_reserve` 时，脚本会生成 `SKIPPED.md` 后退出，不会依靠 overcommit 伪造预加载结果。请在至少能容纳完整模型和预留空间的机器运行：
+若主机可用内存小于 `MemoryMax + 512 MiB`，脚本会生成 `SKIPPED.md` 后退出。16 GiB 主机通常可运行默认 12 GiB 档位，但执行前应关闭其他高内存任务：
 
 ```bash
 MODEL_FILE=/path/to/Qwen3.5-35B-A3B-Q3_K_M.gguf \
-MEMORY_MAX=20G \
+MEMORY_MAX=12G \
 RUN_PREFIX=final_b \
 bash llama.cpp/trace/run_scenario_b.sh
 ```
 
-结果位于 `llama.cpp/trace_output/scenario_b/final_b_{baseline,performance,report}/`。只有两个输出 hash 一致且 performance 组的 `preload_decision=issued` 时，才能比较性能指标；报告不自动宣称性能收益。
+结果位于 `llama.cpp/trace_output/scenario_b/final_b_{baseline,performance,report}/`。只有两个输出 hash 一致且 performance 组的 `hint issued > 0` 时，才能比较性能指标；报告不自动宣称性能收益。
 
 ### 10.9 相关 CTest
 

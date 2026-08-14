@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 #
-# Scenario B: compare controller-off and performance-preload in persistent
-# llama-server processes.  Every group gets a fresh cgroup scope and cold file
-# cache; every request in a group shares the same server process.
+# Scenario B: a bounded-memory, persistent-server comparison.  The model can
+# run at 12 GiB but cannot retain the whole 15 GiB model working set.  Compare
+# controller-off with one Router-selected Expert hint per layer; do not perform
+# a late bulk preload after model load.
 #
 set -euo pipefail
 
@@ -12,20 +13,19 @@ TRACE_BASE_DIR="${TRACE_BASE_DIR:-$PROJECT_DIR/trace_output/scenario_b}"
 RUN_PREFIX="${RUN_PREFIX:-scenario_b}"
 MODEL_FILE="${MODEL_FILE:-$PROJECT_DIR/../models/Qwen3.5-35B-A3B-Q3_K_M.gguf}"
 LLAMA_SERVER="${LLAMA_SERVER:-$PROJECT_DIR/build/bin/llama-server}"
-MEMORY_MAX="${MEMORY_MAX:-20G}"
+MEMORY_MAX="${MEMORY_MAX:-12G}"
 MEMORY_SWAP_MAX="${MEMORY_SWAP_MAX:-0}"
 PORT_BASE="${PORT_BASE:-18080}"
 NUM_THREADS="${NUM_THREADS:-8}"
 CTX_SIZE="${CTX_SIZE:-2048}"
 BATCH_SIZE="${BATCH_SIZE:-512}"
 UBATCH_SIZE="${UBATCH_SIZE:-512}"
-REQUEST_COUNT="${REQUEST_COUNT:-4}"
-N_PREDICT="${N_PREDICT:-16}"
+REQUEST_COUNT="${REQUEST_COUNT:-3}"
+N_PREDICT="${N_PREDICT:-32}"
 HTTP_TIMEOUT_S="${HTTP_TIMEOUT_S:-600}"
 ALLOW_DIRTY_REPO="${ALLOW_DIRTY_REPO:-0}"
-RUN_SCENARIO_B_ALLOW_HOST_OVERCOMMIT="${RUN_SCENARIO_B_ALLOW_HOST_OVERCOMMIT:-0}"
-KV_RESERVE_MB="${KV_RESERVE_MB:-256}"
-BUFFER_RESERVE_MB="${BUFFER_RESERVE_MB:-512}"
+PREFETCH_BUDGET_MB="${PREFETCH_BUDGET_MB:-64}"
+PREFETCH_TOPK="${PREFETCH_TOPK:-1}"
 
 require_file() {
     if [ ! -f "$1" ]; then
@@ -61,23 +61,33 @@ for group in baseline performance report; do
 done
 mkdir -p "$TRACE_BASE_DIR"
 
-# POPULATE_READ can fault the full Expert mapping.  A cgroup limit alone is
-# insufficient when the host itself has less physical memory than that mapping.
-model_bytes="$(stat -c %s "$MODEL_FILE")"
+memory_limit_bytes() {
+    local value="$1"
+    case "$value" in
+        *G|*g) echo $(( ${value%?} * 1024 * 1024 * 1024 )) ;;
+        *M|*m) echo $(( ${value%?} * 1024 * 1024 )) ;;
+        *K|*k) echo $(( ${value%?} * 1024 )) ;;
+        *) echo "$value" ;;
+    esac
+}
+
+# This scenario deliberately runs below the model's full working-set size.
+# The host still needs enough immediately available memory to host the bounded
+# cgroup plus a small operating-system reserve.
+memory_limit_bytes="$(memory_limit_bytes "$MEMORY_MAX")"
 host_available_bytes="$(( $(awk '/^MemAvailable:/ { print $2; exit }' /proc/meminfo) * 1024 ))"
-reserve_bytes=$(( (KV_RESERVE_MB + BUFFER_RESERVE_MB) * 1024 * 1024 ))
-if [ "$RUN_SCENARIO_B_ALLOW_HOST_OVERCOMMIT" != "1" ] && \
-        [ "$host_available_bytes" -lt $((model_bytes + reserve_bytes)) ]; then
+host_reserve_bytes=$((512 * 1024 * 1024))
+if [ "$host_available_bytes" -lt $((memory_limit_bytes + host_reserve_bytes)) ]; then
     skip_dir="$TRACE_BASE_DIR/${RUN_PREFIX}_report"
     mkdir -p "$skip_dir"
     printf '%s\n' \
-        "场景 B 未执行：主机 MemAvailable 小于完整 Expert 预加载所需的模型大小加 KV/compute 预留。" \
-        "model_bytes=$model_bytes" \
+        "场景 B 未执行：主机 MemAvailable 小于 ${MEMORY_MAX} 受限 cgroup 加操作系统预留。" \
+        "memory_limit_bytes=$memory_limit_bytes" \
         "host_available_bytes=$host_available_bytes" \
-        "reserve_bytes=$reserve_bytes" \
-        "请在物理可用内存至少覆盖 model + reserve 的机器上运行；不要使用 overcommit 伪造结果。" \
+        "host_reserve_bytes=$host_reserve_bytes" \
+        "请释放其他内存占用后重试；不要通过 overcommit 绕过此检查。" \
         > "$skip_dir/SKIPPED.md"
-    echo "SKIPPED: insufficient physical host memory; see $skip_dir/SKIPPED.md"
+    echo "SKIPPED: insufficient available host memory; see $skip_dir/SKIPPED.md"
     exit 0
 fi
 
@@ -124,7 +134,7 @@ write_startup_json() {
 run_group() {
     local group="$1"
     local port="$2"
-    local preload="$3"
+    local controller="$3"
     local run_dir="$TRACE_BASE_DIR/${RUN_PREFIX}_${group}"
     local start_ns end_ns
     local endpoint="http://127.0.0.1:${port}/completion"
@@ -144,28 +154,34 @@ run_group() {
         "LLM_MEM_TRACE=1"
         "LLM_MEM_TRACE_DIR=$run_dir"
         "LLM_MEM_TRACE_RUN_ID=${RUN_PREFIX}_${group}"
-        "TRACE_PROFILE=benchmark"
+        "TRACE_PROFILE=control"
         "LLM_MEM_TRACE_TENSOR=0"
         "LLM_MEM_TRACE_KV=0"
-        "LLM_MEM_TRACE_EXPERT=1"
+        "LLM_MEM_TRACE_EXPERT=0"
         "LLM_MEM_TRACE_MEMORY=1"
         "LLM_MEM_TRACE_RESIDENCY=0"
         "LLM_MEM_TRACE_RESIDENCY_ATTRIBUTION=0"
         "LLM_MEM_TRACE_SMAPS=0"
         "LLM_MEM_TRACE_EXPERT_TASK_MODE=summary"
-        "LLM_MEM_TRACE_CONTROL_ONLY=0"
-        "LLM_MEM_TRACE_OPT_EXPERT_PROFILE=performance"
-        "LLM_MEM_TRACE_OPT_EXPERT_CONTROLLER=off"
-        "LLM_MEM_TRACE_OS_HINTS=0"
-        "LLM_MEM_TRACE_OPT_EXPERT_PREFETCH=0"
+        "LLM_MEM_TRACE_CONTROL_ONLY=1"
+        "LLM_MEM_TRACE_OPT_EXPERT_PROFILE=custom"
+        "LLM_MEM_TRACE_OPT_EXPERT_CONTROLLER=$controller"
+        "LLM_MEM_TRACE_OS_HINTS=1"
+        "LLM_MEM_TRACE_OPT_EXPERT_PREFETCH=$([ "$controller" = expert_prefetch ] && echo 1 || echo 0)"
+        "LLM_MEM_TRACE_OPT_EXPERT_PREFETCH_BUDGET_MB=$PREFETCH_BUDGET_MB"
+        "LLM_MEM_TRACE_OPT_EXPERT_PREFETCH_TOPK=$PREFETCH_TOPK"
+        "LLM_MEM_TRACE_OPT_EXPERT_PREFETCH_PREFILL_TOPK=$PREFETCH_TOPK"
+        "LLM_MEM_TRACE_OPT_EXPERT_PREFETCH_DECODE_TOPK=$PREFETCH_TOPK"
+        "LLM_MEM_TRACE_OPT_EXPERT_ASYNC=$([ "$controller" = expert_prefetch ] && echo 1 || echo 0)"
+        "LLM_MEM_TRACE_OPT_EXPERT_ASYNC_WORKERS=1"
+        "LLM_MEM_TRACE_OPT_EXPERT_ASYNC_PRIORITY=0"
+        "LLM_MEM_TRACE_OPT_EXPERT_FEEDBACK=1"
+        "LLM_MEM_TRACE_OPT_EXPERT_VALUE_GATE=0"
         "LLM_MEM_TRACE_OPT_EXPERT_MADV_COLD_RECLAIM=0"
         "LLM_MEM_TRACE_OPT_EXPERT_MADV_DONTNEED_RECLAIM=0"
-        "LLM_MEM_TRACE_OPT_EXPERT_PRELOAD=$preload"
-        "LLM_MEM_TRACE_OPT_EXPERT_PRELOAD_KV_MB=$KV_RESERVE_MB"
-        "LLM_MEM_TRACE_OPT_EXPERT_PRELOAD_BUFFER_MB=$BUFFER_RESERVE_MB"
-        "LLM_MEM_TRACE_OPT_EXPERT_PRELOAD_SAFETY_PCT=80"
+        "LLM_MEM_TRACE_OPT_EXPERT_PRELOAD=0"
     )
-    echo "[RUN] $group: MemoryMax=$MEMORY_MAX, port=$port, preload=$preload"
+    echo "[RUN] $group: MemoryMax=$MEMORY_MAX, port=$port, controller=$controller, budget=${PREFETCH_BUDGET_MB}MiB, topk=$PREFETCH_TOPK"
     systemd-run --user --scope --quiet \
         -p "MemoryMax=$MEMORY_MAX" \
         -p "MemorySwapMax=$MEMORY_SWAP_MAX" \
@@ -200,8 +216,8 @@ run_group() {
     cleanup_server
 }
 
-run_group baseline "$PORT_BASE" 0
-run_group performance "$((PORT_BASE + 1))" 1
+run_group baseline "$PORT_BASE" off
+run_group performance "$((PORT_BASE + 1))" expert_prefetch
 
 REPORT_DIR="$TRACE_BASE_DIR/${RUN_PREFIX}_report"
 python3 "$SCRIPT_DIR/summarize_scenario_b.py" \
