@@ -13,6 +13,65 @@ using llama_files  = std::vector<std::unique_ptr<llama_file>>;
 using llama_mmaps  = std::vector<std::unique_ptr<llama_mmap>>;
 using llama_mlocks = std::vector<std::unique_ptr<llama_mlock>>;
 
+// This is intentionally a one-time mmap admission decision.  It does not
+// participate in any Decode-time memory or Expert-prefetch policy.
+enum class llama_mmap_populate_policy {
+    DEFAULT,
+    POPULATE,
+    SKIP,
+    AUTO,
+};
+
+enum class llama_mmap_populate_decision {
+    DEFAULT,
+    POPULATE,
+    SKIP,
+};
+
+enum class llama_mmap_memory_source {
+    UNAVAILABLE,
+    CGROUP,
+    MEMAVAILABLE,
+};
+
+struct llama_mmap_populate_admission_input {
+    int32_t expert_count = 0;
+    int32_t expert_used_count = 0;
+    uint64_t total_model_mapping_bytes = 0;
+    bool prefetch_requested = false;
+    bool numa = false;
+};
+
+struct llama_mmap_populate_admission {
+    llama_mmap_populate_policy requested_policy = llama_mmap_populate_policy::DEFAULT;
+    llama_mmap_populate_decision decision = llama_mmap_populate_decision::DEFAULT;
+    llama_mmap_memory_source memory_source = llama_mmap_memory_source::UNAVAILABLE;
+    bool legacy_skip_populate = false;
+    bool model_is_moe = false;
+    bool sparse_moe = false;
+    bool fit_ratio_available = false;
+    bool prefetch_requested = false;
+    bool numa = false;
+    int32_t expert_count = 0;
+    int32_t expert_used_count = 0;
+    uint64_t total_model_mapping_bytes = 0;
+    uint64_t memory_current_bytes = 0;
+    uint64_t memory_max_bytes = 0;
+    uint64_t memory_headroom_bytes = 0;
+    double fit_ratio = 0.0;
+    double fit_threshold = 1.0;
+    const char * reason = "DEFAULT_POLICY";
+};
+
+// The environment and Linux memory state are sampled once by this function.
+// The returned result is then shared by every mapping of a split GGUF model.
+llama_mmap_populate_admission llama_mmap_populate_admit(
+        const llama_mmap_populate_admission_input & input);
+void llama_mmap_log_populate_admission(const llama_mmap_populate_admission & admission);
+const char * llama_mmap_populate_policy_name(llama_mmap_populate_policy policy);
+const char * llama_mmap_populate_decision_name(llama_mmap_populate_decision decision);
+const char * llama_mmap_memory_source_name(llama_mmap_memory_source source);
+
 struct llama_file {
     llama_file(const char * fname, const char * mode, bool use_direct_io = false);
     llama_file(FILE * file);
@@ -42,7 +101,11 @@ private:
 
 struct llama_mmap {
     llama_mmap(const llama_mmap &) = delete;
-    llama_mmap(struct llama_file * file, size_t prefetch = (size_t) -1, bool numa = false);
+    llama_mmap(
+            struct llama_file * file,
+            size_t prefetch = (size_t) -1,
+            bool numa = false,
+            const llama_mmap_populate_admission * populate_admission = nullptr);
     ~llama_mmap();
 
     size_t size() const;

@@ -2,15 +2,21 @@
 
 #include "llama-impl.h"
 
+#include "trace_event.h"
+
 #include "ggml.h"
 
 #include <cstring>
 #include <climits>
 #include <cstdlib>
+#include <cctype>
+#include <cmath>
 #include <stdexcept>
 #include <cerrno>
 #include <algorithm>
+#include <limits>
 #include <mutex>
+#include <string>
 
 #ifdef __has_include
     #if __has_include(<unistd.h>)
@@ -28,6 +34,130 @@
 
 #if defined(__linux__) && defined(_POSIX_MAPPED_FILES)
 namespace {
+
+bool parse_u64_text(const char * text, uint64_t & value) {
+    if (!text || !*text) {
+        return false;
+    }
+    errno = 0;
+    char * end = nullptr;
+    const unsigned long long parsed = std::strtoull(text, &end, 10);
+    if (end == text || errno == ERANGE) {
+        return false;
+    }
+    while (*end && std::isspace((unsigned char) *end)) {
+        ++end;
+    }
+    if (*end) {
+        return false;
+    }
+    value = (uint64_t) parsed;
+    return true;
+}
+
+bool read_first_line(const std::string & path, std::string & line) {
+    FILE * file = std::fopen(path.c_str(), "r");
+    if (!file) {
+        return false;
+    }
+    char buffer[4096];
+    const bool read = std::fgets(buffer, sizeof(buffer), file) != nullptr;
+    std::fclose(file);
+    if (!read) {
+        return false;
+    }
+    line = buffer;
+    return true;
+}
+
+bool read_u64_file(const std::string & path, uint64_t & value) {
+    std::string line;
+    return read_first_line(path, line) && parse_u64_text(line.c_str(), value);
+}
+
+std::string current_cgroup_v2_dir_for_mmap_admission() {
+    FILE * file = std::fopen("/proc/self/cgroup", "r");
+    if (!file) {
+        return {};
+    }
+
+    char line[4096];
+    std::string relative;
+    while (std::fgets(line, sizeof(line), file)) {
+        if (std::strncmp(line, "0::", 3) == 0) {
+            relative = line + 3;
+            break;
+        }
+    }
+    std::fclose(file);
+
+    while (!relative.empty() && std::isspace((unsigned char) relative.back())) {
+        relative.pop_back();
+    }
+    if (relative.empty() || relative == "/") {
+        return relative.empty() ? std::string() : "/sys/fs/cgroup";
+    }
+    return "/sys/fs/cgroup/" + (relative.front() == '/' ? relative.substr(1) : relative);
+}
+
+bool read_memavailable_bytes(uint64_t & value) {
+    FILE * file = std::fopen("/proc/meminfo", "r");
+    if (!file) {
+        return false;
+    }
+
+    char line[4096];
+    bool found = false;
+    while (std::fgets(line, sizeof(line), file)) {
+        static constexpr const char * key = "MemAvailable:";
+        if (std::strncmp(line, key, std::strlen(key)) != 0) {
+            continue;
+        }
+        unsigned long long parsed_kib = 0;
+        found = std::sscanf(line + std::strlen(key), "%llu", &parsed_kib) == 1;
+        const uint64_t kib = (uint64_t) parsed_kib;
+        if (found && kib <= UINT64_MAX / 1024) {
+            value = kib * 1024;
+        } else {
+            found = false;
+        }
+        break;
+    }
+    std::fclose(file);
+    return found;
+}
+
+llama_mmap_populate_policy parse_populate_policy(bool & valid) {
+    valid = true;
+    const char * value = std::getenv("LLAMA_MMAP_POPULATE_POLICY");
+    if (!value || !*value || std::strcmp(value, "default") == 0) {
+        return llama_mmap_populate_policy::DEFAULT;
+    }
+    if (std::strcmp(value, "populate") == 0) {
+        return llama_mmap_populate_policy::POPULATE;
+    }
+    if (std::strcmp(value, "skip") == 0) {
+        return llama_mmap_populate_policy::SKIP;
+    }
+    if (std::strcmp(value, "auto") == 0) {
+        return llama_mmap_populate_policy::AUTO;
+    }
+    valid = false;
+    return llama_mmap_populate_policy::DEFAULT;
+}
+
+double parse_fit_threshold() {
+    const char * value = std::getenv("LLAMA_MMAP_AUTO_POPULATE_FIT_THRESHOLD");
+    if (!value || !*value) {
+        return 1.0;
+    }
+    char * end = nullptr;
+    const double parsed = std::strtod(value, &end);
+    while (end && *end && std::isspace((unsigned char) *end)) {
+        ++end;
+    }
+    return end != value && end && !*end && std::isfinite(parsed) && parsed > 0.0 ? parsed : 1.0;
+}
 
 struct mmap_phase_advice_state {
     std::mutex mutex;
@@ -68,6 +198,158 @@ void mmap_phase_advice_unregister_fd(int fd) {
 
 } // namespace
 #endif
+
+const char * llama_mmap_populate_policy_name(llama_mmap_populate_policy policy) {
+    switch (policy) {
+        case llama_mmap_populate_policy::DEFAULT:  return "default";
+        case llama_mmap_populate_policy::POPULATE: return "populate";
+        case llama_mmap_populate_policy::SKIP:     return "skip";
+        case llama_mmap_populate_policy::AUTO:     return "auto";
+    }
+    return "default";
+}
+
+const char * llama_mmap_populate_decision_name(llama_mmap_populate_decision decision) {
+    switch (decision) {
+        case llama_mmap_populate_decision::DEFAULT:  return "DEFAULT";
+        case llama_mmap_populate_decision::POPULATE: return "POPULATE";
+        case llama_mmap_populate_decision::SKIP:     return "SKIP_POPULATE";
+    }
+    return "DEFAULT";
+}
+
+const char * llama_mmap_memory_source_name(llama_mmap_memory_source source) {
+    switch (source) {
+        case llama_mmap_memory_source::UNAVAILABLE:  return "unavailable";
+        case llama_mmap_memory_source::CGROUP:       return "cgroup";
+        case llama_mmap_memory_source::MEMAVAILABLE: return "memavailable";
+    }
+    return "unavailable";
+}
+
+llama_mmap_populate_admission llama_mmap_populate_admit(
+        const llama_mmap_populate_admission_input & input) {
+    llama_mmap_populate_admission admission;
+    admission.expert_count = input.expert_count;
+    admission.expert_used_count = input.expert_used_count;
+    admission.total_model_mapping_bytes = input.total_model_mapping_bytes;
+    admission.prefetch_requested = input.prefetch_requested;
+    admission.numa = input.numa;
+    admission.model_is_moe = input.expert_count > 0;
+    admission.sparse_moe = input.expert_count > 0 && input.expert_used_count > 0 &&
+            input.expert_used_count < input.expert_count;
+    admission.fit_threshold = 1.0;
+
+    bool valid_policy = true;
+#if defined(__linux__) && defined(_POSIX_MAPPED_FILES)
+    admission.requested_policy = parse_populate_policy(valid_policy);
+    admission.fit_threshold = parse_fit_threshold();
+    const char * legacy_skip = std::getenv("LLAMA_MMAP_SKIP_POPULATE");
+    admission.legacy_skip_populate = legacy_skip && std::strcmp(legacy_skip, "1") == 0;
+
+    const std::string cgroup_dir = current_cgroup_v2_dir_for_mmap_admission();
+    uint64_t memory_current = 0;
+    uint64_t memory_max = 0;
+    std::string memory_max_text;
+    if (!cgroup_dir.empty() && read_u64_file(cgroup_dir + "/memory.current", memory_current) &&
+            read_first_line(cgroup_dir + "/memory.max", memory_max_text) &&
+            memory_max_text.compare(0, 3, "max") != 0 &&
+            parse_u64_text(memory_max_text.c_str(), memory_max)) {
+        admission.memory_source = llama_mmap_memory_source::CGROUP;
+        admission.memory_current_bytes = memory_current;
+        admission.memory_max_bytes = memory_max;
+        admission.memory_headroom_bytes = memory_max > memory_current ? memory_max - memory_current : 0;
+    } else {
+        uint64_t memavailable = 0;
+        if (read_memavailable_bytes(memavailable)) {
+            admission.memory_source = llama_mmap_memory_source::MEMAVAILABLE;
+            admission.memory_headroom_bytes = memavailable;
+        }
+    }
+#else
+    (void) valid_policy;
+#endif
+
+    if (admission.memory_source != llama_mmap_memory_source::UNAVAILABLE &&
+            admission.memory_headroom_bytes > 0) {
+        admission.fit_ratio_available = true;
+        admission.fit_ratio = (double) admission.total_model_mapping_bytes /
+                (double) admission.memory_headroom_bytes;
+    }
+
+    if (!valid_policy) {
+        admission.reason = "INVALID_POLICY_FALLBACK_DEFAULT";
+        return admission;
+    }
+
+    switch (admission.requested_policy) {
+        case llama_mmap_populate_policy::POPULATE:
+            admission.decision = llama_mmap_populate_decision::POPULATE;
+            admission.reason = "FORCED_POPULATE";
+            return admission;
+        case llama_mmap_populate_policy::SKIP:
+            admission.decision = llama_mmap_populate_decision::SKIP;
+            admission.reason = "FORCED_SKIP";
+            return admission;
+        case llama_mmap_populate_policy::DEFAULT:
+            if (admission.legacy_skip_populate) {
+                admission.decision = llama_mmap_populate_decision::SKIP;
+                admission.reason = "LEGACY_SKIP_POPULATE";
+            }
+            return admission;
+        case llama_mmap_populate_policy::AUTO:
+            break;
+    }
+
+    if (!admission.sparse_moe) {
+        admission.reason = "NOT_SPARSE_MOE";
+    } else if (admission.memory_source == llama_mmap_memory_source::UNAVAILABLE) {
+        admission.reason = "MEMORY_HEADROOM_UNAVAILABLE";
+    } else if (admission.memory_headroom_bytes == 0 ||
+            (admission.fit_ratio_available && admission.fit_ratio > admission.fit_threshold)) {
+        admission.decision = llama_mmap_populate_decision::SKIP;
+        admission.reason = "SPARSE_MOE_MODEL_EXCEEDS_HEADROOM";
+    } else {
+        admission.reason = "MODEL_FITS_HEADROOM";
+    }
+    return admission;
+}
+
+void llama_mmap_log_populate_admission(const llama_mmap_populate_admission & admission) {
+    const std::string fit_ratio = admission.fit_ratio_available ?
+            format("%.6f", admission.fit_ratio) : "unavailable";
+    const std::string memory_current = admission.memory_source == llama_mmap_memory_source::CGROUP ?
+            std::to_string(admission.memory_current_bytes) : "unavailable";
+    const std::string memory_max = admission.memory_source == llama_mmap_memory_source::CGROUP ?
+            std::to_string(admission.memory_max_bytes) : "unavailable";
+    std::fprintf(stderr,
+            "[MMAP_POPULATE_ADMISSION] requested_policy=%s legacy_skip_populate=%s "
+            "model_is_moe=%s sparse_moe=%s expert_count=%d expert_used_count=%d "
+            "model_bytes=%llu memory_source=%s memory_current=%s memory_max=%s "
+            "memory_headroom=%llu fit_ratio=%s fit_threshold=%.6f expected_n_predict=unavailable "
+            "prefetch_requested=%s numa=%s decision=%s reason=%s\n",
+            llama_mmap_populate_policy_name(admission.requested_policy),
+            admission.legacy_skip_populate ? "true" : "false",
+            admission.model_is_moe ? "true" : "false",
+            admission.sparse_moe ? "true" : "false",
+            admission.expert_count, admission.expert_used_count,
+            (unsigned long long) admission.total_model_mapping_bytes,
+            llama_mmap_memory_source_name(admission.memory_source), memory_current.c_str(), memory_max.c_str(),
+            (unsigned long long) admission.memory_headroom_bytes, fit_ratio.c_str(), admission.fit_threshold,
+            admission.prefetch_requested ? "true" : "false", admission.numa ? "true" : "false",
+            llama_mmap_populate_decision_name(admission.decision), admission.reason);
+    llm_mem_trace_mmap_populate_admission(
+            llama_mmap_populate_policy_name(admission.requested_policy),
+            llama_mmap_populate_decision_name(admission.decision), admission.reason,
+            admission.model_is_moe ? 1 : 0, admission.sparse_moe ? 1 : 0,
+            admission.expert_count, admission.expert_used_count,
+            admission.total_model_mapping_bytes,
+            llama_mmap_memory_source_name(admission.memory_source),
+            admission.memory_current_bytes, admission.memory_max_bytes, admission.memory_headroom_bytes,
+            admission.fit_ratio_available ? 1 : 0, admission.fit_ratio, admission.fit_threshold,
+            admission.prefetch_requested ? 1 : 0, admission.numa ? 1 : 0,
+            admission.legacy_skip_populate ? 1 : 0);
+}
 
 #if defined(_WIN32)
     #define WIN32_LEAN_AND_MEAN
@@ -490,7 +772,11 @@ struct llama_mmap::impl {
     int decode_normal_fd = -1;
 #endif
 
-    impl(struct llama_file * file, size_t prefetch, bool numa) {
+    impl(
+            struct llama_file * file,
+            size_t prefetch,
+            bool numa,
+            const llama_mmap_populate_admission * populate_admission) {
         size = file->size();
         int fd = file->file_id();
         int flags = MAP_SHARED;
@@ -512,17 +798,22 @@ struct llama_mmap::impl {
                 sequential_advice_applied = true;
             }
         }
-        const char * skip_populate = std::getenv("LLAMA_MMAP_SKIP_POPULATE");
-        if (prefetch && skip_populate && std::strcmp(skip_populate, "1") == 0) {
-            LLAMA_LOG_WARN("llama_mmap: skipping MAP_POPULATE by request\n");
-        } else if (prefetch) {
+        const bool skip_populate = populate_admission ?
+                populate_admission->decision == llama_mmap_populate_decision::SKIP :
+                (std::getenv("LLAMA_MMAP_SKIP_POPULATE") &&
+                 std::strcmp(std::getenv("LLAMA_MMAP_SKIP_POPULATE"), "1") == 0);
+        if (prefetch && !skip_populate) {
             flags |= MAP_POPULATE;
         }
 #endif
+        const uint64_t mmap_begin_ts_ns = llm_mem_trace_time_ns();
         addr = mmap(NULL, file->size(), PROT_READ, flags, fd, 0);
         if (addr == MAP_FAILED) {
             throw std::runtime_error(format("mmap failed: %s", strerror(errno)));
         }
+        llm_mem_trace_model_mmap(
+                mmap_begin_ts_ns, llm_mem_trace_time_ns(), (uint64_t) file->size(),
+                (flags & MAP_POPULATE) != 0 ? 1 : 0);
 
         if (prefetch > 0) {
             if (posix_madvise(addr, std::min(file->size(), prefetch), POSIX_MADV_WILLNEED)) {
@@ -620,8 +911,13 @@ struct llama_mmap::impl {
 #elif defined(_WIN32)
     HANDLE hMapping = nullptr;
 
-    impl(struct llama_file * file, size_t prefetch, bool numa) {
+    impl(
+            struct llama_file * file,
+            size_t prefetch,
+            bool numa,
+            const llama_mmap_populate_admission * populate_admission) {
         GGML_UNUSED(numa);
+        GGML_UNUSED(populate_admission);
 
         size = file->size();
 
@@ -684,10 +980,15 @@ struct llama_mmap::impl {
         }
     }
 #else
-    impl(struct llama_file * file, size_t prefetch, bool numa) {
+    impl(
+            struct llama_file * file,
+            size_t prefetch,
+            bool numa,
+            const llama_mmap_populate_admission * populate_admission) {
         GGML_UNUSED(file);
         GGML_UNUSED(prefetch);
         GGML_UNUSED(numa);
+        GGML_UNUSED(populate_admission);
 
         throw std::runtime_error("mmap not supported");
     }
@@ -704,7 +1005,12 @@ struct llama_mmap::impl {
     size_t size;
 };
 
-llama_mmap::llama_mmap(struct llama_file * file, size_t prefetch, bool numa) : pimpl(std::make_unique<impl>(file, prefetch, numa)) {}
+llama_mmap::llama_mmap(
+        struct llama_file * file,
+        size_t prefetch,
+        bool numa,
+        const llama_mmap_populate_admission * populate_admission) :
+        pimpl(std::make_unique<impl>(file, prefetch, numa, populate_admission)) {}
 llama_mmap::~llama_mmap() = default;
 
 size_t llama_mmap::size() const { return pimpl->size; }

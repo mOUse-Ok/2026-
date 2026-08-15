@@ -38,6 +38,9 @@ bool compare_deadline_score(const ExpertHintPriorityKey & a, const ExpertHintPri
         }
         return a.deadline_ts_ns < b.deadline_ts_ns;
     }
+    if (a.deterministic != b.deterministic) {
+        return a.deterministic;
+    }
     return compare_score(a, b);
 }
 

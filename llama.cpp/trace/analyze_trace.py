@@ -1220,6 +1220,164 @@ def collect_metrics(data: dict[str, list[dict]]) -> dict:
             1 for r in controlled_hints if r.get("action") in controller_cancel_actions
         )
 
+    swap_samples = [
+        int(r["swap_current_bytes"])
+        for r in data["memory"]
+        if isinstance(r.get("swap_current_bytes"), (int, float))
+    ]
+    if swap_samples:
+        # This is cgroup-v2 memory.swap.current sampled by the existing
+        # feedback controller; label it as such rather than mistaking it for
+        # a per-process /proc/smaps peak.
+        metrics["cgroup_swap_current_peak_mb"] = max(swap_samples) / (1024**2)
+
+    deterministic_summaries = [
+        r for r in data["memory"]
+        if r.get("event") == "DETERMINISTIC_PREFETCH_SUMMARY"
+    ]
+    if deterministic_summaries:
+        # The feature writes one process-end summary.  Keeping it separate from
+        # EXPERT_TASK avoids changing the established Expert metrics.
+        summary = max(deterministic_summaries, key=lambda r: int(r.get("ts_ns", 0)))
+        metrics["deterministic_prefetch_summary_events"] = len(deterministic_summaries)
+        for field in (
+            "candidate_tensor_count",
+            "candidate_bytes",
+            "per_layer_range_count_min",
+            "per_layer_range_count_max",
+            "per_layer_selected_bytes_min",
+            "per_layer_selected_bytes_max",
+            "target_ranges",
+            "target_bytes",
+            "actual_candidate_first_uses",
+            "missed_first_uses",
+            "unexpected_first_uses",
+            "task_created",
+            "task_issued",
+            "hint_bytes",
+            "issued_before_first_use",
+            "issued_after_first_use",
+            "hint_to_first_use_lead_samples",
+        ):
+            metrics[f"deterministic_prefetch_{field}"] = int(summary.get(field, 0))
+        for field in (
+            "first_use_match_rate_pct",
+            "issued_before_first_use_rate_pct",
+            "hint_to_first_use_mean_us",
+            "hint_to_first_use_median_us",
+        ):
+            metrics[f"deterministic_prefetch_{field}"] = float(summary.get(field, 0.0))
+        metrics["deterministic_prefetch_enabled"] = 1 if summary.get("enabled") is True else 0
+        metrics["deterministic_prefetch_shadow"] = 1 if summary.get("shadow") is True else 0
+
+    mmap_events = [r for r in data["memory"] if r.get("event") == "MODEL_MMAP"]
+    mmap_admissions = [
+        r for r in data["memory"]
+        if r.get("event") == "MMAP_POPULATE_ADMISSION"
+    ]
+    if mmap_admissions:
+        admission = min(mmap_admissions, key=lambda r: int(r.get("ts_ns", 0)))
+        metrics["mmap_populate_admission_events"] = len(mmap_admissions)
+        for field in (
+            "requested_policy",
+            "decision",
+            "reason",
+            "memory_source",
+            "expected_n_predict",
+        ):
+            metrics[f"mmap_populate_admission_{field}"] = str(admission.get(field, ""))
+        for field in (
+            "expert_count",
+            "expert_used_count",
+            "model_bytes",
+            "memory_current_bytes",
+            "memory_max_bytes",
+            "memory_headroom_bytes",
+        ):
+            metrics[f"mmap_populate_admission_{field}"] = int(admission.get(field, 0))
+        for field in ("fit_ratio", "fit_threshold"):
+            if isinstance(admission.get(field), (int, float)):
+                metrics[f"mmap_populate_admission_{field}"] = float(admission[field])
+        for field in (
+            "model_is_moe",
+            "sparse_moe",
+            "fit_ratio_available",
+            "prefetch_requested",
+            "numa",
+            "legacy_skip_populate",
+        ):
+            metrics[f"mmap_populate_admission_{field}"] = 1 if admission.get(field) is True else 0
+
+    if mmap_events:
+        metrics["model_mmap_events"] = len(mmap_events)
+        metrics["model_mmap_duration_ms"] = sum(
+            int(r.get("duration_ns", 0)) for r in mmap_events
+        ) / 1e6
+        metrics["model_mmap_bytes"] = sum(int(r.get("bytes", 0)) for r in mmap_events)
+        metrics["model_mmap_populate_events"] = sum(
+            1 for r in mmap_events if r.get("map_populate") is True
+        )
+        if mmap_admissions:
+            decision = str(mmap_admissions[0].get("decision", ""))
+            requested = mmap_admissions[0].get("prefetch_requested") is True and \
+                mmap_admissions[0].get("numa") is not True
+            expected_populate = requested and decision != "SKIP_POPULATE"
+            actual_populate = metrics["model_mmap_populate_events"] == len(mmap_events)
+            metrics["mmap_populate_admission_actual_matches_decision"] = 1 if \
+                actual_populate == expected_populate else 0
+        model_begin_ns = min(int(r.get("begin_ts_ns", r.get("ts_ns", 0))) for r in mmap_events)
+        load_ready_events = [r for r in data["memory"] if r.get("event") == "MODEL_LOAD_COMPLETE"]
+        decode_begin_events = [r for r in data["memory"] if r.get("event") == "MODEL_DECODE_BEGIN"]
+        if load_ready_events:
+            load_ready_ns = min(int(r.get("ts_ns", 0)) for r in load_ready_events)
+            if load_ready_ns >= model_begin_ns:
+                metrics["model_load_to_ready_ms"] = (load_ready_ns - model_begin_ns) / 1e6
+        if decode_begin_events:
+            decode_begin_ns = min(int(r.get("ts_ns", 0)) for r in decode_begin_events)
+            if decode_begin_ns >= model_begin_ns:
+                metrics["time_to_decode_start_ms"] = (decode_begin_ns - model_begin_ns) / 1e6
+
+    populate_snapshots = [
+        r for r in data["memory"]
+        if r.get("event") == "MMAP_POPULATE_AUDIT_SNAPSHOT"
+    ]
+    for snapshot in populate_snapshots:
+        point = str(snapshot.get("point", "")).lower()
+        if point not in {"t0", "t1", "t2"}:
+            continue
+        for field in (
+            "page_size", "mappings", "mincore_failures",
+            "model_pages", "model_resident_pages", "model_resident_bytes",
+            "expert_pages", "expert_resident_pages", "expert_resident_bytes",
+            "nonexpert_resident_pages", "nonexpert_resident_bytes",
+            "mapping_rejected", "overlapping_expert_mapping_rejected",
+        ):
+            metrics[f"mmap_populate_audit_{point}_{field}"] = int(snapshot.get(field, 0))
+        for field in ("model_resident_ratio", "expert_resident_ratio"):
+            metrics[f"mmap_populate_audit_{point}_{field}"] = float(snapshot.get(field, 0.0))
+        metrics[f"mmap_populate_audit_{point}_complete"] = 1 if snapshot.get("complete") is True else 0
+
+    populate_summaries = [
+        r for r in data["memory"]
+        if r.get("event") == "MMAP_POPULATE_AUDIT_SUMMARY"
+    ]
+    if populate_summaries:
+        summary = max(populate_summaries, key=lambda r: int(r.get("ts_ns", 0)))
+        metrics["mmap_populate_audit_summary_events"] = len(populate_summaries)
+        for field in (
+            "t0_resident_pages_in_used_expert_slices",
+            "t0_resident_bytes_in_used_expert_slices",
+            "t0_resident_pages_in_never_used_expert_slices",
+            "t0_resident_bytes_in_never_used_expert_slices",
+            "used_slice_keys",
+            "registered_expert_slices",
+        ):
+            metrics[f"mmap_populate_audit_{field}"] = int(summary.get(field, 0))
+        metrics["mmap_populate_audit_never_used_fraction_of_t0_expert_residency"] = float(
+            summary.get("never_used_fraction_of_t0_expert_residency", 0.0)
+        )
+        metrics["mmap_populate_audit_complete"] = 1 if summary.get("complete") is True else 0
+
     task_events = [r for r in data["memory"] if r.get("event") == "EXPERT_TASK"]
     task_summaries = [r for r in data["memory"] if r.get("event") == "EXPERT_TASK_SUMMARY"]
     if task_summaries:

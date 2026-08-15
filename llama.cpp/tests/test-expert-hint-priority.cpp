@@ -47,6 +47,16 @@ static void test_deadline_score_order_is_preserved() {
     require(expert_hint_priority_higher(
                     first, second, ExpertAsyncPriorityMode::DeadlineScore),
             "sequence must break equal deadline and score ties in ascending order");
+
+    ExpertHintPriorityKey deterministic = key(8, 0, 0, 0.1, 100);
+    deterministic.deterministic = true;
+    require(expert_hint_priority_higher(
+                    deterministic, high_score, ExpertAsyncPriorityMode::DeadlineScore),
+            "deterministic requests must break equal-deadline ties");
+    const ExpertHintPriorityKey strictly_earlier = key(9, 0, 0, 0.0, 99);
+    require(expert_hint_priority_higher(
+                    strictly_earlier, deterministic, ExpertAsyncPriorityMode::DeadlineScore),
+            "deterministic requests must not override an earlier deadline");
 }
 
 static void test_other_core_modes_are_preserved() {

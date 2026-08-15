@@ -9,6 +9,9 @@ struct ExpertHintPriorityKey {
     double route_score = 0.0;
     uint64_t sequence = 0;
     uint64_t deadline_ts_ns = 0;
+    // Deterministic next-layer requests never override an earlier deadline.
+    // They only win an otherwise identical deadline tie.
+    bool deterministic = false;
 };
 
 // Returns true when a must be issued before b.

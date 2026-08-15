@@ -1405,7 +1405,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    ml.init_mappings(
+            true,
+            use_mlock ? &pimpl->mlock_mmaps : nullptr,
+            hparams.n_expert,
+            hparams.n_expert_used);
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers

@@ -373,6 +373,24 @@ bool expert_prefetch_control_enabled() {
     return os_hint_opt_enabled("LLM_MEM_TRACE_OPT_EXPERT_PREFETCH");
 }
 
+// This deliberately has no default effect.  Shadow mode builds and audits the
+// same fixed table but never emits an OS hint.
+bool deterministic_prefetch_enabled() {
+    static const bool enabled = env_truthy(
+            std::getenv("LLM_MEM_TRACE_OPT_DETERMINISTIC_PREFETCH"));
+    return enabled && os_hints_enabled();
+}
+
+bool deterministic_prefetch_shadow_enabled() {
+    static const bool enabled = env_truthy(
+            std::getenv("LLM_MEM_TRACE_OPT_DETERMINISTIC_PREFETCH_SHADOW"));
+    return enabled && llm_mem_trace_enabled();
+}
+
+bool deterministic_prefetch_observation_enabled() {
+    return deterministic_prefetch_enabled() || deterministic_prefetch_shadow_enabled();
+}
+
 // This controller is deliberately independent of Expert prefetch/reclaim.
 // It protects only the request-to-KV-slot admission boundary in llama-server;
 // it never changes the size, type, or contents of an active KV cache.
@@ -742,6 +760,364 @@ uint64_t count_process_mappings() {
     return count;
 }
 #endif
+
+// This is a deliberately serial, opt-in audit for the MAP_POPULATE question.
+// It snapshots each actual model mapping only at T0/T1/T2; it never performs
+// a per-Expert mincore syscall and it writes aggregate results only.
+bool mmap_populate_audit_enabled() {
+    static const bool requested = env_truthy(std::getenv("LLAMA_MMAP_POPULATE_AUDIT"));
+    return requested && llm_mem_trace_enabled() &&
+            llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_MEMORY) &&
+            !llm_mem_trace_control_only();
+}
+
+struct MmapPopulateAuditMappedTensor {
+    uintptr_t addr = 0;
+    size_t nbytes = 0;
+};
+
+struct MmapPopulateAuditSnapshot {
+    bool captured = false;
+    bool complete = false;
+    uint64_t ts_ns = 0;
+    uint64_t page_size = 0;
+    uint64_t mappings = 0;
+    uint64_t mincore_failures = 0;
+    uint64_t model_pages = 0;
+    uint64_t model_resident_pages = 0;
+    uint64_t expert_pages = 0;
+    uint64_t expert_resident_pages = 0;
+    uint64_t nonexpert_resident_pages = 0;
+};
+
+#ifdef __linux__
+struct MmapPopulateAuditSlice {
+    int layer = -1;
+    int expert = -1;
+    std::string tensor;
+    size_t mapping_index = 0;
+    uint64_t first_page = 0;
+    uint64_t end_page = 0;
+    uint64_t t0_resident_pages = 0;
+};
+
+struct MmapPopulateAuditMapping {
+    FileMapping mapping;
+    std::vector<size_t> slices;
+    bool expert_attribution_valid = true;
+};
+#endif
+
+std::string mmap_populate_audit_slice_key(
+        int layer, int expert, const std::string & tensor) {
+    return std::to_string(layer) + ":" + std::to_string(expert) + ":" + tensor;
+}
+
+class MmapPopulateAuditState {
+public:
+    void add_mapped_tensor(uintptr_t addr, size_t nbytes) {
+        if (!mmap_populate_audit_enabled() || addr == 0 || nbytes == 0) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(mu_);
+        for (const auto & item : mapped_tensors_) {
+            if (item.addr == addr && item.nbytes == nbytes) {
+                return;
+            }
+        }
+        mapped_tensors_.push_back({addr, nbytes});
+    }
+
+    void note_first_use(const ExpertTensorInfo & info, int expert) {
+        if (!mmap_populate_audit_enabled() || expert < 0) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(mu_);
+        used_slices_.insert(mmap_populate_audit_slice_key(info.layer, expert, info.name));
+    }
+
+    void capture_t0() { capture("T0", t0_); }
+    void capture_t1() { capture("T1", t1_); }
+    void capture_t2() {
+        capture("T2", t2_);
+        std::lock_guard<std::mutex> lock(mu_);
+        write_summary_locked();
+    }
+
+private:
+    std::mutex mu_;
+    std::vector<MmapPopulateAuditMappedTensor> mapped_tensors_;
+    std::unordered_set<std::string> used_slices_;
+#ifdef __linux__
+    std::vector<MmapPopulateAuditMapping> mappings_;
+    std::vector<MmapPopulateAuditSlice> slices_;
+#endif
+    MmapPopulateAuditSnapshot t0_;
+    MmapPopulateAuditSnapshot t1_;
+    MmapPopulateAuditSnapshot t2_;
+    bool layout_ready_ = false;
+    bool layout_failed_ = false;
+    bool summary_written_ = false;
+    uint64_t mapping_rejected_ = 0;
+    uint64_t overlapping_expert_mapping_rejected_ = 0;
+
+    void capture(const char * point, MmapPopulateAuditSnapshot & snapshot) {
+        if (!mmap_populate_audit_enabled()) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(mu_);
+        if (snapshot.captured) {
+            return;
+        }
+        snapshot.captured = true;
+        snapshot.ts_ns = llm_mem_trace_time_ns();
+#ifdef __linux__
+        if (!build_layout_locked()) {
+            write_snapshot_locked(point, snapshot);
+            return;
+        }
+
+        snapshot.page_size = (uint64_t) sysconf(_SC_PAGESIZE);
+        if (snapshot.page_size == 0) {
+            write_snapshot_locked(point, snapshot);
+            return;
+        }
+        snapshot.mappings = mappings_.size();
+        for (size_t mapping_index = 0; mapping_index < mappings_.size(); ++mapping_index) {
+            const MmapPopulateAuditMapping & audit_mapping = mappings_[mapping_index];
+            const FileMapping & mapping = audit_mapping.mapping;
+            const uint64_t page_count = (uint64_t) ((mapping.end - mapping.start) / snapshot.page_size);
+            if (page_count == 0 || page_count > std::numeric_limits<size_t>::max()) {
+                ++snapshot.mincore_failures;
+                continue;
+            }
+
+            std::vector<unsigned char> page_residency((size_t) page_count);
+            if (mincore(reinterpret_cast<void *>(mapping.start),
+                        (size_t) (mapping.end - mapping.start), page_residency.data()) != 0) {
+                ++snapshot.mincore_failures;
+                continue;
+            }
+
+            snapshot.model_pages += page_count;
+            for (unsigned char value : page_residency) {
+                snapshot.model_resident_pages += (value & 1u) ? 1u : 0u;
+            }
+            if (!audit_mapping.expert_attribution_valid) {
+                continue;
+            }
+            for (size_t slice_index : audit_mapping.slices) {
+                MmapPopulateAuditSlice & slice = slices_[slice_index];
+                if (slice.end_page > page_count || slice.first_page >= slice.end_page) {
+                    ++snapshot.mincore_failures;
+                    continue;
+                }
+                snapshot.expert_pages += slice.end_page - slice.first_page;
+                uint64_t resident = 0;
+                for (uint64_t page = slice.first_page; page < slice.end_page; ++page) {
+                    resident += (page_residency[(size_t) page] & 1u) ? 1u : 0u;
+                }
+                snapshot.expert_resident_pages += resident;
+                if (&snapshot == &t0_) {
+                    slice.t0_resident_pages = resident;
+                }
+            }
+        }
+        snapshot.nonexpert_resident_pages = snapshot.model_resident_pages > snapshot.expert_resident_pages ?
+                snapshot.model_resident_pages - snapshot.expert_resident_pages : 0;
+        snapshot.complete = snapshot.mincore_failures == 0 && !layout_failed_;
+#else
+        (void) point;
+#endif
+        write_snapshot_locked(point, snapshot);
+    }
+
+#ifdef __linux__
+    bool build_layout_locked() {
+        if (layout_ready_) {
+            return true;
+        }
+        if (layout_failed_) {
+            return false;
+        }
+        const long sys_page_size = sysconf(_SC_PAGESIZE);
+        if (sys_page_size <= 0 || mapped_tensors_.empty()) {
+            layout_failed_ = true;
+            return false;
+        }
+        const uintptr_t page_size = (uintptr_t) sys_page_size;
+
+        for (const MmapPopulateAuditMappedTensor & tensor : mapped_tensors_) {
+            FileMapping mapping;
+            if (!find_file_mapping(tensor.addr, mapping) ||
+                    !file_mapping_contains_range(mapping, tensor.addr, tensor.nbytes)) {
+                ++mapping_rejected_;
+                continue;
+            }
+            const auto existing = std::find_if(
+                    mappings_.begin(), mappings_.end(), [&mapping](const MmapPopulateAuditMapping & item) {
+                        return item.mapping.start == mapping.start && item.mapping.end == mapping.end &&
+                                item.mapping.offset == mapping.offset && item.mapping.path == mapping.path;
+                    });
+            if (existing == mappings_.end()) {
+                mappings_.push_back({std::move(mapping), {}, true});
+            }
+        }
+        if (mappings_.empty()) {
+            layout_failed_ = true;
+            return false;
+        }
+
+        const std::vector<ExpertTensorInfo> expert_tensors = expert_tensor_registry().all();
+        for (const ExpertTensorInfo & info : expert_tensors) {
+            for (int expert = 0; expert < info.n_expert; ++expert) {
+                uintptr_t addr = 0;
+                size_t nbytes = 0;
+                if (!expert_slice_range(info, expert, addr, nbytes) ||
+                        nbytes > std::numeric_limits<uintptr_t>::max() - addr) {
+                    continue;
+                }
+                const auto mapping_it = std::find_if(
+                        mappings_.begin(), mappings_.end(), [addr, nbytes](const MmapPopulateAuditMapping & item) {
+                            return file_mapping_contains_range(item.mapping, addr, nbytes);
+                        });
+                if (mapping_it == mappings_.end()) {
+                    ++mapping_rejected_;
+                    continue;
+                }
+                const uintptr_t first = ((addr + page_size - 1) / page_size) * page_size;
+                const uintptr_t end = ((addr + nbytes) / page_size) * page_size;
+                if (end <= first || first < mapping_it->mapping.start || end > mapping_it->mapping.end) {
+                    // The first/last partial boundary pages intentionally do
+                    // not belong to either Expert slice's formal statistics.
+                    continue;
+                }
+                const size_t mapping_index = (size_t) (mapping_it - mappings_.begin());
+                MmapPopulateAuditSlice slice;
+                slice.layer = info.layer;
+                slice.expert = expert;
+                slice.tensor = info.name;
+                slice.mapping_index = mapping_index;
+                slice.first_page = (uint64_t) ((first - mapping_it->mapping.start) / page_size);
+                slice.end_page = (uint64_t) ((end - mapping_it->mapping.start) / page_size);
+                mappings_[mapping_index].slices.push_back(slices_.size());
+                slices_.push_back(std::move(slice));
+            }
+        }
+
+        // Complete pages should never be shared after the inward alignment.
+        // If an unusual layout violates that invariant, reject Expert
+        // attribution for the whole mapping rather than double-count pages.
+        for (MmapPopulateAuditMapping & mapping : mappings_) {
+            std::sort(mapping.slices.begin(), mapping.slices.end(), [this](size_t a, size_t b) {
+                return slices_[a].first_page < slices_[b].first_page;
+            });
+            uint64_t previous_end = 0;
+            bool have_previous = false;
+            for (size_t slice_index : mapping.slices) {
+                const MmapPopulateAuditSlice & slice = slices_[slice_index];
+                if (have_previous && slice.first_page < previous_end) {
+                    mapping.expert_attribution_valid = false;
+                    break;
+                }
+                previous_end = slice.end_page;
+                have_previous = true;
+            }
+            if (!mapping.expert_attribution_valid) {
+                ++overlapping_expert_mapping_rejected_;
+            }
+        }
+        layout_ready_ = true;
+        return true;
+    }
+#endif
+
+    static uint64_t bytes(const MmapPopulateAuditSnapshot & snapshot, uint64_t pages) {
+        return pages * snapshot.page_size;
+    }
+
+    void write_snapshot_locked(const char * point, const MmapPopulateAuditSnapshot & snapshot) const {
+        if (!llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_MEMORY)) {
+            return;
+        }
+        std::string line;
+        line.reserve(1024);
+        line += "{\"event\":\"MMAP_POPULATE_AUDIT_SNAPSHOT\",\"ts_ns\":" +
+                std::to_string(snapshot.ts_ns);
+        line += ",\"point\":";
+        json_escape_append(line, point);
+        line += ",\"complete\":" + std::string(snapshot.complete ? "true" : "false");
+        line += ",\"page_size\":" + std::to_string(snapshot.page_size);
+        line += ",\"mappings\":" + std::to_string(snapshot.mappings);
+        line += ",\"mincore_failures\":" + std::to_string(snapshot.mincore_failures);
+        line += ",\"model_pages\":" + std::to_string(snapshot.model_pages);
+        line += ",\"model_resident_pages\":" + std::to_string(snapshot.model_resident_pages);
+        line += ",\"model_resident_bytes\":" + std::to_string(bytes(snapshot, snapshot.model_resident_pages));
+        line += ",\"model_resident_ratio\":" + std::to_string(
+                snapshot.model_pages == 0 ? 0.0 :
+                (double) snapshot.model_resident_pages / (double) snapshot.model_pages);
+        line += ",\"expert_pages\":" + std::to_string(snapshot.expert_pages);
+        line += ",\"expert_resident_pages\":" + std::to_string(snapshot.expert_resident_pages);
+        line += ",\"expert_resident_bytes\":" + std::to_string(bytes(snapshot, snapshot.expert_resident_pages));
+        line += ",\"expert_resident_ratio\":" + std::to_string(
+                snapshot.expert_pages == 0 ? 0.0 :
+                (double) snapshot.expert_resident_pages / (double) snapshot.expert_pages);
+        line += ",\"nonexpert_resident_pages\":" + std::to_string(snapshot.nonexpert_resident_pages);
+        line += ",\"nonexpert_resident_bytes\":" + std::to_string(bytes(snapshot, snapshot.nonexpert_resident_pages));
+        line += ",\"mapping_rejected\":" + std::to_string(mapping_rejected_);
+        line += ",\"overlapping_expert_mapping_rejected\":" +
+                std::to_string(overlapping_expert_mapping_rejected_);
+        line += "}";
+        llm_mem_trace_write(LLM_MEM_TRACE_SINK_MEMORY, line.c_str(), line.size());
+    }
+
+    void write_summary_locked() {
+        if (summary_written_ || !t2_.captured ||
+                !llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_MEMORY)) {
+            return;
+        }
+        uint64_t used_pages = 0;
+        uint64_t never_used_pages = 0;
+#ifdef __linux__
+        for (const MmapPopulateAuditSlice & slice : slices_) {
+            const std::string key = mmap_populate_audit_slice_key(
+                    slice.layer, slice.expert, slice.tensor);
+            if (used_slices_.count(key) != 0) {
+                used_pages += slice.t0_resident_pages;
+            } else {
+                never_used_pages += slice.t0_resident_pages;
+            }
+        }
+#endif
+        const uint64_t page_size = t0_.page_size;
+        std::string line;
+        line.reserve(1024);
+        line += "{\"event\":\"MMAP_POPULATE_AUDIT_SUMMARY\",\"ts_ns\":" +
+                std::to_string(llm_mem_trace_time_ns());
+        line += ",\"complete\":" + std::string(t0_.complete && t1_.complete && t2_.complete ? "true" : "false");
+        line += ",\"t0_resident_pages_in_used_expert_slices\":" + std::to_string(used_pages);
+        line += ",\"t0_resident_bytes_in_used_expert_slices\":" + std::to_string(used_pages * page_size);
+        line += ",\"t0_resident_pages_in_never_used_expert_slices\":" + std::to_string(never_used_pages);
+        line += ",\"t0_resident_bytes_in_never_used_expert_slices\":" + std::to_string(never_used_pages * page_size);
+        line += ",\"never_used_fraction_of_t0_expert_residency\":" + std::to_string(
+                (double) never_used_pages / (double) std::max<uint64_t>(t0_.expert_resident_pages, 1));
+        line += ",\"used_slice_keys\":" + std::to_string(used_slices_.size());
+        line += ",\"registered_expert_slices\":";
+#ifdef __linux__
+        line += std::to_string(slices_.size());
+#else
+        line += "0";
+#endif
+        line += "}";
+        llm_mem_trace_write(LLM_MEM_TRACE_SINK_MEMORY, line.c_str(), line.size());
+        summary_written_ = true;
+    }
+};
+
+MmapPopulateAuditState & mmap_populate_audit_state() {
+    static MmapPopulateAuditState state;
+    return state;
+}
 
 // Serial diagnostic only: compare a routed Expert Slice with the directly
 // adjacent, unrouted slice in the same GGUF tensor. This never issues an OS
@@ -3702,6 +4078,286 @@ struct ExpertTaskLifecycleRecord {
     double score = 0.0;
 };
 
+enum class PrefetchTaskSource {
+    Expert,
+    Deterministic,
+};
+
+bool is_deterministic_task(PrefetchTaskSource source) {
+    return source == PrefetchTaskSource::Deterministic;
+}
+
+// Qwen3.5 alternates linear and full-attention layers, so attention weight
+// names are not a safe fixed class.  These five weights are instead present
+// in every Qwen3.5 MoE layer and are all consumed unconditionally by
+// build_layer_ffn(): router + the shared-expert MLP and its scalar gate.
+bool is_deterministic_qwen35_tensor_name(const char * name) {
+    if (!name || !std::strstr(name, "blk.")) {
+        return false;
+    }
+    static constexpr std::array<const char *, 5> suffixes = {{
+        ".ffn_gate_inp.weight",
+        ".ffn_gate_shexp.weight",
+        ".ffn_up_shexp.weight",
+        ".ffn_down_shexp.weight",
+        ".ffn_gate_inp_shexp.weight",
+    }};
+    const size_t name_len = std::strlen(name);
+    for (const char * suffix : suffixes) {
+        const size_t suffix_len = std::strlen(suffix);
+        if (name_len > suffix_len &&
+                std::strcmp(name + name_len - suffix_len, suffix) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+struct DeterministicTensorInfo {
+    std::string name;
+    int layer = -1;
+    uintptr_t addr = 0;
+    size_t nbytes = 0;
+};
+
+struct DeterministicUseRecord {
+    DeterministicTensorInfo info;
+    uint64_t step = 0;
+    uint64_t issue_ts_ns = 0;
+    uint64_t first_use_ts_ns = 0;
+    bool task_created = false;
+    bool issued = false;
+    bool first_used = false;
+};
+
+struct DeterministicPrefetchCounters {
+    uint64_t target_ranges = 0;
+    uint64_t target_bytes = 0;
+    uint64_t actual_first_uses = 0;
+    uint64_t unexpected_first_uses = 0;
+    uint64_t task_created = 0;
+    uint64_t task_issued = 0;
+    uint64_t hint_bytes = 0;
+    uint64_t issued_before_first_use = 0;
+    uint64_t issued_after_first_use = 0;
+    std::vector<uint64_t> hint_to_first_use_ns;
+};
+
+struct DeterministicPrefetchState {
+    std::mutex mu;
+    std::unordered_map<int, std::vector<DeterministicTensorInfo>> by_layer;
+    std::unordered_map<std::string, DeterministicUseRecord> uses;
+    DeterministicPrefetchCounters counters;
+
+    static std::string key(
+            uint64_t step, int layer, const std::string & name, uintptr_t addr) {
+        return std::to_string(step) + ":" + std::to_string(layer) + ":" +
+                name + ":" + std::to_string((uint64_t) addr);
+    }
+
+    void add_mapped_tensor(const char * name, int layer, uintptr_t addr, size_t nbytes) {
+        if (!is_deterministic_qwen35_tensor_name(name) || layer < 0 || addr == 0 || nbytes == 0) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(mu);
+        std::vector<DeterministicTensorInfo> & entries = by_layer[layer];
+        for (const DeterministicTensorInfo & entry : entries) {
+            if (entry.name == name && entry.addr == addr && entry.nbytes == nbytes) {
+                return;
+            }
+        }
+        entries.push_back({name, layer, addr, nbytes});
+    }
+
+    std::vector<DeterministicTensorInfo> begin_target_layer(uint64_t step, int layer) {
+        std::vector<DeterministicTensorInfo> result;
+        std::lock_guard<std::mutex> lock(mu);
+        const auto found = by_layer.find(layer);
+        if (found == by_layer.end()) {
+            return result;
+        }
+        for (const DeterministicTensorInfo & info : found->second) {
+            const std::string record_key = key(step, layer, info.name, info.addr);
+            auto inserted = uses.emplace(record_key, DeterministicUseRecord{});
+            if (!inserted.second) {
+                continue;
+            }
+            DeterministicUseRecord & record = inserted.first->second;
+            record.info = info;
+            record.step = step;
+            counters.target_ranges++;
+            counters.target_bytes += info.nbytes;
+            result.push_back(info);
+        }
+        return result;
+    }
+
+    void note_task_created(uint64_t step, const DeterministicTensorInfo & info) {
+        std::lock_guard<std::mutex> lock(mu);
+        const auto found = uses.find(key(step, info.layer, info.name, info.addr));
+        if (found == uses.end() || found->second.task_created) {
+            return;
+        }
+        found->second.task_created = true;
+        counters.task_created++;
+    }
+
+    void note_task_issued(
+            uint64_t step, const DeterministicTensorInfo & info, uint64_t issue_ts_ns) {
+        std::lock_guard<std::mutex> lock(mu);
+        const auto found = uses.find(key(step, info.layer, info.name, info.addr));
+        if (found == uses.end() || found->second.issued) {
+            return;
+        }
+        DeterministicUseRecord & record = found->second;
+        record.issued = true;
+        record.issue_ts_ns = issue_ts_ns;
+        counters.task_issued++;
+        counters.hint_bytes += info.nbytes;
+        if (record.first_used) {
+            counters.issued_after_first_use++;
+        }
+    }
+
+    void observe_param_access(const ggml_tensor * t) {
+        if (!t || llm_mem_trace_get_phase() != LLM_MEM_TRACE_PHASE_DECODE) {
+            return;
+        }
+        const char * name = ggml_get_name(t);
+        if (!is_deterministic_qwen35_tensor_name(name)) {
+            return;
+        }
+        const int layer = parse_layer_from_name(name);
+        const uintptr_t addr = tensor_addr(t);
+        const uint64_t step = llm_mem_trace_get_step();
+        const uint64_t now = llm_mem_trace_time_ns();
+
+        std::lock_guard<std::mutex> lock(mu);
+        const auto found = uses.find(key(step, layer, name, addr));
+        if (found == uses.end()) {
+            counters.unexpected_first_uses++;
+            return;
+        }
+        DeterministicUseRecord & record = found->second;
+        if (record.first_used) {
+            return;
+        }
+        record.first_used = true;
+        record.first_use_ts_ns = now;
+        counters.actual_first_uses++;
+        if (record.issued) {
+            if (now >= record.issue_ts_ns) {
+                counters.issued_before_first_use++;
+                counters.hint_to_first_use_ns.push_back(now - record.issue_ts_ns);
+            } else {
+                counters.issued_after_first_use++;
+            }
+        }
+    }
+
+    void write_summary() {
+        if (!deterministic_prefetch_observation_enabled() ||
+                !llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_MEMORY)) {
+            return;
+        }
+
+        uint64_t table_tensors = 0;
+        uint64_t table_bytes = 0;
+        uint64_t min_layer_bytes = 0;
+        uint64_t max_layer_bytes = 0;
+        uint64_t min_layer_ranges = 0;
+        uint64_t max_layer_ranges = 0;
+        DeterministicPrefetchCounters snapshot;
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            for (const auto & pair : by_layer) {
+                uint64_t layer_bytes = 0;
+                uint64_t layer_ranges = 0;
+                for (const DeterministicTensorInfo & info : pair.second) {
+                    table_tensors++;
+                    table_bytes += info.nbytes;
+                    layer_bytes += info.nbytes;
+                    layer_ranges++;
+                }
+                if (min_layer_ranges == 0 || layer_ranges < min_layer_ranges) {
+                    min_layer_ranges = layer_ranges;
+                }
+                min_layer_bytes = min_layer_bytes == 0 ? layer_bytes :
+                        std::min(min_layer_bytes, layer_bytes);
+                max_layer_ranges = std::max(max_layer_ranges, layer_ranges);
+                max_layer_bytes = std::max(max_layer_bytes, layer_bytes);
+            }
+            snapshot = counters;
+        }
+
+        uint64_t lead_total_ns = 0;
+        for (uint64_t lead_ns : snapshot.hint_to_first_use_ns) {
+            lead_total_ns += lead_ns;
+        }
+        std::sort(snapshot.hint_to_first_use_ns.begin(), snapshot.hint_to_first_use_ns.end());
+        const size_t lead_count = snapshot.hint_to_first_use_ns.size();
+        const uint64_t lead_median_ns = lead_count == 0 ? 0 :
+                snapshot.hint_to_first_use_ns[(lead_count - 1) / 2];
+        const double lead_mean_us = lead_count == 0 ? 0.0 :
+                (double) lead_total_ns / (double) lead_count / 1000.0;
+        const uint64_t missed = snapshot.target_ranges >= snapshot.actual_first_uses ?
+                snapshot.target_ranges - snapshot.actual_first_uses : 0;
+        const double match_rate_pct = snapshot.target_ranges == 0 ? 0.0 :
+                100.0 * (double) snapshot.actual_first_uses / (double) snapshot.target_ranges;
+        const double issued_before_rate_pct = snapshot.actual_first_uses == 0 ? 0.0 :
+                100.0 * (double) snapshot.issued_before_first_use /
+                        (double) snapshot.actual_first_uses;
+
+        std::string line;
+        line.reserve(768);
+        line += "{\"event\":\"DETERMINISTIC_PREFETCH_SUMMARY\",\"ts_ns\":" +
+                std::to_string(llm_mem_trace_time_ns());
+        line += ",\"source\":\"DETERMINISTIC\"";
+        line += ",\"enabled\":" + std::string(deterministic_prefetch_enabled() ? "true" : "false");
+        line += ",\"shadow\":" + std::string(deterministic_prefetch_shadow_enabled() ? "true" : "false");
+        line += ",\"candidate_tensor_count\":" + std::to_string(table_tensors);
+        line += ",\"candidate_bytes\":" + std::to_string(table_bytes);
+        line += ",\"per_layer_range_count_min\":" + std::to_string(min_layer_ranges);
+        line += ",\"per_layer_range_count_max\":" + std::to_string(max_layer_ranges);
+        line += ",\"per_layer_selected_bytes_min\":" + std::to_string(min_layer_bytes);
+        line += ",\"per_layer_selected_bytes_max\":" + std::to_string(max_layer_bytes);
+        line += ",\"target_ranges\":" + std::to_string(snapshot.target_ranges);
+        line += ",\"target_bytes\":" + std::to_string(snapshot.target_bytes);
+        line += ",\"actual_candidate_first_uses\":" + std::to_string(snapshot.actual_first_uses);
+        line += ",\"missed_first_uses\":" + std::to_string(missed);
+        line += ",\"unexpected_first_uses\":" + std::to_string(snapshot.unexpected_first_uses);
+        line += ",\"first_use_match_rate_pct\":" + std::to_string(match_rate_pct);
+        line += ",\"task_created\":" + std::to_string(snapshot.task_created);
+        line += ",\"task_issued\":" + std::to_string(snapshot.task_issued);
+        line += ",\"hint_bytes\":" + std::to_string(snapshot.hint_bytes);
+        line += ",\"issued_before_first_use\":" + std::to_string(snapshot.issued_before_first_use);
+        line += ",\"issued_after_first_use\":" + std::to_string(snapshot.issued_after_first_use);
+        line += ",\"issued_before_first_use_rate_pct\":" + std::to_string(issued_before_rate_pct);
+        line += ",\"hint_to_first_use_lead_samples\":" + std::to_string(lead_count);
+        line += ",\"hint_to_first_use_mean_us\":" + std::to_string(lead_mean_us);
+        line += ",\"hint_to_first_use_median_us\":" + std::to_string((double) lead_median_ns / 1000.0);
+        line += "}";
+        llm_mem_trace_write(LLM_MEM_TRACE_SINK_MEMORY, line.c_str(), line.size());
+    }
+};
+
+DeterministicPrefetchState & deterministic_prefetch_state() {
+    static DeterministicPrefetchState state;
+    return state;
+}
+
+void write_deterministic_prefetch_summary() {
+    deterministic_prefetch_state().write_summary();
+}
+
+void ensure_deterministic_prefetch_summary_registered() {
+    static const bool registered = [] {
+        std::atexit(write_deterministic_prefetch_summary);
+        return true;
+    }();
+    (void) registered;
+}
+
 struct ExpertHintTask {
     std::string action;
     std::string fadvise_action;
@@ -3733,6 +4389,7 @@ struct ExpertHintTask {
     double psi_full_avg10 = 0.0;
     bool use_fadvise = false;
     bool memory_object_hint_slot_acquired = false;
+    PrefetchTaskSource source = PrefetchTaskSource::Expert;
     ExpertTaskLifecycleRecord lifecycle;
     uint64_t issue_id = 0;
 };
@@ -4678,14 +5335,16 @@ void release_expert_task_hint_slot(
 }
 
 uint64_t issue_expert_hint_task(ExpertHintTask & task) {
-    if (expert_task_detail_events_enabled()) {
+    const bool track_expert_lifecycle = !is_deterministic_task(task.source) &&
+            expert_task_trace_mode() != ExpertTaskTraceMode::Off;
+    if (track_expert_lifecycle && expert_task_detail_events_enabled()) {
         task.issue_id = next_expert_issue_id();
     }
-    if (expert_task_trace_mode() != ExpertTaskTraceMode::Off) {
+    if (track_expert_lifecycle) {
         expert_task_lifecycle_stats().issue_groups.fetch_add(1, std::memory_order_relaxed);
     }
     const uint64_t begin = llm_mem_trace_time_ns();
-    if (expert_task_trace_mode() != ExpertTaskTraceMode::Off) {
+    if (track_expert_lifecycle) {
         task.lifecycle.issue_id = task.issue_id;
         task.lifecycle.issue_task_count = task.issue_id != 0 ? 1 : 0;
         task.lifecycle.issued_ts_ns = begin;
@@ -4706,19 +5365,24 @@ uint64_t issue_expert_hint_task(ExpertHintTask & task) {
     }
     const uint64_t end = llm_mem_trace_time_ns();
     const uint64_t duration = end >= begin ? end - begin : 0;
-    expert_timing_model().observe_syscall(duration);
-    if (expert_runtime_rescue_enabled()) {
-        expert_runtime_rescue_controller().record_prefetch_issued(task.phase, task.step);
+    if (is_deterministic_task(task.source)) {
+        deterministic_prefetch_state().note_task_issued(
+                task.step, {task.tensor_name, task.layer, task.addr, task.nbytes}, begin);
+    } else {
+        expert_timing_model().observe_syscall(duration);
+        if (expert_runtime_rescue_enabled()) {
+            expert_runtime_rescue_controller().record_prefetch_issued(task.phase, task.step);
+        }
+        // Phase 2E-A: count issued prefetch (observation-only, gated on calibration only).
+        // Phase 2E-B: calibrated control also feeds the profile.
+        if (expert_calibration_shadow_enabled() || expert_calibrated_control_enabled()) {
+            expert_calibration_profile().record_prefetch_issued(task.phase);
+        }
+        if (expert_calibrated_control_enabled()) {
+            expert_calibrated_controller().record_prefetch_issued(task.phase);
+        }
+        transition_expert_task(task.lifecycle, ExpertTaskEvent::Issue, nullptr, begin, end);
     }
-    // Phase 2E-A: count issued prefetch (observation-only, gated on calibration only).
-    // Phase 2E-B: calibrated control also feeds the profile.
-    if (expert_calibration_shadow_enabled() || expert_calibrated_control_enabled()) {
-        expert_calibration_profile().record_prefetch_issued(task.phase);
-    }
-    if (expert_calibrated_control_enabled()) {
-        expert_calibrated_controller().record_prefetch_issued(task.phase);
-    }
-    transition_expert_task(task.lifecycle, ExpertTaskEvent::Issue, nullptr, begin, end);
     release_expert_task_hint_slot(task, false);
     return duration;
 }
@@ -4768,7 +5432,9 @@ struct ExpertHintQueue {
             const uint64_t task_bytes = (uint64_t) task.nbytes;
             task.sequence = next_sequence++;
             task.lifecycle.sequence = task.sequence;
-            transition_expert_task(task.lifecycle, ExpertTaskEvent::Enqueue);
+            if (!is_deterministic_task(task.source)) {
+                transition_expert_task(task.lifecycle, ExpertTaskEvent::Enqueue);
+            }
             if (priority_enabled && priority_heap_enabled) {
                 priority_heap.emplace_back(std::move(task));
                 auto cmp = [this](const ExpertHintTask & a, const ExpertHintTask & b) {
@@ -4872,12 +5538,15 @@ struct ExpertHintQueue {
                 task = pop_one_unlocked();
             }
 
-            transition_expert_task(task.lifecycle, ExpertTaskEvent::Dequeue);
+            if (!is_deterministic_task(task.source)) {
+                transition_expert_task(task.lifecycle, ExpertTaskEvent::Dequeue);
+            }
             if (expert_feedback_enabled()) {
                 apply_pressure_snapshot(task, expert_pressure_controller().snapshot());
             }
             refresh_expert_task_estimate(task);
-            if (expert_task_exceeds_pressure_budget(task, 0)) {
+            if (!is_deterministic_task(task.source) &&
+                    expert_task_exceeds_pressure_budget(task, 0)) {
                 transition_expert_task(
                         task.lifecycle, ExpertTaskEvent::Cancel, "pressure_changed");
                 write_expert_task_skip(
@@ -4887,7 +5556,7 @@ struct ExpertHintQueue {
                 cancelled_pressure++;
                 continue;
             }
-            if (expert_task_below_value_threshold(task)) {
+            if (!is_deterministic_task(task.source) && expert_task_below_value_threshold(task)) {
                 // R2 deliberately overrides only this value re-check.  Pressure,
                 // queue, semantic-stale, lifecycle and hint-slot safeguards stay
                 // on their normal paths.
@@ -4905,7 +5574,7 @@ struct ExpertHintQueue {
                 }
             }
 
-            if (expert_semantic_stale_cancel_enabled() &&
+            if (!is_deterministic_task(task.source) && expert_semantic_stale_cancel_enabled() &&
                     expert_route_hint_ttl_steps_for_phase(task.phase) == 0) {
                 const bool live = expert_memory_object_tracker().has_live_demand(
                         task.layer, task.expert, task.tensor_name);
@@ -5076,6 +5745,7 @@ struct ExpertHintQueue {
             result.route_score = task.route_score;
             result.sequence = task.sequence;
             result.deadline_ts_ns = task.deadline_ts_ns;
+            result.deterministic = is_deterministic_task(task.source);
             return result;
         };
         return expert_hint_priority_higher(key(a), key(b), priority_mode);
@@ -5114,9 +5784,18 @@ ExpertTaskGateResult prepare_expert_hint_task(ExpertHintTask & task) {
                 task.step, task.layer, task.phase, task.enqueue_ts_ns);
         task.deadline_ts_ns = task.enqueue_ts_ns + slack;
     }
-    task.lifecycle.deadline_ts_ns = task.deadline_ts_ns;
+    if (!is_deterministic_task(task.source)) {
+        task.lifecycle.deadline_ts_ns = task.deadline_ts_ns;
+    }
 
     refresh_expert_task_estimate(task);
+
+    // A deterministic entry is an exact next-layer requirement, not a Router
+    // probability. Keep its deadline and queue accounting, but do not apply
+    // the Expert-only value/pressure admission policy to it.
+    if (is_deterministic_task(task.source)) {
+        return ExpertTaskGateResult::Accept;
+    }
 
     if (expert_feedback_enabled()) {
         const uint64_t queued = expert_prefetch_async_enabled() ?
@@ -5137,18 +5816,22 @@ ExpertTaskGateResult prepare_expert_hint_task(ExpertHintTask & task) {
 }
 
 bool submit_expert_hint_task(ExpertHintTask && task) {
-    // Phase 2E-A: count every DECODE prefetch opportunity BEFORE gates.
-    // Phase 2E-B: calibrated control also feeds the profile.
-    if (expert_calibration_shadow_enabled() || expert_calibrated_control_enabled()) {
-        expert_calibration_profile().record_prefetch_opportunity(task.phase);
-    }
-    if (expert_calibrated_control_enabled()) {
-        expert_calibrated_controller().record_prefetch_opportunity(task.phase);
+    if (!is_deterministic_task(task.source)) {
+        // Phase 2E-A: count every DECODE prefetch opportunity BEFORE gates.
+        // Phase 2E-B: calibrated control also feeds the profile.
+        if (expert_calibration_shadow_enabled() || expert_calibrated_control_enabled()) {
+            expert_calibration_profile().record_prefetch_opportunity(task.phase);
+        }
+        if (expert_calibrated_control_enabled()) {
+            expert_calibrated_controller().record_prefetch_opportunity(task.phase);
+        }
     }
     const ExpertTaskGateResult gate = prepare_expert_hint_task(task);
     if (gate == ExpertTaskGateResult::Pressure) {
-        transition_expert_task(task.lifecycle, ExpertTaskEvent::Reject, "pressure_budget");
-        write_expert_task_skip(task, "expert_prefetch_skip_pressure", "pressure_budget");
+        if (!is_deterministic_task(task.source)) {
+            transition_expert_task(task.lifecycle, ExpertTaskEvent::Reject, "pressure_budget");
+            write_expert_task_skip(task, "expert_prefetch_skip_pressure", "pressure_budget");
+        }
         if (expert_prefetch_async_enabled()) {
             expert_hint_queue().record_cancelled_pressure();
         }
@@ -5156,15 +5839,19 @@ bool submit_expert_hint_task(ExpertHintTask && task) {
         return false;
     }
     if (gate == ExpertTaskGateResult::Value) {
-        transition_expert_task(task.lifecycle, ExpertTaskEvent::Reject, "benefit_below_cost");
-        write_expert_task_skip(task, "expert_prefetch_skip_value", "benefit_below_cost");
+        if (!is_deterministic_task(task.source)) {
+            transition_expert_task(task.lifecycle, ExpertTaskEvent::Reject, "benefit_below_cost");
+            write_expert_task_skip(task, "expert_prefetch_skip_value", "benefit_below_cost");
+        }
         if (expert_prefetch_async_enabled()) {
             expert_hint_queue().record_cancelled_value();
         }
         release_expert_task_hint_slot(task, true);
         return false;
     }
-    transition_expert_task(task.lifecycle, ExpertTaskEvent::Admit);
+    if (!is_deterministic_task(task.source)) {
+        transition_expert_task(task.lifecycle, ExpertTaskEvent::Admit);
+    }
     if (expert_prefetch_async_enabled()) {
         static const bool registered = [] {
             std::atexit(shutdown_expert_hint_queue);
@@ -5176,8 +5863,10 @@ bool submit_expert_hint_task(ExpertHintTask && task) {
         }
         if (!expert_prefetch_async_fallback_enabled()) {
             expert_hint_queue().record_cancelled_queue_full();
-            transition_expert_task(task.lifecycle, ExpertTaskEvent::Cancel, "queue_full");
-            write_expert_task_skip(task, "expert_prefetch_cancel_queue_full", "queue_full");
+            if (!is_deterministic_task(task.source)) {
+                transition_expert_task(task.lifecycle, ExpertTaskEvent::Cancel, "queue_full");
+                write_expert_task_skip(task, "expert_prefetch_cancel_queue_full", "queue_full");
+            }
             release_expert_task_hint_slot(task, true);
             return false;
         }
@@ -5199,7 +5888,8 @@ ExpertHintTask make_expert_hint_task(
         uintptr_t addr,
         size_t nbytes,
         double route_score = 0.0,
-        double route_confidence = 0.0) {
+        double route_confidence = 0.0,
+        PrefetchTaskSource source = PrefetchTaskSource::Expert) {
     ExpertHintTask task;
     task.action = action ? action : "expert_madvise_willneed";
     task.fadvise_action = fadvise_action ? fadvise_action : "expert_posix_fadvise_willneed";
@@ -5211,11 +5901,13 @@ ExpertHintTask make_expert_hint_task(
     task.nbytes = nbytes;
     task.route_score = route_score == route_score ? route_score : 0.0;
     task.route_confidence = route_confidence == route_confidence ? route_confidence : 0.0;
+    task.source = source;
     task.phase = llm_mem_trace_get_phase();
     task.stage = classify_expert_tensor_stage(task.tensor_name.c_str());
     task.step = llm_mem_trace_get_step();
     task.use_fadvise = os_hint_opt_enabled("LLM_MEM_TRACE_OPT_POSIX_FADVISE");
-    if (expert_task_trace_mode() != ExpertTaskTraceMode::Off) {
+    if (!is_deterministic_task(task.source) &&
+            expert_task_trace_mode() != ExpertTaskTraceMode::Off) {
         task.lifecycle.step = task.step;
         task.lifecycle.layer = task.layer;
         task.lifecycle.expert = task.expert;
@@ -5228,11 +5920,50 @@ ExpertHintTask make_expert_hint_task(
         ensure_expert_task_summary_registered();
         ensure_expert_first_use_summary_registered();
     }
-    if (expert_task_detail_events_enabled()) {
+    if (!is_deterministic_task(task.source) && expert_task_detail_events_enabled()) {
         task.lifecycle.task_id = next_expert_task_id();
     }
-    transition_expert_task(task.lifecycle, ExpertTaskEvent::Create);
+    if (!is_deterministic_task(task.source)) {
+        transition_expert_task(task.lifecycle, ExpertTaskEvent::Create);
+    }
     return task;
+}
+
+void submit_deterministic_prefetch_for_layer(int target_layer) {
+    if (!deterministic_prefetch_observation_enabled() ||
+            llm_mem_trace_get_phase() != LLM_MEM_TRACE_PHASE_DECODE || target_layer < 0) {
+        return;
+    }
+
+    ensure_deterministic_prefetch_summary_registered();
+    const uint64_t step = llm_mem_trace_get_step();
+    const std::vector<DeterministicTensorInfo> ranges =
+            deterministic_prefetch_state().begin_target_layer(step, target_layer);
+    for (const DeterministicTensorInfo & info : ranges) {
+        if (!deterministic_prefetch_enabled()) {
+            continue;
+        }
+        deterministic_prefetch_state().note_task_created(step, info);
+        ExpertHintTask task = make_expert_hint_task(
+                "deterministic_madvise_willneed",
+                "deterministic_posix_fadvise_willneed",
+                "deterministic_next_layer",
+                info.name.c_str(),
+                info.layer,
+                -1,
+                info.addr,
+                info.nbytes,
+                0.0,
+                1.0,
+                PrefetchTaskSource::Deterministic);
+        // This experiment is deliberately MADV_WILLNEED-only.
+        task.use_fadvise = false;
+        submit_expert_hint_task(std::move(task));
+    }
+}
+
+void deterministic_prefetch_decode_begin() {
+    submit_deterministic_prefetch_for_layer(0);
 }
 
 void log_tensor_event(const ggml_tensor * t, const char * access_kind) {
@@ -5443,6 +6174,9 @@ struct LayerTracker {
 
         const uint64_t ts = llm_mem_trace_time_ns();
         expert_timing_model().on_layer_begin(step, layer, llm_mem_trace_get_phase(), ts);
+        // At the first graph node of layer L, request exactly the five fixed
+        // non-Expert ranges for L+1.  No wider or multi-layer window exists.
+        submit_deterministic_prefetch_for_layer(layer + 1);
         if (!llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_MEMORY) || llm_mem_trace_control_only()) {
             return;
         }
@@ -5624,7 +6358,9 @@ void observe_expert_logical_first_use(const ggml_tensor * operation) {
     const bool observe_memory_objects = expert_memory_objects_enabled();
     const bool observe_residency = llm_mem_trace_residency_attribution_enabled();
     const bool observe_boundary_probe = expert_boundary_probe_enabled();
-    if ((!observe_tasks && !observe_memory_objects && !observe_residency && !observe_boundary_probe) || !operation ||
+    const bool observe_populate_audit = mmap_populate_audit_enabled();
+    if ((!observe_tasks && !observe_memory_objects && !observe_residency && !observe_boundary_probe &&
+            !observe_populate_audit) || !operation ||
             operation->op != GGML_OP_MUL_MAT_ID) {
         return;
     }
@@ -5678,6 +6414,9 @@ void observe_expert_logical_first_use(const ggml_tensor * operation) {
         if (!expert_slice_range(info, expert, slice_addr, slice_bytes)) {
             continue;
         }
+        if (observe_populate_audit) {
+            mmap_populate_audit_state().note_first_use(info, expert);
+        }
         if (observe_residency) {
             llm_mem_trace_residency_attribution_observe(
                     "Routed Expert", info.name.c_str(),
@@ -5707,6 +6446,121 @@ void observe_expert_logical_first_use(const ggml_tensor * operation) {
 }
 
 } // namespace
+
+extern "C" void llm_mem_trace_deterministic_prefetch_decode_begin(void) {
+    deterministic_prefetch_decode_begin();
+}
+
+extern "C" void llm_mem_trace_mmap_populate_audit_after_model_load(void) {
+    mmap_populate_audit_state().capture_t0();
+}
+
+extern "C" void llm_mem_trace_mmap_populate_audit_before_decode(void) {
+    mmap_populate_audit_state().capture_t1();
+}
+
+extern "C" void llm_mem_trace_mmap_populate_audit_decode_complete(void) {
+    mmap_populate_audit_state().capture_t2();
+}
+
+extern "C" void llm_mem_trace_model_mmap(
+        uint64_t begin_ts_ns, uint64_t end_ts_ns, uint64_t nbytes, int map_populate) {
+    llm_mem_trace_init(nullptr);
+    if (!llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_MEMORY)) {
+        return;
+    }
+    std::string line;
+    line.reserve(256);
+    line += "{\"event\":\"MODEL_MMAP\",\"ts_ns\":" + std::to_string(end_ts_ns);
+    line += ",\"begin_ts_ns\":" + std::to_string(begin_ts_ns);
+    line += ",\"duration_ns\":" + std::to_string(end_ts_ns >= begin_ts_ns ?
+            end_ts_ns - begin_ts_ns : 0);
+    line += ",\"bytes\":" + std::to_string(nbytes);
+    line += ",\"map_populate\":" + std::string(map_populate ? "true" : "false");
+    line += "}";
+    llm_mem_trace_write(LLM_MEM_TRACE_SINK_MEMORY, line.c_str(), line.size());
+}
+
+extern "C" void llm_mem_trace_mmap_populate_admission(
+        const char * requested_policy,
+        const char * decision,
+        const char * reason,
+        int model_is_moe,
+        int sparse_moe,
+        int32_t expert_count,
+        int32_t expert_used_count,
+        uint64_t model_bytes,
+        const char * memory_source,
+        uint64_t memory_current_bytes,
+        uint64_t memory_max_bytes,
+        uint64_t memory_headroom_bytes,
+        int fit_ratio_available,
+        double fit_ratio,
+        double fit_threshold,
+        int prefetch_requested,
+        int numa,
+        int legacy_skip_populate) {
+    llm_mem_trace_init(nullptr);
+    if (!llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_MEMORY)) {
+        return;
+    }
+    std::string line;
+    line.reserve(512);
+    line += "{\"event\":\"MMAP_POPULATE_ADMISSION\",\"ts_ns\":" +
+            std::to_string(llm_mem_trace_time_ns());
+    line += ",\"requested_policy\":";
+    json_escape_append(line, requested_policy);
+    line += ",\"decision\":";
+    json_escape_append(line, decision);
+    line += ",\"reason\":";
+    json_escape_append(line, reason);
+    line += ",\"model_is_moe\":" + std::string(model_is_moe ? "true" : "false");
+    line += ",\"sparse_moe\":" + std::string(sparse_moe ? "true" : "false");
+    line += ",\"expert_count\":" + std::to_string(expert_count);
+    line += ",\"expert_used_count\":" + std::to_string(expert_used_count);
+    line += ",\"model_bytes\":" + std::to_string(model_bytes);
+    line += ",\"memory_source\":";
+    json_escape_append(line, memory_source);
+    line += ",\"memory_current_bytes\":" + std::to_string(memory_current_bytes);
+    line += ",\"memory_max_bytes\":" + std::to_string(memory_max_bytes);
+    line += ",\"memory_headroom_bytes\":" + std::to_string(memory_headroom_bytes);
+    line += ",\"fit_ratio_available\":" + std::string(fit_ratio_available ? "true" : "false");
+    if (fit_ratio_available && std::isfinite(fit_ratio)) {
+        line += ",\"fit_ratio\":" + std::to_string(fit_ratio);
+    }
+    line += ",\"fit_threshold\":" + std::to_string(fit_threshold);
+    line += ",\"expected_n_predict\":\"unavailable\"";
+    line += ",\"prefetch_requested\":" + std::string(prefetch_requested ? "true" : "false");
+    line += ",\"numa\":" + std::string(numa ? "true" : "false");
+    line += ",\"legacy_skip_populate\":" + std::string(legacy_skip_populate ? "true" : "false");
+    line += "}";
+    llm_mem_trace_write(LLM_MEM_TRACE_SINK_MEMORY, line.c_str(), line.size());
+}
+
+extern "C" void llm_mem_trace_model_load_complete(uint64_t model_bytes) {
+    llm_mem_trace_init(nullptr);
+    if (!llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_MEMORY)) {
+        return;
+    }
+    const std::string line = "{\"event\":\"MODEL_LOAD_COMPLETE\",\"ts_ns\":" +
+            std::to_string(llm_mem_trace_time_ns()) + ",\"model_bytes\":" +
+            std::to_string(model_bytes) + "}";
+    llm_mem_trace_write(LLM_MEM_TRACE_SINK_MEMORY, line.c_str(), line.size());
+}
+
+extern "C" void llm_mem_trace_model_decode_begin(void) {
+    llm_mem_trace_init(nullptr);
+    if (!llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_MEMORY)) {
+        return;
+    }
+    static std::atomic<bool> written{false};
+    if (written.exchange(true, std::memory_order_relaxed)) {
+        return;
+    }
+    const std::string line = "{\"event\":\"MODEL_DECODE_BEGIN\",\"ts_ns\":" +
+            std::to_string(llm_mem_trace_time_ns()) + "}";
+    llm_mem_trace_write(LLM_MEM_TRACE_SINK_MEMORY, line.c_str(), line.size());
+}
 
 extern "C" void llm_mem_trace_expert_preload_after_model_load(uint64_t model_size_bytes) {
     expert_madv_random_after_model_load();
@@ -5767,9 +6621,15 @@ extern "C" void llm_mem_trace_tensor_begin(const ggml_tensor * t) {
     layer_tracker().on_begin(layer);
 
     if (t->src[0]) {
+        if (deterministic_prefetch_observation_enabled()) {
+            deterministic_prefetch_state().observe_param_access(t->src[0]);
+        }
         log_param_access(t->src[0], t, name);
     }
     if (t->src[1]) {
+        if (deterministic_prefetch_observation_enabled()) {
+            deterministic_prefetch_state().observe_param_access(t->src[1]);
+        }
         log_param_access(t->src[1], t, name);
     }
 }
@@ -5803,6 +6663,13 @@ extern "C" void llm_mem_trace_tensor_loaded(const ggml_tensor * t, const char * 
                                (backend && std::strstr(backend, "Mapped") != nullptr);
 
     expert_tensor_registry().add(t, name, layer, addr, nbytes);
+    if (mapped_tensor && mmap_populate_audit_enabled()) {
+        mmap_populate_audit_state().add_mapped_tensor(addr, nbytes);
+    }
+    if (mapped_tensor && deterministic_prefetch_observation_enabled()) {
+        deterministic_prefetch_state().add_mapped_tensor(name, layer, addr, nbytes);
+        ensure_deterministic_prefetch_summary_registered();
+    }
     apply_load_os_hints("tensor_load", name, layer, addr, nbytes, mapped_tensor);
 
     if (!llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_TENSOR)) {

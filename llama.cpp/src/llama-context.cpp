@@ -368,6 +368,10 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    // The model mapping is still owned by llama_model while its context is
+    // being destroyed.  This is the only generic point after Decode has
+    // completed but before the mmap may be released.
+    llm_mem_trace_mmap_populate_audit_decode_complete();
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t             backend = backend_ptrs[i];
@@ -1711,10 +1715,18 @@ int llama_context::decode(const llama_batch & batch_inp) {
         const uint64_t trace_step = llm_mem_trace_next_step();
         llm_mem_trace_set_ubatch(&ubatch, trace_phase, trace_step);
         if (trace_phase == LLM_MEM_TRACE_PHASE_DECODE) {
+            // T1 for the opt-in MAP_POPULATE audit: final Prefill state,
+            // before the Decode NORMAL transition or any Decode graph work.
+            llm_mem_trace_mmap_populate_audit_before_decode();
+            llm_mem_trace_model_decode_begin();
             // This is the existing runtime boundary between the final prefill
             // ubatch and the first real decode ubatch.  The mmap helper is
             // process-wide one-shot, so later decode tokens are no-ops.
             llama_mmap_decode_normal_once(trace_step);
+            // This is the last boundary before the Decode graph is evaluated.
+            // The deterministic prefetch feature is opt-in and submits only
+            // Qwen3.5's fixed layer-0 non-Expert ranges here.
+            llm_mem_trace_deterministic_prefetch_decode_begin();
         }
         llm_mem_trace_ubatch_guard ubatch_guard;
         for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {

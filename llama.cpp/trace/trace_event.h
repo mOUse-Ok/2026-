@@ -50,11 +50,45 @@ void llm_mem_trace_token_end(int token_idx);
 void llm_mem_trace_tensor_begin(const struct ggml_tensor * t);
 void llm_mem_trace_tensor_end(const struct ggml_tensor * t);
 void llm_mem_trace_tensor_loaded(const struct ggml_tensor * t, const char * stage);
+// Sparse-MoE MAP_POPULATE diagnostic.  The audit is fully opt-in and takes
+// only the three lifecycle snapshots wired below.
+void llm_mem_trace_mmap_populate_audit_after_model_load(void);
+void llm_mem_trace_mmap_populate_audit_before_decode(void);
+void llm_mem_trace_mmap_populate_audit_decode_complete(void);
+// One record per actual model mmap; no residency query is performed here.
+void llm_mem_trace_model_mmap(uint64_t begin_ts_ns, uint64_t end_ts_ns,
+                              uint64_t nbytes, int map_populate);
+// One record before the first model mmap.  It describes the frozen
+// MAP_POPULATE admission decision rather than a runtime controller action.
+void llm_mem_trace_mmap_populate_admission(
+        const char * requested_policy,
+        const char * decision,
+        const char * reason,
+        int model_is_moe,
+        int sparse_moe,
+        int32_t expert_count,
+        int32_t expert_used_count,
+        uint64_t model_bytes,
+        const char * memory_source,
+        uint64_t memory_current_bytes,
+        uint64_t memory_max_bytes,
+        uint64_t memory_headroom_bytes,
+        int fit_ratio_available,
+        double fit_ratio,
+        double fit_threshold,
+        int prefetch_requested,
+        int numa,
+        int legacy_skip_populate);
+void llm_mem_trace_model_load_complete(uint64_t model_bytes);
+void llm_mem_trace_model_decode_begin(void);
 // Called exactly after the final model data fragment has been loaded.  The
 // optional performance preload is fully environment-gated and refuses to run
 // without a finite cgroup memory budget.
 void llm_mem_trace_expert_preload_after_model_load(uint64_t model_size_bytes);
 void llm_mem_trace_prefetch_expert_layer(int layer, int token_idx, const int * experts, const float * scores, int n_experts, const char * reason);
+// Qwen3.5 MoE-only opt-in: enqueue layer 0's fixed non-Expert ranges at the
+// Decode boundary.  Later layers are submitted by the existing layer tracker.
+void llm_mem_trace_deterministic_prefetch_decode_begin(void);
 
 void llm_mem_trace_kv_set_rows(const struct ggml_tensor * t);
 void llm_mem_trace_kv_reuse(uint32_t n_tokens, uint32_t reused);
@@ -100,10 +134,47 @@ static inline void llm_mem_trace_token_end(int token_idx) { (void) token_idx; }
 static inline void llm_mem_trace_tensor_begin(const struct ggml_tensor * t) { (void) t; }
 static inline void llm_mem_trace_tensor_end(const struct ggml_tensor * t) { (void) t; }
 static inline void llm_mem_trace_tensor_loaded(const struct ggml_tensor * t, const char * stage) { (void) t; (void) stage; }
+static inline void llm_mem_trace_mmap_populate_audit_after_model_load(void) {}
+static inline void llm_mem_trace_mmap_populate_audit_before_decode(void) {}
+static inline void llm_mem_trace_mmap_populate_audit_decode_complete(void) {}
+static inline void llm_mem_trace_model_mmap(uint64_t begin_ts_ns, uint64_t end_ts_ns,
+                                             uint64_t nbytes, int map_populate) {
+    (void) begin_ts_ns; (void) end_ts_ns; (void) nbytes; (void) map_populate;
+}
+static inline void llm_mem_trace_mmap_populate_admission(
+        const char * requested_policy,
+        const char * decision,
+        const char * reason,
+        int model_is_moe,
+        int sparse_moe,
+        int32_t expert_count,
+        int32_t expert_used_count,
+        uint64_t model_bytes,
+        const char * memory_source,
+        uint64_t memory_current_bytes,
+        uint64_t memory_max_bytes,
+        uint64_t memory_headroom_bytes,
+        int fit_ratio_available,
+        double fit_ratio,
+        double fit_threshold,
+        int prefetch_requested,
+        int numa,
+        int legacy_skip_populate) {
+    (void) requested_policy; (void) decision; (void) reason;
+    (void) model_is_moe; (void) sparse_moe;
+    (void) expert_count; (void) expert_used_count; (void) model_bytes;
+    (void) memory_source; (void) memory_current_bytes; (void) memory_max_bytes;
+    (void) memory_headroom_bytes; (void) fit_ratio_available; (void) fit_ratio;
+    (void) fit_threshold; (void) prefetch_requested; (void) numa;
+    (void) legacy_skip_populate;
+}
+static inline void llm_mem_trace_model_load_complete(uint64_t model_bytes) { (void) model_bytes; }
+static inline void llm_mem_trace_model_decode_begin(void) {}
 static inline void llm_mem_trace_expert_preload_after_model_load(uint64_t model_size_bytes) { (void) model_size_bytes; }
 static inline void llm_mem_trace_prefetch_expert_layer(int layer, int token_idx, const int * experts, const float * scores, int n_experts, const char * reason) {
     (void) layer; (void) token_idx; (void) experts; (void) scores; (void) n_experts; (void) reason;
 }
+static inline void llm_mem_trace_deterministic_prefetch_decode_begin(void) {}
 
 static inline void llm_mem_trace_kv_set_rows(const struct ggml_tensor * t) { (void) t; }
 static inline void llm_mem_trace_kv_reuse(uint32_t n_tokens, uint32_t reused) { (void) n_tokens; (void) reused; }

@@ -1324,23 +1324,45 @@ void llama_model_loader::done_getting_tensors() const {
     }
 }
 
-void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps) {
+void llama_model_loader::init_mappings(
+        bool prefetch,
+        llama_mlocks * mlock_mmaps,
+        int32_t expert_count,
+        int32_t expert_used_count) {
     if (use_mmap) {
+        uint64_t total_model_mapping_bytes = 0;
+        for (const auto & file : files) {
+            const uint64_t file_size = (uint64_t) file->size();
+            if (total_model_mapping_bytes > UINT64_MAX - file_size) {
+                throw std::runtime_error("model mapping size overflow");
+            }
+            total_model_mapping_bytes += file_size;
+        }
+
+        bool is_numa = false;
+        auto * dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        if (dev) {
+            auto * reg = ggml_backend_dev_backend_reg(dev);
+            auto * is_numa_fn = (decltype(ggml_is_numa) *) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_is_numa");
+            if (is_numa_fn) {
+                is_numa = is_numa_fn();
+            }
+        }
+
+        const llama_mmap_populate_admission admission = llama_mmap_populate_admit({
+                expert_count,
+                expert_used_count,
+                total_model_mapping_bytes,
+                prefetch,
+                is_numa,
+        });
+        llama_mmap_log_populate_admission(admission);
+
         mappings.reserve(files.size());
         mmaps_used.reserve(files.size());
         for (const auto & file : files) {
-            bool is_numa = false;
-
-            auto * dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-            if (dev) {
-                auto * reg = ggml_backend_dev_backend_reg(dev);
-                auto * is_numa_fn = (decltype(ggml_is_numa) *) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_is_numa");
-                if (is_numa_fn) {
-                    is_numa = is_numa_fn();
-                }
-            }
-
-            std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch ? -1 : 0, is_numa);
+            std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(
+                    file.get(), prefetch ? -1 : 0, is_numa, &admission);
             mmaps_used.emplace_back(mapping->size(), 0);
             if (mlock_mmaps) {
                 std::unique_ptr<llama_mlock> mlock_mmap(new llama_mlock());
@@ -1675,6 +1697,10 @@ bool llama_model_loader::load_all_data(
         }
         // This is the first point at which the complete Expert registry is
         // available and every CPU-resident tensor has a stable mmap address.
+        // The opt-in audit must observe this state before any optional
+        // performance preload can submit an OS hint.
+        llm_mem_trace_mmap_populate_audit_after_model_load();
+        llm_mem_trace_model_load_complete((uint64_t) size_data);
         // The trace implementation applies its own cgroup budget guard.
         llm_mem_trace_expert_preload_after_model_load((uint64_t) size_data);
         if (progress_callback) {
