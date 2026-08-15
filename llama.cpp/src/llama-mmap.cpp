@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <cerrno>
 #include <algorithm>
+#include <mutex>
 
 #ifdef __has_include
     #if __has_include(<unistd.h>)
@@ -23,6 +24,49 @@
             #include <sys/resource.h>
         #endif
     #endif
+#endif
+
+#if defined(__linux__) && defined(_POSIX_MAPPED_FILES)
+namespace {
+
+struct mmap_phase_advice_state {
+    std::mutex mutex;
+    std::vector<int> fds;
+    bool transition_attempted = false;
+};
+
+mmap_phase_advice_state & mmap_phase_advice_state_instance() {
+    static mmap_phase_advice_state state;
+    return state;
+}
+
+bool mmap_decode_normal_enabled() {
+    const char * value = std::getenv("LLAMA_MMAP_DECODE_NORMAL");
+    return value && std::strcmp(value, "1") == 0;
+}
+
+bool mmap_phase_advice_register_fd(int fd) {
+    auto & state = mmap_phase_advice_state_instance();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    if (state.transition_attempted) {
+        return false;
+    }
+    try {
+        state.fds.push_back(fd);
+        return true;
+    } catch (const std::exception &) {
+        return false;
+    }
+}
+
+void mmap_phase_advice_unregister_fd(int fd) {
+    auto & state = mmap_phase_advice_state_instance();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    auto & fds = state.fds;
+    fds.erase(std::remove(fds.begin(), fds.end(), fd), fds.end());
+}
+
+} // namespace
 #endif
 
 #if defined(_WIN32)
@@ -442,6 +486,9 @@ void llama_file::write_u32(uint32_t val) const { pimpl->write_u32(val); }
 struct llama_mmap::impl {
 #ifdef _POSIX_MAPPED_FILES
     std::vector<std::pair<size_t, size_t>> mapped_fragments;
+#ifdef __linux__
+    int decode_normal_fd = -1;
+#endif
 
     impl(struct llama_file * file, size_t prefetch, bool numa) {
         size = file->size();
@@ -449,15 +496,21 @@ struct llama_mmap::impl {
         int flags = MAP_SHARED;
         if (numa) { prefetch = 0; }
 #ifdef __linux__
+        bool sequential_advice_applied = false;
         // This opt-out is intentionally benchmark-only.  It lets a runtime
         // compare the historical whole-file sequential hint with the kernel
         // default, without changing normal mmap behavior.
         const char * skip_sequential_fadvise = std::getenv("LLAMA_MMAP_SKIP_SEQUENTIAL_FADVISE");
         if (skip_sequential_fadvise && std::strcmp(skip_sequential_fadvise, "1") == 0) {
             LLAMA_LOG_WARN("llama_mmap: skipping POSIX_FADV_SEQUENTIAL by request\n");
-        } else if (posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL)) {
-            LLAMA_LOG_WARN("warning: posix_fadvise(.., POSIX_FADV_SEQUENTIAL) failed: %s\n",
-                    strerror(errno));
+        } else {
+            const int result = posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+            if (result != 0) {
+                LLAMA_LOG_WARN("warning: posix_fadvise(.., POSIX_FADV_SEQUENTIAL) failed: %s\n",
+                        strerror(errno));
+            } else {
+                sequential_advice_applied = true;
+            }
         }
         const char * skip_populate = std::getenv("LLAMA_MMAP_SKIP_POPULATE");
         if (prefetch && skip_populate && std::strcmp(skip_populate, "1") == 0) {
@@ -485,6 +538,22 @@ struct llama_mmap::impl {
         }
 
         mapped_fragments.emplace_back(0, file->size());
+
+        // mmap retains a reference to the file description after the loader's
+        // original fd is closed.  dup() keeps that *same* open file
+        // description reachable for the Decode NORMAL transition; reopening
+        // the path would create a distinct file description and be incorrect.
+        if (sequential_advice_applied && mmap_decode_normal_enabled()) {
+            const int duplicated_fd = dup(fd);
+            if (duplicated_fd == -1) {
+                LLAMA_LOG_WARN("llama_mmap: cannot retain fd for Decode NORMAL: %s\n", strerror(errno));
+            } else if (mmap_phase_advice_register_fd(duplicated_fd)) {
+                decode_normal_fd = duplicated_fd;
+            } else {
+                LLAMA_LOG_WARN("llama_mmap: cannot register retained fd for Decode NORMAL\n");
+                close(duplicated_fd);
+            }
+        }
     }
 
     static void align_range(size_t * first, size_t * last, size_t page_size) {
@@ -536,6 +605,12 @@ struct llama_mmap::impl {
     }
 
     ~impl() {
+#ifdef __linux__
+        if (decode_normal_fd != -1) {
+            mmap_phase_advice_unregister_fd(decode_normal_fd);
+            close(decode_normal_fd);
+        }
+#endif
         for (const auto & frag : mapped_fragments) {
             if (munmap((char *) addr + frag.first, frag.second - frag.first)) {
                 LLAMA_LOG_WARN("warning: munmap failed: %s\n", strerror(errno));
@@ -636,6 +711,36 @@ size_t llama_mmap::size() const { return pimpl->size; }
 void * llama_mmap::addr() const { return pimpl->addr; }
 
 void llama_mmap::unmap_fragment(size_t first, size_t last) { pimpl->unmap_fragment(first, last); }
+
+void llama_mmap_decode_normal_once(uint64_t step) {
+#if defined(__linux__) && defined(_POSIX_MAPPED_FILES)
+    if (!mmap_decode_normal_enabled()) {
+        return;
+    }
+
+    auto & state = mmap_phase_advice_state_instance();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    if (state.transition_attempted) {
+        return;
+    }
+    state.transition_attempted = true;
+
+    int result = 0;
+    for (const int fd : state.fds) {
+        const int current = posix_fadvise(fd, 0, 0, POSIX_FADV_NORMAL);
+        if (result == 0 && current != 0) {
+            result = current;
+        }
+    }
+    // Keep this one-shot experimental marker independent of the application's
+    // configured log level so subprocess runs can verify the transition.
+    std::fprintf(stderr,
+            "[MMAP_PHASE_ADVICE] transition=SEQUENTIAL_TO_NORMAL phase=Decode step=%llu files=%zu result=%d\n",
+            (unsigned long long) step, state.fds.size(), result);
+#else
+    GGML_UNUSED(step);
+#endif
+}
 
 #if defined(_POSIX_MEMLOCK_RANGE) || defined(_WIN32)
 const bool llama_mmap::SUPPORTED  = true;

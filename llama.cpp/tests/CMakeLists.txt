@@ -201,6 +201,11 @@ llama_build_and_test(test-chat-template.cpp)
 llama_build_and_test(test-json-partial.cpp)
 llama_build_and_test(test-log.cpp)
 
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    llama_build(test-mmap-phase-advice.cpp)
+    llama_test(test-mmap-phase-advice)
+endif()
+
 if (LLAMA_MEM_TRACE)
     find_package(Threads REQUIRED)
 

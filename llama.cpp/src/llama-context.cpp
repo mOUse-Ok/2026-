@@ -1710,6 +1710,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
         const int trace_phase = ubatch.n_tokens > 1 ? LLM_MEM_TRACE_PHASE_PREFILL : LLM_MEM_TRACE_PHASE_DECODE;
         const uint64_t trace_step = llm_mem_trace_next_step();
         llm_mem_trace_set_ubatch(&ubatch, trace_phase, trace_step);
+        if (trace_phase == LLM_MEM_TRACE_PHASE_DECODE) {
+            // This is the existing runtime boundary between the final prefill
+            // ubatch and the first real decode ubatch.  The mmap helper is
+            // process-wide one-shot, so later decode tokens are no-ops.
+            llama_mmap_decode_normal_once(trace_step);
+        }
         llm_mem_trace_ubatch_guard ubatch_guard;
         for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
             llm_mem_trace_token_begin((int) i);

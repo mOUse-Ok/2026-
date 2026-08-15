@@ -57,6 +57,11 @@ private:
     std::unique_ptr<impl> pimpl;
 };
 
+// When LLAMA_MMAP_DECODE_NORMAL=1, move the file descriptions retained by
+// mmap from the startup SEQUENTIAL advice back to NORMAL at the first decode
+// step.  This is a process-wide one-shot operation and is a no-op by default.
+void llama_mmap_decode_normal_once(uint64_t step);
+
 struct llama_mlock {
     llama_mlock();
     ~llama_mlock();

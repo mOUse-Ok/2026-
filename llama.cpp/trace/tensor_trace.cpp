@@ -743,6 +743,461 @@ uint64_t count_process_mappings() {
 }
 #endif
 
+// Serial diagnostic only: compare a routed Expert Slice with the directly
+// adjacent, unrouted slice in the same GGUF tensor. This never issues an OS
+// hint or touches either range; mincore() only reports current residency.
+struct ExpertBoundaryProbeState {
+    std::mutex mu;
+    bool active = false;
+    bool shutdown_reported = false;
+    bool saw_decode_route = false;
+    bool saw_suitable_pair = false;
+    bool selected_first_use = false;
+    bool neighbor_first_use = false;
+    bool neighbor_selected_by_router = false;
+    uint64_t valid_pairs = 0;
+    uint64_t invalid_pairs = 0;
+    uint64_t cold_rejected_candidates = 0;
+    uint64_t candidate_mincore_failures = 0;
+    uint64_t step = 0;
+    int phase = LLM_MEM_TRACE_PHASE_UNKNOWN;
+    int layer = -1;
+    int token_idx = -1;
+    int selected_expert = -1;
+    int neighbor_expert = -1;
+    bool neighbor_forward = true;
+    uint64_t gap_bytes = 0;
+    uint64_t selected_file_offset = 0;
+    uint64_t neighbor_file_offset = 0;
+    uintptr_t selected_probe_addr = 0;
+    uintptr_t neighbor_probe_addr = 0;
+    size_t selected_probe_bytes = 0;
+    size_t neighbor_probe_bytes = 0;
+    std::string tensor;
+    ResidencyInfo selected_before;
+    ResidencyInfo neighbor_before;
+};
+
+ExpertBoundaryProbeState & expert_boundary_probe_state() {
+    static ExpertBoundaryProbeState state;
+    return state;
+}
+
+bool expert_boundary_probe_enabled() {
+    static const bool requested = env_truthy(std::getenv("LLAMA_EXPERT_BOUNDARY_PROBE"));
+    return requested && llm_mem_trace_enabled() &&
+            llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_MEMORY) &&
+            !llm_mem_trace_control_only();
+}
+
+uint64_t expert_boundary_probe_max_pairs() {
+    static const uint64_t configured = std::max<uint64_t>(
+            1, std::min<uint64_t>(
+                    env_u64_or_default("LLAMA_EXPERT_BOUNDARY_PROBE_MAX_PAIRS", 12), 1024));
+    return configured;
+}
+
+const char * expert_boundary_probe_run_id() {
+    const char * run_id = std::getenv("LLM_MEM_TRACE_RUN_ID");
+    return run_id && run_id[0] ? run_id : "";
+}
+
+ResidencyInfo query_expert_boundary_probe_residency(uintptr_t addr, size_t nbytes) {
+    ResidencyInfo info;
+#ifdef __linux__
+    if (addr == 0 || nbytes == 0) {
+        return info;
+    }
+    const long sys_page_size = sysconf(_SC_PAGESIZE);
+    if (sys_page_size <= 0) {
+        return info;
+    }
+    const uintptr_t page_size = (uintptr_t) sys_page_size;
+    const uintptr_t start = addr & ~(page_size - 1);
+    const uintptr_t last = addr + nbytes - 1;
+    if (last < addr) {
+        return info;
+    }
+    const uintptr_t end = (last & ~(page_size - 1)) + page_size;
+    const uint64_t page_count = (uint64_t) ((end - start) / page_size);
+    if (page_count == 0 || page_count > 16384) {
+        info.available = true;
+        info.error = page_count > 16384 ? E2BIG : EINVAL;
+        return info;
+    }
+
+    info.available = true;
+    info.exact = true;
+    info.page_size = (uint64_t) page_size;
+    info.page_count = page_count;
+    info.sampled_pages = page_count;
+    std::vector<unsigned char> pages((size_t) page_count);
+    if (mincore(reinterpret_cast<void *>(start), (size_t) (end - start), pages.data()) != 0) {
+        info.error = errno;
+        return info;
+    }
+    for (unsigned char page : pages) {
+        info.resident_pages += (page & 1u) ? 1u : 0u;
+    }
+#else
+    (void) addr;
+    (void) nbytes;
+#endif
+    return info;
+}
+
+void append_expert_boundary_probe_snapshot(
+        std::string & line, const char * name, const ResidencyInfo & snapshot) {
+    line += ",\"";
+    line += name;
+    line += "\":{\"available\":" + std::string(snapshot.available ? "true" : "false");
+    line += ",\"exact\":" + std::string(snapshot.exact ? "true" : "false");
+    line += ",\"total_pages\":" + std::to_string(snapshot.page_count);
+    line += ",\"resident_pages\":" + std::to_string(snapshot.resident_pages);
+    line += ",\"resident_ratio\":" + std::to_string(
+            snapshot.page_count == 0 ? 0.0 :
+            (double) snapshot.resident_pages / (double) snapshot.page_count);
+    line += ",\"page_size\":" + std::to_string(snapshot.page_size);
+    if (snapshot.error != 0) {
+        line += ",\"error\":" + std::to_string(snapshot.error);
+    }
+    line += "}";
+}
+
+void write_expert_boundary_probe_skipped_locked(const char * reason) {
+    if (!llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_MEMORY)) {
+        return;
+    }
+    std::string line;
+    line.reserve(256);
+    line += "{\"event\":\"EXPERT_BOUNDARY_PROBE\",\"ts_ns\":" +
+            std::to_string(llm_mem_trace_time_ns());
+    line += ",\"status\":\"skipped\",\"reason\":";
+    json_escape_append(line, reason ? reason : "unknown");
+    line += ",\"run_id\":";
+    json_escape_append(line, expert_boundary_probe_run_id());
+    line += ",\"requested_pairs\":" + std::to_string(expert_boundary_probe_max_pairs());
+    line += "}";
+    llm_mem_trace_write(LLM_MEM_TRACE_SINK_MEMORY, line.c_str(), line.size());
+}
+
+void write_expert_boundary_probe_result_locked(
+        const ResidencyInfo & selected_after, const ResidencyInfo & neighbor_after,
+        const char * forced_discard_reason = nullptr) {
+    ExpertBoundaryProbeState & state = expert_boundary_probe_state();
+    if (!llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_MEMORY)) {
+        return;
+    }
+
+    const bool mincore_ok = state.selected_before.error == 0 &&
+            state.neighbor_before.error == 0 && selected_after.error == 0 &&
+            neighbor_after.error == 0 && state.selected_before.exact &&
+            state.neighbor_before.exact && selected_after.exact && neighbor_after.exact;
+    const bool cold_before = state.selected_before.resident_pages == 0 &&
+            state.neighbor_before.resident_pages == 0;
+    const bool neighbor_used = state.neighbor_selected_by_router || state.neighbor_first_use;
+    const bool valid = !forced_discard_reason && mincore_ok && cold_before &&
+            state.selected_first_use && !neighbor_used;
+    const char * discard_reason = forced_discard_reason;
+    if (!discard_reason && !mincore_ok) {
+        discard_reason = "mincore_failed";
+    } else if (!discard_reason && !cold_before) {
+        discard_reason = "not_cold_before";
+    } else if (!discard_reason && !state.selected_first_use) {
+        discard_reason = "selected_not_first_used";
+    } else if (!discard_reason && neighbor_used) {
+        discard_reason = "B_used";
+    }
+    const int64_t selected_new = (int64_t) selected_after.resident_pages -
+            (int64_t) state.selected_before.resident_pages;
+    const int64_t neighbor_new = (int64_t) neighbor_after.resident_pages -
+            (int64_t) state.neighbor_before.resident_pages;
+    const uint64_t positive_selected_new = selected_new > 0 ? (uint64_t) selected_new : 0;
+    const uint64_t positive_neighbor_new = neighbor_new > 0 ? (uint64_t) neighbor_new : 0;
+    const uint64_t denominator = std::max<uint64_t>(
+            positive_selected_new + positive_neighbor_new, 1);
+
+    if (valid) {
+        ++state.valid_pairs;
+    } else {
+        ++state.invalid_pairs;
+    }
+
+    std::string line;
+    line.reserve(1280);
+    line += "{\"event\":\"EXPERT_BOUNDARY_PROBE\",\"ts_ns\":" +
+            std::to_string(llm_mem_trace_time_ns());
+    line += ",\"status\":";
+    json_escape_append(line, valid ? "complete" : "invalid");
+    line += ",\"valid\":" + std::string(valid ? "true" : "false");
+    if (discard_reason) {
+        line += ",\"discard_reason\":";
+        json_escape_append(line, discard_reason);
+    }
+    line += ",\"run_id\":";
+    json_escape_append(line, expert_boundary_probe_run_id());
+    line += ",\"requested_pairs\":" + std::to_string(expert_boundary_probe_max_pairs());
+    line += ",\"phase\":";
+    json_escape_append(line, phase_name(state.phase));
+    line += ",\"step\":" + std::to_string(state.step);
+    line += ",\"layer\":" + std::to_string(state.layer);
+    line += ",\"token_index\":" + std::to_string(state.token_idx);
+    line += ",\"tensor\":";
+    json_escape_append(line, state.tensor.c_str());
+    line += ",\"selected_expert\":" + std::to_string(state.selected_expert);
+    line += ",\"neighbor_expert\":" + std::to_string(state.neighbor_expert);
+    line += ",\"neighbor_direction\":";
+    json_escape_append(line, state.neighbor_forward ? "forward" : "backward");
+    line += ",\"gap_bytes\":" + std::to_string(state.gap_bytes);
+    line += ",\"selected_file_offset\":" + std::to_string(state.selected_file_offset);
+    line += ",\"neighbor_file_offset\":" + std::to_string(state.neighbor_file_offset);
+    line += ",\"selected_probe_bytes\":" + std::to_string(state.selected_probe_bytes);
+    line += ",\"neighbor_probe_bytes\":" + std::to_string(state.neighbor_probe_bytes);
+    append_expert_boundary_probe_snapshot(line, "selected_before", state.selected_before);
+    append_expert_boundary_probe_snapshot(line, "selected_after", selected_after);
+    append_expert_boundary_probe_snapshot(line, "neighbor_before", state.neighbor_before);
+    append_expert_boundary_probe_snapshot(line, "neighbor_after", neighbor_after);
+    line += ",\"A_total_pages\":" + std::to_string(state.selected_before.page_count);
+    line += ",\"A_before_pages\":" + std::to_string(state.selected_before.resident_pages);
+    line += ",\"A_after_pages\":" + std::to_string(selected_after.resident_pages);
+    line += ",\"selected_new_pages\":" + std::to_string(selected_new);
+    line += ",\"A_new_pages\":" + std::to_string(selected_new);
+    line += ",\"B_total_pages\":" + std::to_string(state.neighbor_before.page_count);
+    line += ",\"B_before_pages\":" + std::to_string(state.neighbor_before.resident_pages);
+    line += ",\"B_after_pages\":" + std::to_string(neighbor_after.resident_pages);
+    line += ",\"neighbor_new_pages\":" + std::to_string(neighbor_new);
+    line += ",\"B_new_pages\":" + std::to_string(neighbor_new);
+    line += ",\"selected_first_use\":" +
+            std::string(state.selected_first_use ? "true" : "false");
+    line += ",\"neighbor_selected_by_router\":" +
+            std::string(state.neighbor_selected_by_router ? "true" : "false");
+    line += ",\"neighbor_logical_first_use\":" +
+            std::string(state.neighbor_first_use ? "true" : "false");
+    if (valid) {
+        line += ",\"cross_expert_overfetch_pages\":" +
+                std::to_string(positive_neighbor_new);
+        line += ",\"cross_expert_overfetch_bytes\":" + std::to_string(
+                positive_neighbor_new * state.neighbor_before.page_size);
+        line += ",\"cross_expert_overfetch_ratio\":" + std::to_string(
+                (double) positive_neighbor_new / (double) denominator);
+    }
+    line += ",\"valid_pairs_so_far\":" + std::to_string(state.valid_pairs);
+    line += ",\"invalid_pairs_so_far\":" + std::to_string(state.invalid_pairs);
+    line += "}";
+    llm_mem_trace_write(LLM_MEM_TRACE_SINK_MEMORY, line.c_str(), line.size());
+}
+
+void write_expert_boundary_probe_summary_locked() {
+    ExpertBoundaryProbeState & state = expert_boundary_probe_state();
+    if (state.shutdown_reported || !llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_MEMORY)) {
+        return;
+    }
+    std::string line;
+    line.reserve(256);
+    line += "{\"event\":\"EXPERT_BOUNDARY_PROBE_SUMMARY\",\"ts_ns\":" +
+            std::to_string(llm_mem_trace_time_ns());
+    line += ",\"run_id\":";
+    json_escape_append(line, expert_boundary_probe_run_id());
+    line += ",\"requested_pairs\":" + std::to_string(expert_boundary_probe_max_pairs());
+    line += ",\"valid_pairs\":" + std::to_string(state.valid_pairs);
+    line += ",\"invalid_pairs\":" + std::to_string(state.invalid_pairs);
+    line += ",\"cold_rejected_candidates\":" + std::to_string(state.cold_rejected_candidates);
+    line += ",\"candidate_mincore_failures\":" + std::to_string(state.candidate_mincore_failures);
+    line += "}";
+    llm_mem_trace_write(LLM_MEM_TRACE_SINK_MEMORY, line.c_str(), line.size());
+    state.shutdown_reported = true;
+}
+
+void ensure_expert_boundary_probe_registered();
+
+void expert_boundary_probe_on_route(
+        int layer, int token_idx, const int * experts, int n_experts) {
+    if (!expert_boundary_probe_enabled() || llm_mem_trace_get_phase() != LLM_MEM_TRACE_PHASE_DECODE ||
+            layer < 0 || !experts || n_experts <= 0) {
+        return;
+    }
+    ensure_expert_boundary_probe_registered();
+
+    ExpertBoundaryProbeState & state = expert_boundary_probe_state();
+    std::lock_guard<std::mutex> lock(state.mu);
+    const uint64_t step = llm_mem_trace_get_step();
+    state.saw_decode_route = true;
+    if (state.active) {
+        if (state.step == step && state.layer == layer &&
+                std::find(experts, experts + n_experts, state.neighbor_expert) != experts + n_experts) {
+            state.neighbor_selected_by_router = true;
+        }
+        return;
+    }
+    if (state.valid_pairs >= expert_boundary_probe_max_pairs()) {
+        return;
+    }
+
+#ifndef __linux__
+    write_expert_boundary_probe_skipped_locked("unsupported_platform");
+    return;
+#else
+    std::unordered_set<int> selected(experts, experts + n_experts);
+    const std::vector<ExpertTensorInfo> tensors = expert_tensor_registry().for_layer(layer);
+    for (int pass = 0; pass < 2; ++pass) {
+        for (const ExpertTensorInfo & info : tensors) {
+            const bool is_down = info.name.find("ffn_down_exps.weight") != std::string::npos;
+            if ((pass == 0 && !is_down) || (pass == 1 && is_down)) {
+                continue;
+            }
+            for (int selected_index = 0; selected_index < n_experts; ++selected_index) {
+                const int selected_expert = experts[selected_index];
+                if (selected_expert < 0 || selected_expert >= info.n_expert) {
+                    continue;
+                }
+                const int neighbors[2] = { selected_expert + 1, selected_expert - 1 };
+                for (const int neighbor_expert : neighbors) {
+                    if (neighbor_expert < 0 || neighbor_expert >= info.n_expert ||
+                            selected.count(neighbor_expert) != 0) {
+                        continue;
+                    }
+                    uintptr_t selected_addr = 0;
+                    uintptr_t neighbor_addr = 0;
+                    size_t selected_bytes = 0;
+                    size_t neighbor_bytes = 0;
+                    if (!expert_slice_range(info, selected_expert, selected_addr, selected_bytes) ||
+                            !expert_slice_range(info, neighbor_expert, neighbor_addr, neighbor_bytes)) {
+                        continue;
+                    }
+                    FileMapping selected_mapping;
+                    FileMapping neighbor_mapping;
+                    if (!find_file_mapping(selected_addr, selected_mapping) ||
+                            !find_file_mapping(neighbor_addr, neighbor_mapping) ||
+                            !file_mapping_contains_range(selected_mapping, selected_addr, selected_bytes) ||
+                            !file_mapping_contains_range(neighbor_mapping, neighbor_addr, neighbor_bytes) ||
+                            selected_mapping.path != neighbor_mapping.path) {
+                        continue;
+                    }
+                    uintptr_t selected_probe_addr = 0;
+                    uintptr_t neighbor_probe_addr = 0;
+                    size_t selected_probe_bytes = 0;
+                    size_t neighbor_probe_bytes = 0;
+                    if (!page_aligned_inner_file_range(
+                                selected_mapping, selected_addr, selected_bytes,
+                                selected_probe_addr, selected_probe_bytes) ||
+                            !page_aligned_inner_file_range(
+                                neighbor_mapping, neighbor_addr, neighbor_bytes,
+                                neighbor_probe_addr, neighbor_probe_bytes)) {
+                        continue;
+                    }
+                    state.step = llm_mem_trace_get_step();
+                    state.phase = llm_mem_trace_get_phase();
+                    state.layer = layer;
+                    state.token_idx = token_idx;
+                    state.selected_expert = selected_expert;
+                    state.neighbor_expert = neighbor_expert;
+                    state.neighbor_forward = neighbor_expert > selected_expert;
+                    state.gap_bytes = neighbor_addr > selected_addr ?
+                            (uint64_t) (neighbor_addr - (selected_addr + selected_bytes)) :
+                            (uint64_t) (selected_addr - (neighbor_addr + neighbor_bytes));
+                    state.selected_file_offset = selected_mapping.offset +
+                            (uint64_t) (selected_addr - selected_mapping.start);
+                    state.neighbor_file_offset = neighbor_mapping.offset +
+                            (uint64_t) (neighbor_addr - neighbor_mapping.start);
+                    state.selected_probe_addr = selected_probe_addr;
+                    state.neighbor_probe_addr = neighbor_probe_addr;
+                    state.selected_probe_bytes = selected_probe_bytes;
+                    state.neighbor_probe_bytes = neighbor_probe_bytes;
+                    state.tensor = info.name;
+                    state.saw_suitable_pair = true;
+                    state.selected_first_use = false;
+                    state.neighbor_first_use = false;
+                    state.neighbor_selected_by_router = false;
+                    const ResidencyInfo selected_before =
+                            query_expert_boundary_probe_residency(selected_probe_addr, selected_probe_bytes);
+                    const ResidencyInfo neighbor_before =
+                            query_expert_boundary_probe_residency(neighbor_probe_addr, neighbor_probe_bytes);
+                    state.selected_before = selected_before;
+                    state.neighbor_before = neighbor_before;
+                    if (!selected_before.available || !neighbor_before.available ||
+                            selected_before.error != 0 || neighbor_before.error != 0 ||
+                            !selected_before.exact || !neighbor_before.exact) {
+                        ++state.candidate_mincore_failures;
+                        continue;
+                    }
+                    if (selected_before.resident_pages != 0 || neighbor_before.resident_pages != 0) {
+                        ++state.cold_rejected_candidates;
+                        continue;
+                    }
+
+                    state.active = true;
+                    return;
+                }
+            }
+        }
+    }
+#endif
+}
+
+void expert_boundary_probe_note_first_use(
+        const ExpertTensorInfo & info, const std::unordered_set<int> & experts) {
+    if (!expert_boundary_probe_enabled()) {
+        return;
+    }
+    ExpertBoundaryProbeState & state = expert_boundary_probe_state();
+    std::lock_guard<std::mutex> lock(state.mu);
+    if (state.active && state.step == llm_mem_trace_get_step() && state.layer == info.layer &&
+            state.tensor == info.name) {
+        if (experts.count(state.selected_expert) != 0) {
+            state.selected_first_use = true;
+        }
+        if (experts.count(state.neighbor_expert) != 0) {
+            state.neighbor_first_use = true;
+        }
+    }
+}
+
+void expert_boundary_probe_after_layer(int layer) {
+    if (!expert_boundary_probe_enabled()) {
+        return;
+    }
+    ExpertBoundaryProbeState & state = expert_boundary_probe_state();
+    std::lock_guard<std::mutex> lock(state.mu);
+    if (!state.active || state.step != llm_mem_trace_get_step() || state.layer != layer) {
+        return;
+    }
+    const ResidencyInfo selected_after = query_expert_boundary_probe_residency(
+            state.selected_probe_addr, state.selected_probe_bytes);
+    const ResidencyInfo neighbor_after = query_expert_boundary_probe_residency(
+            state.neighbor_probe_addr, state.neighbor_probe_bytes);
+    state.active = false;
+    write_expert_boundary_probe_result_locked(selected_after, neighbor_after);
+}
+
+void write_expert_boundary_probe_shutdown() {
+    if (!expert_boundary_probe_enabled()) {
+        return;
+    }
+    ExpertBoundaryProbeState & state = expert_boundary_probe_state();
+    std::lock_guard<std::mutex> lock(state.mu);
+    if (state.active) {
+        state.active = false;
+        write_expert_boundary_probe_result_locked(
+                state.selected_before, state.neighbor_before, "layer_end_not_observed");
+    }
+    if (state.valid_pairs == 0 && state.invalid_pairs == 0) {
+        const char * reason = !state.saw_decode_route ? "no_decode_route_observed" :
+                (state.saw_suitable_pair ? "no_cold_selected_unselected_adjacent_pair" :
+                "no_suitable_selected_unselected_adjacent_pair");
+        write_expert_boundary_probe_skipped_locked(reason);
+    }
+    write_expert_boundary_probe_summary_locked();
+}
+
+void ensure_expert_boundary_probe_registered() {
+    (void) expert_boundary_probe_state();
+    static const bool registered = [] {
+        std::atexit(write_expert_boundary_probe_shutdown);
+        return true;
+    }();
+    (void) registered;
+}
+
 void apply_posix_fadvise_hint(
         const char * action,
         const char * trigger,
@@ -5110,6 +5565,8 @@ struct LayerTracker {
             }
         }
 
+        expert_boundary_probe_after_layer(layer);
+
         const uint64_t ts = llm_mem_trace_time_ns();
         expert_timing_model().on_layer_end(step, layer, llm_mem_trace_get_phase(), ts);
         if (!llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_MEMORY) || llm_mem_trace_control_only()) {
@@ -5166,7 +5623,8 @@ void observe_expert_logical_first_use(const ggml_tensor * operation) {
     const bool observe_tasks = expert_task_trace_mode() != ExpertTaskTraceMode::Off;
     const bool observe_memory_objects = expert_memory_objects_enabled();
     const bool observe_residency = llm_mem_trace_residency_attribution_enabled();
-    if ((!observe_tasks && !observe_memory_objects && !observe_residency) || !operation ||
+    const bool observe_boundary_probe = expert_boundary_probe_enabled();
+    if ((!observe_tasks && !observe_memory_objects && !observe_residency && !observe_boundary_probe) || !operation ||
             operation->op != GGML_OP_MUL_MAT_ID) {
         return;
     }
@@ -5206,6 +5664,10 @@ void observe_expert_logical_first_use(const ggml_tensor * operation) {
                 experts.insert(expert);
             }
         }
+    }
+
+    if (observe_boundary_probe) {
+        expert_boundary_probe_note_first_use(info, experts);
     }
 
     const uint64_t step = llm_mem_trace_get_step();
@@ -5346,7 +5808,6 @@ extern "C" void llm_mem_trace_tensor_loaded(const ggml_tensor * t, const char * 
     if (!llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_TENSOR)) {
         return;
     }
-
     const uint64_t ts = llm_mem_trace_time_ns();
     char addr_buf[32];
     std::snprintf(addr_buf, sizeof(addr_buf), "0x%llx", (unsigned long long) addr);
@@ -5380,7 +5841,11 @@ extern "C" int llm_mem_trace_moe_control_requires_router(void) {
     if (!llm_mem_trace_enabled()) {
         return 0;
     }
-    return expert_prefetch_control_enabled() || expert_memory_objects_enabled();
+    const bool boundary_probe = expert_boundary_probe_enabled();
+    if (boundary_probe) {
+        ensure_expert_boundary_probe_registered();
+    }
+    return expert_prefetch_control_enabled() || expert_memory_objects_enabled() || boundary_probe;
 }
 
 extern "C" int llm_mem_trace_kv_slot_admission_allows(
@@ -5392,7 +5857,8 @@ extern "C" int llm_mem_trace_kv_slot_admission_allows(
 extern "C" void llm_mem_trace_prefetch_expert_layer(int layer, int token_idx, const int * experts, const float * scores, int n_experts, const char * reason) {
     const bool prefetch_enabled = expert_prefetch_control_enabled();
     const bool observe_memory_objects = expert_memory_objects_enabled();
-    if ((!prefetch_enabled && !observe_memory_objects) ||
+    const bool observe_boundary_probe = expert_boundary_probe_enabled();
+    if ((!prefetch_enabled && !observe_memory_objects && !observe_boundary_probe) ||
             layer < 0 || !experts || n_experts <= 0) {
         return;
     }
@@ -5404,6 +5870,9 @@ extern "C" void llm_mem_trace_prefetch_expert_layer(int layer, int token_idx, co
 
     const uint64_t step = llm_mem_trace_get_step();
     const int phase = llm_mem_trace_get_phase();
+    if (observe_boundary_probe) {
+        expert_boundary_probe_on_route(layer, token_idx, experts, n_experts);
+    }
     if (observe_memory_objects) {
         ensure_expert_memory_object_summary_registered();
     }
