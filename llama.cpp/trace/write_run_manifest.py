@@ -150,6 +150,8 @@ def main() -> None:
             "TEMP",
             "SEED",
             "GPU_LAYERS",
+            "LLAMA_MMAP_SKIP_SEQUENTIAL_FADVISE",
+            "LLAMA_MMAP_SKIP_POPULATE",
             "TRACE_PROFILE",
             "OMP_NUM_THREADS",
             "OMP_DYNAMIC",

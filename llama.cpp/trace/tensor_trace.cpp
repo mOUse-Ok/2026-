@@ -727,6 +727,20 @@ bool page_aligned_inner_file_range(
     len = (size_t) range_len;
     return true;
 }
+
+uint64_t count_process_mappings() {
+    FILE * fp = std::fopen("/proc/self/maps", "r");
+    if (!fp) {
+        return 0;
+    }
+    char line[4096];
+    uint64_t count = 0;
+    while (std::fgets(line, sizeof(line), fp)) {
+        ++count;
+    }
+    std::fclose(fp);
+    return count;
+}
 #endif
 
 void apply_posix_fadvise_hint(
@@ -2819,6 +2833,150 @@ void ensure_expert_preload_summary_registered() {
 
 bool expert_preload_fallback_error(int error_code) {
     return error_code == EINVAL || error_code == ENOSYS || error_code == EOPNOTSUPP;
+}
+
+// Expert routing is sparse across the expert dimension, while the tensor
+// itself is a contiguous mmap range. Apply the access-pattern hint once per
+// expert tensor after model load, never from the Router/decode hot path.
+bool expert_madv_random_enabled() {
+    return os_hint_opt_enabled("LLM_MEM_TRACE_OPT_EXPERT_MADV_RANDOM") &&
+            llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_MEMORY);
+}
+
+struct ExpertMadvRandomRegion {
+    std::string tensor;
+    int layer = -1;
+    uintptr_t addr = 0;
+    size_t nbytes = 0;
+};
+
+struct ExpertMadvRandomState {
+    bool enabled = false;
+    bool called = false;
+    bool summary_written = false;
+    uint64_t max_regions = 0;
+    uint64_t candidate_tensors = 0;
+    uint64_t file_mapped_tensors = 0;
+    uint64_t mapping_rejected = 0;
+    uint64_t inner_page_rejected = 0;
+    uint64_t eligible_regions = 0;
+    uint64_t issued = 0;
+    uint64_t failed = 0;
+    uint64_t advised_bytes = 0;
+    uint64_t map_count_before = 0;
+    uint64_t map_count_after = 0;
+    std::string decision = "disabled";
+};
+
+ExpertMadvRandomState & expert_madv_random_state() {
+    static ExpertMadvRandomState state;
+    return state;
+}
+
+void write_expert_madv_random_summary() {
+    ExpertMadvRandomState & state = expert_madv_random_state();
+    if (state.summary_written || !state.enabled ||
+            !llm_mem_trace_sink_enabled(LLM_MEM_TRACE_SINK_MEMORY)) {
+        return;
+    }
+    std::string line;
+    line.reserve(640);
+    line += "{\"event\":\"EXPERT_MADV_RANDOM_SUMMARY\",\"ts_ns\":" +
+            std::to_string(llm_mem_trace_time_ns());
+    line += ",\"enabled\":true";
+    line += ",\"called\":" + std::string(state.called ? "true" : "false");
+    line += ",\"decision\":";
+    json_escape_append(line, state.decision.c_str());
+    line += ",\"max_regions\":" + std::to_string(state.max_regions);
+    line += ",\"candidate_tensors\":" + std::to_string(state.candidate_tensors);
+    line += ",\"file_mapped_tensors\":" + std::to_string(state.file_mapped_tensors);
+    line += ",\"mapping_rejected\":" + std::to_string(state.mapping_rejected);
+    line += ",\"inner_page_rejected\":" + std::to_string(state.inner_page_rejected);
+    line += ",\"eligible_regions\":" + std::to_string(state.eligible_regions);
+    line += ",\"issued\":" + std::to_string(state.issued);
+    line += ",\"failed\":" + std::to_string(state.failed);
+    line += ",\"advised_bytes\":" + std::to_string(state.advised_bytes);
+    line += ",\"map_count_before\":" + std::to_string(state.map_count_before);
+    line += ",\"map_count_after\":" + std::to_string(state.map_count_after);
+    line += "}";
+    llm_mem_trace_write(LLM_MEM_TRACE_SINK_MEMORY, line.c_str(), line.size());
+    state.summary_written = true;
+}
+
+void expert_madv_random_after_model_load() {
+    if (!expert_madv_random_enabled()) {
+        return;
+    }
+
+    ExpertMadvRandomState & state = expert_madv_random_state();
+    if (state.called) {
+        return;
+    }
+    state.enabled = true;
+    state.called = true;
+    state.max_regions = env_u64_or_default(
+            "LLM_MEM_TRACE_OPT_EXPERT_MADV_RANDOM_MAX_REGIONS", 1024);
+
+#ifndef __linux__
+    state.decision = "unsupported_platform";
+    write_expert_madv_random_summary();
+    return;
+#else
+    std::vector<ExpertMadvRandomRegion> regions;
+    const std::vector<ExpertTensorInfo> tensors = expert_tensor_registry().all();
+    if (tensors.empty()) {
+        state.decision = "no_registered_expert_tensors";
+        write_expert_madv_random_summary();
+        return;
+    }
+
+    regions.reserve(tensors.size());
+    for (const ExpertTensorInfo & info : tensors) {
+        state.candidate_tensors++;
+        FileMapping mapping;
+        if (!find_file_mapping(info.addr, mapping) ||
+                !file_mapping_contains_range(mapping, info.addr, info.nbytes)) {
+            state.mapping_rejected++;
+            continue;
+        }
+        state.file_mapped_tensors++;
+        uintptr_t advised_addr = 0;
+        size_t advised_bytes = 0;
+        if (!page_aligned_inner_file_range(
+                    mapping, info.addr, info.nbytes, advised_addr, advised_bytes)) {
+            state.inner_page_rejected++;
+            continue;
+        }
+        regions.push_back({info.name, info.layer, advised_addr, advised_bytes});
+    }
+    state.eligible_regions = regions.size();
+    if (regions.empty()) {
+        state.decision = "no_eligible_file_mapped_regions";
+        write_expert_madv_random_summary();
+        return;
+    }
+    if (state.max_regions == 0 || regions.size() > state.max_regions) {
+        state.decision = "region_limit_rejected";
+        write_expert_madv_random_summary();
+        return;
+    }
+
+    state.map_count_before = count_process_mappings();
+    for (const ExpertMadvRandomRegion & region : regions) {
+        const int rc = apply_madvise_hint(
+                "expert_madvise_random", MADV_RANDOM, "model_load_access_pattern",
+                region.tensor.c_str(), region.layer, -1, region.addr, region.nbytes);
+        if (rc == 0) {
+            state.issued++;
+            state.advised_bytes = saturating_add_u64(state.advised_bytes, region.nbytes);
+        } else {
+            state.failed++;
+        }
+    }
+    state.map_count_after = count_process_mappings();
+    state.decision = state.issued > 0 ? "issued" : "no_advice_issued";
+    write_expert_madv_random_summary();
+#endif
 }
 
 void expert_preload_after_model_load(uint64_t model_size_bytes) {
@@ -5089,6 +5247,7 @@ void observe_expert_logical_first_use(const ggml_tensor * operation) {
 } // namespace
 
 extern "C" void llm_mem_trace_expert_preload_after_model_load(uint64_t model_size_bytes) {
+    expert_madv_random_after_model_load();
     expert_preload_after_model_load(model_size_bytes);
 }
 

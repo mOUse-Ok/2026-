@@ -6,6 +6,7 @@
 
 #include <cstring>
 #include <climits>
+#include <cstdlib>
 #include <stdexcept>
 #include <cerrno>
 #include <algorithm>
@@ -448,11 +449,22 @@ struct llama_mmap::impl {
         int flags = MAP_SHARED;
         if (numa) { prefetch = 0; }
 #ifdef __linux__
-        if (posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL)) {
+        // This opt-out is intentionally benchmark-only.  It lets a runtime
+        // compare the historical whole-file sequential hint with the kernel
+        // default, without changing normal mmap behavior.
+        const char * skip_sequential_fadvise = std::getenv("LLAMA_MMAP_SKIP_SEQUENTIAL_FADVISE");
+        if (skip_sequential_fadvise && std::strcmp(skip_sequential_fadvise, "1") == 0) {
+            LLAMA_LOG_WARN("llama_mmap: skipping POSIX_FADV_SEQUENTIAL by request\n");
+        } else if (posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL)) {
             LLAMA_LOG_WARN("warning: posix_fadvise(.., POSIX_FADV_SEQUENTIAL) failed: %s\n",
                     strerror(errno));
         }
-        if (prefetch) { flags |= MAP_POPULATE; }
+        const char * skip_populate = std::getenv("LLAMA_MMAP_SKIP_POPULATE");
+        if (prefetch && skip_populate && std::strcmp(skip_populate, "1") == 0) {
+            LLAMA_LOG_WARN("llama_mmap: skipping MAP_POPULATE by request\n");
+        } else if (prefetch) {
+            flags |= MAP_POPULATE;
+        }
 #endif
         addr = mmap(NULL, file->size(), PROT_READ, flags, fd, 0);
         if (addr == MAP_FAILED) {

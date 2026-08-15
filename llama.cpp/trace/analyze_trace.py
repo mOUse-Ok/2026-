@@ -1563,6 +1563,22 @@ def collect_metrics(data: dict[str, list[dict]]) -> dict:
         metrics["expert_route_hint_duplicate_skipped"] = sum(int(r.get("duplicate_skipped", 0)) for r in route_hint_summaries)
         metrics["expert_route_hint_ttl_skipped"] = sum(int(r.get("ttl_skipped", 0)) for r in route_hint_summaries)
 
+    expert_madv_random_summaries = [r for r in data["memory"] if r.get("event") == "EXPERT_MADV_RANDOM_SUMMARY"]
+    if expert_madv_random_summaries:
+        summary = expert_madv_random_summaries[-1]
+        metrics["expert_madv_random_summary_events"] = len(expert_madv_random_summaries)
+        metrics["expert_madv_random_enabled"] = bool(summary.get("enabled", False))
+        metrics["expert_madv_random_decision"] = str(summary.get("decision", "unknown"))
+        metrics["expert_madv_random_candidate_tensors"] = int(summary.get("candidate_tensors", 0))
+        metrics["expert_madv_random_eligible_regions"] = int(summary.get("eligible_regions", 0))
+        metrics["expert_madv_random_issued"] = int(summary.get("issued", 0))
+        metrics["expert_madv_random_failed"] = int(summary.get("failed", 0))
+        metrics["expert_madv_random_advised_gb"] = int(summary.get("advised_bytes", 0)) / (1024**3)
+        map_count_before = int(summary.get("map_count_before", 0))
+        map_count_after = int(summary.get("map_count_after", 0))
+        if map_count_before > 0 and map_count_after > 0:
+            metrics["expert_madv_random_vma_delta"] = map_count_after - map_count_before
+
     pressure_events = [r for r in data["memory"] if r.get("event") == "EXPERT_PRESSURE"]
     if pressure_events:
         metrics["expert_pressure_samples"] = len(pressure_events)
