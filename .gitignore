@@ -82,6 +82,14 @@ llmop_draft.tex
 # Local experiments and large trace artifacts
 experiments/
 
+# Defense evidence is intentionally versioned.  Legacy experiment payloads
+# remain ignored; report_result is the canonical index and destination for
+# newly qualified runs.
+!experiments/
+experiments/*
+!experiments/report_result/
+!experiments/report_result/**
+
 # Local presentation artifacts
 slides/
 slides-*/

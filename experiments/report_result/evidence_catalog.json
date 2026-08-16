@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "target_commit": "88fc9e13808739640ed1d2305c76358cc14d98d4",
+  "entries": [
+    {
+      "id": "H0",
+      "source": "experiments/report_result/00_h0_current_head_health.md",
+      "evidence_grade": "A",
+      "use": "current-head correctness gate",
+      "status": "passed"
+    },
+    {
+      "id": "M1",
+      "source": "experiments/results/experiment_0815",
+      "evidence_grade": "A-minus",
+      "use": "current-head mmap trade-off",
+      "status": "reusable",
+      "limitation": "model sha256 is absent from all manifests"
+    },
+    {
+      "id": "V2",
+      "source": "llama.cpp/trace_output/final-readme-v2",
+      "evidence_grade": "B",
+      "use": "historical trace, prefetch, lifecycle and COLD context",
+      "status": "historical-only",
+      "commit": "01817a0aab55791fbcb54d2021f78a15e02307ab"
+    },
+    {
+      "id": "M2-legacy",
+      "source": "llama.cpp/trace_output/admission_v1; llama.cpp/trace_output/map_populate_perf; llama.cpp/trace_output/phase_advice_matrix",
+      "evidence_grade": "D",
+      "use": "design signal only",
+      "status": "excluded-from-defense-metrics",
+      "limitation": "dirty worktrees and missing model hashes"
+    },
+    {
+      "id": "A1-legacy",
+      "source": "llama.cpp/trace_output/scenario_a_final",
+      "evidence_grade": "D",
+      "use": "motivation for matched completion redesign",
+      "status": "excluded-from-causal-claim",
+      "limitation": "plain and survival groups differ in binary and inference parameters"
+    },
+    {
+      "id": "B-legacy",
+      "source": "experiments/results/scenario_b; experiments/results/scenario_b_12g",
+      "evidence_grade": "C/D",
+      "use": "server test design input",
+      "status": "not-a-defense-performance-result",
+      "limitation": "missing standard manifest and/or incomplete output-equivalence evidence"
+    },
+    {
+      "id": "negative-archive",
+      "source": "experiments/expert_prefetch/negative_results",
+      "evidence_grade": "B/C",
+      "use": "historical negative-result narrative",
+      "status": "do-not-rebenchmark-without-a-specific-defense-question"
+    }
+  ]
+}
