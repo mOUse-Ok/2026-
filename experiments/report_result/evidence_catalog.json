@@ -1,6 +1,7 @@
 {
-  "schema_version": 1,
-  "target_commit": "88fc9e13808739640ed1d2305c76358cc14d98d4",
+  "schema_version": 2,
+  "target_head": "a5d80057701a759edd40f477e9375e0daffbe757",
+  "last_source_commit": "88fc9e13808739640ed1d2305c76358cc14d98d4",
   "entries": [
     {
       "id": "H0",
@@ -11,11 +12,58 @@
     },
     {
       "id": "M1",
-      "source": "experiments/results/experiment_0815",
+      "source": "experiments/experiment_0815",
       "evidence_grade": "A-minus",
-      "use": "current-head mmap trade-off",
+      "use": "source-equivalent current-head mmap trade-off",
       "status": "reusable",
-      "limitation": "model sha256 is absent from all manifests"
+      "limitation": "model sha256 is null and no finite memory.max was applied"
+    },
+    {
+      "id": "M2",
+      "source": "experiments/experiment_M2_mmap_pressure",
+      "evidence_grade": "A-minus",
+      "use": "source-equivalent mmap admission branch and pressure trade-off",
+      "status": "reusable",
+      "limitation": "model sha256 is null; all cells completed, so this is not OOM-avoidance evidence"
+    },
+    {
+      "id": "R1",
+      "source": "none",
+      "evidence_grade": "none",
+      "use": "Memory Object, COLD/DONTNEED and rescue pressure A/B",
+      "status": "planned-32gb-run"
+    },
+    {
+      "id": "T1",
+      "source": "experiments/experiment_T_current_head/T1_plain_vs_trace",
+      "evidence_grade": "invalid",
+      "use": "none",
+      "status": "redo-required",
+      "limitation": "the alleged trace-off launch enables both trace sinks and still emits complete expert and memory JSONL traces; its build configuration was not archived"
+    },
+    {
+      "id": "T2",
+      "source": "experiments/experiment_T_current_head/T2_20G; experiments/experiment_T_current_head/T2_12G",
+      "evidence_grade": "invalid",
+      "use": "Router observation only",
+      "status": "redo-required-for-prefetch",
+      "limitation": "LLM_MEM_TRACE_OPT_EXPERT_PREFETCH is 0; controller naming alone does not enable the code gate, so every EXPERT_TASK_SUMMARY reports created/admitted/issued=0"
+    },
+    {
+      "id": "T3-A1",
+      "source": "experiments/experiment_T_current_head/T3_memory_object; experiments/experiment_A1_matched_completion",
+      "evidence_grade": "A-minus-mechanism",
+      "use": "Memory Object working-set and MADV_DONTNEED state-machine execution plus negative performance result",
+      "status": "reusable-with-boundaries",
+      "limitation": "model sha256 is null; no COLD/rescue A/B, and the alleged trace-off groups also emit traces"
+    },
+    {
+      "id": "S1",
+      "source": "experiments/experiment_S1_kv_slot_admission",
+      "evidence_grade": "C",
+      "use": "low-pressure KV slot-admission pass-through and output equivalence",
+      "status": "mechanism-only",
+      "limitation": "no standard manifest/cgroup snapshot and no deferred or rejected slot"
     },
     {
       "id": "V2",
@@ -24,14 +72,6 @@
       "use": "historical trace, prefetch, lifecycle and COLD context",
       "status": "historical-only",
       "commit": "01817a0aab55791fbcb54d2021f78a15e02307ab"
-    },
-    {
-      "id": "M2-legacy",
-      "source": "llama.cpp/trace_output/admission_v1; llama.cpp/trace_output/map_populate_perf; llama.cpp/trace_output/phase_advice_matrix",
-      "evidence_grade": "D",
-      "use": "design signal only",
-      "status": "excluded-from-defense-metrics",
-      "limitation": "dirty worktrees and missing model hashes"
     },
     {
       "id": "A1-legacy",
@@ -43,18 +83,25 @@
     },
     {
       "id": "B-legacy",
-      "source": "experiments/results/scenario_b; experiments/results/scenario_b_12g",
-      "evidence_grade": "C/D",
-      "use": "server test design input",
-      "status": "not-a-defense-performance-result",
-      "limitation": "missing standard manifest and/or incomplete output-equivalence evidence"
+      "source": "experiments/scenario_b; experiments/scenario_b_12g",
+      "evidence_grade": "C",
+      "use": "server admission and Router-hint mechanism evidence",
+      "status": "historical-only; not a standard current-head performance result",
+      "limitation": "standard run manifests are absent; 20G preload was budget-rejected, while 12G Router hint runs require a new controlled matrix for a performance claim"
     },
     {
-      "id": "negative-archive",
-      "source": "experiments/expert_prefetch/negative_results",
+      "id": "expert-prefetch-archive",
+      "source": "backup-before-remove-experiments-20260807202154^:experiments/expert_prefetch",
       "evidence_grade": "B/C",
-      "use": "historical negative-result narrative",
-      "status": "do-not-rebenchmark-without-a-specific-defense-question"
+      "use": "historical negative-result and trace narrative",
+      "status": "exactly-recoverable-but-not-current-performance"
+    },
+    {
+      "id": "4C-dangling-record",
+      "source": "git-object:3bfa5cc7edf7b8955084e20044015857fb60dba3",
+      "evidence_grade": "C",
+      "use": "historical Router semantic-stability observation",
+      "status": "recoverable-before-gc; not-a-current-A/B"
     }
   ]
 }

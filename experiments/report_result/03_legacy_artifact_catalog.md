@@ -1,22 +1,18 @@
-# 既有实验产物：复用与排除目录
+# 历史产物目录与复用边界
 
-| 产物 | 版本/完整性 | 结论 | 答辩处理 |
+本表按当前工作区、Git 可达对象和原始 run 是否仍可复核分类。历史文字、截图或派生汇总均不等同于逐 run 原始证据。
+
+| 资产 | 当前状态 | 可恢复性 | 答辩用途 |
 |---|---|---|---|
-| `experiments/results/experiment_0815/` | `88fc9e1`、`git_dirty=false`、16 个 manifest、binary/prompt/output SHA、模型 SHA 缺失 | mmap baseline/skip-populate N=5；另两开关 N=3。 | **直接复用为 M1**；补记模型 SHA 后可升为 A 级。 |
-| `llama.cpp/trace_output/final-readme-v2/` | 干净 `01817a0`、N=3/5，完整但非当前 HEAD | trace 开销、prefetch/COLD 负结果、lifecycle。 | B 级历史背景；不可写“当前”。 |
-| `llama.cpp/trace_output/admission_v1/`、`map_populate_perf/`、`phase_advice_matrix/` | `git_dirty=true`、模型 SHA 缺失 | mmap 机制线索与早期性能信号。 | D 级；不用于答辩数字。 |
-| `llama.cpp/trace_output/scenario_a_final/` | `5505465`、dirty、组间二进制/KV/context/ubatch 不等价 | plain OOM 与 survival 完成。 | D 级；不能归因 Working Set 或 reclaim。 |
-| `experiments/results/scenario_b/` | 汇总有输出一致性缺失/不通过，缺标准 manifest | 充足内存组 hint=0。 | D 级；不得报性能。 |
-| `experiments/results/scenario_b_12g/` | 有请求指标与 hint 计数，但缺标准 manifest | Router hint 可发出，性能无稳定结论。 | C 级机制线索。 |
-| `experiments/expert_prefetch/negative_results/` | 历史归档 | cache、slack、pressure、max-wait、aging 等负结果。 | B/C 级“已否定方向”，不作当前性能。 |
-| `experiments/results/experiment_0/1/2/5a/` | 旧机器/旧实现或链路不足 | 早期探索。 | D 级，不混合数据。 |
+| `experiments/experiment_0815/`（M1，16 runs） | 已恢复：16 个 manifest、JSONL、输出、分析和 CSV | 完整逐 run 数据存在；`88fc9e1`、clean、binary/prompt/输出一致；模型 SHA 为 null | A−：可复用为无 cgroup mmap 负结果。 |
+| `experiments/scenario_b/`、`experiments/scenario_b_12g/` | 已恢复：server 请求、cgroup、输出和 3 次报告 | 缺标准 run manifest；12G 组能证明 Router hint 实际 issued 且成功组输出一致 | C：机制与历史负结果线索；T2/S1 仍须当前标准矩阵。 |
+| `llama.cpp/trace_output/m3b_formal_summary`、`shadow_slack`、`m4a1_*` | `docs/test-report.md` 有文字引用，原始目录缺失 | 未纳入 Git | 旧实现阶段的叙事不可作答辩指标；不恢复旧策略代码，冻结期内不重做。 |
+| `experiments/expert_prefetch/`（31 文件） | 当前工作区缺失 | **可从本地分支 `backup-before-remove-experiments-20260807202154^` 精确恢复** | 历史 B/C 级背景、负结果和取证样本；不可升级为当前 HEAD 性能。 |
+| dangling blob `3bfa5cc7…60dba3` | 无路径、尚在对象库 | 可按 object id 导出；执行 `git gc` 前须先固定 | 历史 4C Router semantic stability 记录，模型 SHA 缺失、binary/output 不全等价；仅机制背景。 |
+| `llama.cpp/trace_output/final-readme-v2`、`scenario_a_final`、`admission_v1` 等仍存目录 | 仍在本机 | 可读，不复制 | 按 `evidence_catalog.json` 的 B/D 级边界使用，不与当前结果混算。 |
 
-## M1 当前 HEAD 复用结论
+## `expert_prefetch` 备份的价值
 
-`experiment_0815` 运行于 32GB 级 AMD 主机，当前 HEAD、工作树干净、`TRACE_PROFILE=benchmark`、CPU-only、固定 prompt，所有 16 个输出 SHA 一致且 trace 无 dropped event。
+该备份包含 83,197,117-byte 的 async memory JSONL gzip、baseline trace、fault/pressure/lifecycle 汇总、图表、负结果和 provenance。其 provenance 明确是旧提交且工作树 dirty；其中 async trace 的控制器为 off、与 baseline 并非合格效率 A/B。因此适合保存“实现曾被观测过”和负结果脉络，不适合报当前 TPS、p95 或 OOM 改善。
 
-- `skip-populate` 显著缩短加载并降低 RSS，但把代价转移到 prefill：major faults 大幅增加，decode p95/TPS 退化。
-- `skip-sequential` 无明显收益。
-- `expert-madv-random` 已实际下发 advice，但 decode 指标变差。
-
-这是一组“当前 HEAD 的机制取舍/负结果”证据，不是默认策略的加速宣传；完整数值和逐 run 数据仍以 [`../../results/experiment_0815/REPORT.md`](../results/experiment_0815/REPORT.md) 及其 `runs/` 为准。
+恢复动作未在本次审计执行。若确认恢复，应只导出到 `report_result/raw/recovered_legacy_expert_prefetch/`，保留原始 commit、对象 SHA 和 `historical-only` 标签，绝不能覆盖新实验的 ID 目录。

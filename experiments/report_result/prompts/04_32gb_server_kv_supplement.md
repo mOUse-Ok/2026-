@@ -1,6 +1,6 @@
 # 给 32GB 机器 Agent 的提示词：S1 KV Slot Admission 补充验证
 
-这是补充实验，不得阻塞 M2/T1/T2/T3/A1。只在 32GB Linux 主机、当前 clean `88fc9e1` 上执行，不修改源码、算法、策略或现有脚本。结果写入 `<repo>/experiments/report_result/raw/S1_kv_slot_admission/`。
+这是补充实验，不得阻塞 M1/M2/T1/T2/T3/R1/A1。只在 32GB Linux 主机、当前 clean `a5d80057701a759edd40f477e9375e0daffbe757` 上执行，不修改源码、算法、策略或现有脚本。结果写入 `<repo>/experiments/report_result/raw/S1_kv_slot_admission/`。
 
 目标是验证 server 中 KV Slot Admission 的实际启用与多请求行为，不预设性能收益。
 

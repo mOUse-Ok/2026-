@@ -2,7 +2,7 @@
 
 在 32GB Linux 机器上重新验证 384MiB 完成性，但只修复实验对照，不修改算法、策略、源码或现有脚本。输出唯一写入 `<repo>/experiments/report_result/raw/A1_matched_completion/`。
 
-前置：HEAD=`88fc9e1`、工作树 clean、模型与两种二进制均存在、记录 model/binary SHA、可用内存至少 24GiB、`systemd-run --user --scope` 可用。否则写 `STATUS_BLOCKED.md`。
+前置：HEAD=`a5d80057701a759edd40f477e9375e0daffbe757`、首次写入前工作树 clean、模型与两种二进制均存在、记录 model/binary SHA、可用内存至少 24GiB、`systemd-run --user --scope` 可用。否则写 `STATUS_BLOCKED.md`。
 
 固定所有推理参数为 survival 配置：CPU-only、`-n 16 -t 8 -b 512 -ub 64 -c 1024 --cache-type-k q8_0 --cache-type-v f16 --temp 0 --seed 1234`、同一 prompt、cold cache、MemoryMax=384MiB、MemorySwapMax=0。
 
