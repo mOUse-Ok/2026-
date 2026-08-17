@@ -81,7 +81,6 @@ python3 -m py_compile \
   llama.cpp/trace/analyze_residency_attribution.py \
   llama.cpp/trace/trace_metrics.py \
   llama.cpp/trace/compare_trace_runs.py \
-  llama.cpp/trace/simulate_expert_cache.py \
   llama.cpp/trace/simulate_kv_cache_policy.py \
   llama.cpp/trace/summarize_repeat_runs.py \
   llama.cpp/trace/summarize_experiment_4b.py \
@@ -219,13 +218,7 @@ analysis/metrics.json
 
 ## 12. 离线模拟
 
-Expert cache：
-
-```bash
-python3 llama.cpp/trace/simulate_expert_cache.py \
-  --trace-dir llama.cpp/trace_output/<run> \
-  --output-dir llama.cpp/trace_output/contest_runs/expert_cache_simulation
-```
+Expert cache 离线模拟脚本 `simulate_expert_cache.py` 属于历史探索（已随 Expert Cache 路线归档删除，结论为负结果：通用 cache replacement 与 Router 语义不匹配），当前仓库不再提供该入口。
 
 KV policy：
 

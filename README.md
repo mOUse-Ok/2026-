@@ -6,12 +6,13 @@
 
 ![LLM Runtime 到 Linux VM 的系统架构](docs/assets/system-architecture.svg)
 
-本项目的核心贡献不依赖于单个“加速百分比”，而是：
+本项目的核心贡献围绕三条已冻结的主线组织（详见第 3 节）：
 
-- 建立 LLM Runtime 与 Linux VM 之间的语义观测链：Router → Expert Slice → Task / First-use → OS memory metrics；
-- 将 Expert Slice 提升为具有身份、需求和状态的 Memory Object，并提供可审计的生命周期闭环；
-- 实现具有 admission、eviction、readmission、protection/probation 的容量约束 Semantic Working Set；
-- 以 Prefetch / `MADV_COLD` 的受控负结果约束控制边界，并探索 Runtime Rescue 作为实验性的反馈保护。
+1. **资源约束感知的模型映射准入**：依据模型 mmap 大小、Sparse MoE 结构与 cgroup / MemAvailable headroom，决策 `DEFAULT / POPULATE / SKIP`；
+2. **推理阶段感知的文件预读控制**：`POSIX_FADV_SEQUENTIAL` → 首次 Decode 前 → `POSIX_FADV_NORMAL` 的阶段切换；
+3. **面向 MoE Expert 的语义内存对象管理**：Router → `(layer, expert)` → Registry → mmap 虚拟地址区间的 Memory Object 及其可审计生命周期。
+
+Router-driven Prefetch、`MADV_COLD` / `MADV_DONTNEED` 回收与 Runtime Rescue 属于研究/实验机制：它们被真实执行与追踪，但当前性能结果为负或未证明净收益，不作为当前主线的性能贡献（见第 6、8 节）。
 
 完整的实验环境、样本身份、原始指标与证据边界见 [Final README Evidence V2](docs/final-readme-evidence-v2.md)。本文只给出面向评审的系统概览和闭合结论。
 
@@ -37,9 +38,43 @@ Linux 虚拟内存看到的是 page、`mmap`、page fault 与 RSS；LLM Runtime 
 
 这里的 `madvise(MADV_WILLNEED)` 和 `madvise(MADV_COLD)` 都是 Linux advice：它们不是强制 page-in / reclaim，也不能由成功返回推导出物理页已经到位或已经回收。logical first-use 也不是 residency 测量。
 
-## 3. 从 Router-driven Prefetch 到 Semantic Working Set
+## 3. 三项核心贡献
 
-项目先建立 Router、Expert、Task、First-use 与 OS memory metrics 的跨层 trace，使“hint 已发出”与“真实需求到达”可以被分别观察。Router 随后提供未来 Expert 需求，系统将 `layer + expert + tensor` 映射为实际 Slice 地址范围，形成 opt-in 的 Prefetch 路径；严格 5×5 对照未显示稳定加速后，设计重点转向哪些 Slice 正在被语义需求、应被保护多久、以及何时可退出工作集。因此，Expert Slice 被提升为带状态的 Memory Object，并由容量约束的 Semantic Working Set 管理；`MADV_COLD` 的负结果进一步推动 Runtime Rescue 这类反馈保护，而不是单向 reclaim 策略。
+### 3.1 资源约束感知的模型映射准入
+
+模型加载阶段，系统根据模型 mmap 大小、Sparse MoE 结构（活跃 Expert 占比）、cgroup 限额与 `MemAvailable` 计算的 fit ratio / headroom，决策 mmap 策略为 `DEFAULT / POPULATE / SKIP` 三档：内存宽裕时用 `MAP_POPULATE` 预填充，紧张时保持按需缺页，极端紧张时跳过填充。
+
+当前主要端到端结果（12 GiB 下 `Auto` 相比强制 `POPULATE`）：
+
+| 指标 | 相对变化 |
+| --- | ---: |
+| Wall Time | **↓ 34.1%** |
+| Major Fault | **↓ 21.7%** |
+| Decode P95 | **↓ 11.1%** |
+| TPS | **↑ 13.95%** |
+
+边界：该结果不声称避免 OOM、不声称全局最优、不声称跨模型泛化。数据见 `experiments/report_result/07_m2_mmap_pressure_result.md`。
+
+### 3.2 推理阶段感知的文件预读控制
+
+mmap 时施加 `POSIX_FADV_SEQUENTIAL` 以加速顺序加载；在**首次 Decode 前**切换为 `POSIX_FADV_NORMAL`，避免 Decode 阶段的读-ahead 继续按顺序模式放大。严格 A/B（20 GiB、skip-populate cold-page、N=3 interleaved）：
+
+| 观察项 | Sequential | Decode 前 NORMAL | 变化 |
+| --- | ---: | ---: | ---: |
+| 未路由相邻 Expert 新增驻留页 | 2246.7 | 965.0 | **↓ 57.0%** |
+| Router 选中 Expert 驻留页 | 5265 | 5265 | 保持一致 |
+
+端到端性能基本持平；该机制的准确表述是**减少跨 Expert 邻页过取**，不是端到端性能提升。数据见 `experiments/report_result/09_decode_normal_ab_result.md`。
+
+### 3.3 面向 MoE Expert 的语义内存对象管理
+
+真实映射链：`Router` → `(layer, expert)` → `ExpertTensorRegistry` → `(layer, expert, tensor)` → mmap 后的进程**虚拟地址区间** `addr + nbytes` → Expert Memory Object。其中 `addr` 是 mmap 之后的进程虚拟地址，不是物理地址、也不是磁盘地址；一个完整 Expert 由多类 Tensor slice 组成，不能把整个 Expert 简化为天然连续的一整块内存。
+
+状态证据（16 GiB 档 transient 运行）：semantic demands **102,186**，unmatched **0**，invariant violation **0**；demand / first-use / lifecycle 全部闭合。7040 MiB 档 N=5 对照记录 102,222 个 demand/activation/completion 与 slot acquire/release 一一对应（见第 6.3 节）。
+
+> Router Prefetch 的正式口径：**Router 提供 Expert 需求，系统结合内存压力、任务价值和需求时效决定是否执行 OS Hint。** 16–19 GiB transient sweep（`experiments/report_result/08_prefetch_pressure_window_result.md`）中：19G Moderate 发出 5,067 个 hint、18G/17G High 分别发出 102,172 / 102,177 个、16G Critical 全部抑制（0 hint），四档均无 reclaim；16G 才是全部抑制的档位。12 GiB server 场景（独立 tight-memory anchor，不可与 16–19 GiB 同表比较，证据见 `experiments/report_result/10_prefetch_12g_reclaim_anchor.md`）在真实 reclaim（pgsteal 2,703,337）下仍发出 18,003 个 hint 且未 OOM，详见第 10.8 节。
+
+项目先建立 Router、Expert、Task、First-use 与 OS memory metrics 的跨层 trace，使“hint 已发出”与“真实需求到达”可以被分别观察；严格 5×5 对照未显示 Prefetch 稳定加速后，设计重点转向语义状态管理与上述三条主线（演化过程见[技术考古报告](docs/technical-archaeology-report.md)）。
 
 ## 4. System Architecture
 
@@ -74,7 +109,7 @@ Trace 记录 MoE Router、Expert、Tensor、Task、logical First-use 与 OS metr
 
 ### 4.4 Memory Object Lifecycle
 
-Memory Object 不是地址范围的包装。它以 `layer / expert / tensor` 作为 object key，并保存当前 `address + nbytes` Slice 范围；同时维护 demand 的 `pending` / `active` 状态、in-flight hint slot、Working Set membership 与 `last_touch`，以及 shadow eviction / probation 状态。生命周期为：
+Memory Object 不是地址范围的包装。它以 `layer / expert / tensor` 作为 object key，并保存当前 `address + nbytes` Slice 范围——该 address 是 mmap 后的进程**虚拟地址**，不是物理地址或磁盘地址；同时维护 demand 的 `pending` / `active` 状态、in-flight hint slot、Working Set membership 与 `last_touch`，以及 shadow eviction / probation 状态。生命周期为：
 
 `Demand registration → Activation → Completion → hint-slot release`
 
@@ -90,6 +125,8 @@ Working Set 是一个**容量约束的语义工作集**，并非 Linux RSS 的�
 - **Readmission / COLD 候选**：probation 中的对象若再次 demand 会取消该轮 probation 并回到工作集。只有已被 eviction、无活跃需求且经过 grace steps 的对象，才可进入可选 COLD 候选流程。
 
 protected object 可以使预算短时间无法满足；这恰恰说明 budget 是语义容量约束，而不是物理内存上限。
+
+冻结前的机制审计（`experiments/report_result/phase2_final_defense_mechanism_audit.md`）给出当前策略的性能边界：Working Set ON 相对 baseline wall time 约 **+92.9%**；受限 DONTNEED 回收相对 plain 约 **+41.6%** 且 major faults 未见改善。准确结论是：**逻辑 Working Set budget 不等同于物理 Page Cache residency**——语义驱逐并不能让内核按同量回收文件页，重入与额外扫描反而带来开销。因此 Working Set / DONTNEED 保留为机制探索与边界结果，不作为默认优化策略。
 
 ### 4.6 OS Memory Actions
 
@@ -147,6 +184,8 @@ Runtime Rescue 是实验性 guard。当前 `gate_recovery` 原型只在 Decode �
 
 当前环境**没有观察到稳定加速**。该结果并不否认路径可执行：Router → Expert Slice → Task → OS hint 已被真实运行和追踪；它说明“可预测”不等于“执行更多 Prefetch 就会获得系统收益”。因此项目转向回答：哪些 Expert 当前确有需求、需要被保护多久，以及何时可以安全退出工作集。早期归档中的大幅 fault / decode 数字不属于当前主线，未作为当前收益引用。
 
+16–19 GiB 压力 sweep 的当前口径见第 3.3 节：19G/18G/17G 分别发出 5,067 / 102,172 / 102,177 个 hint（均无 reclaim），16G 为 Critical 全抑制档（0 hint）；12 GiB server 独立 anchor 见第 10.8 节。正式总结：Router 提供 Expert 需求，系统结合内存压力、任务价值和需求时效决定是否执行 OS Hint。
+
 ### 6.3 Memory Object Lifecycle
 
 在 current HEAD、N=5 的 Lifecycle OFF/ON 对照中，Lifecycle ON 的 wall time 为 63.094 ± 7.884 s，相对 55.488 ± 0.644 s 的 OFF 为 **+13.71%**。这不是性能提升证据。
@@ -192,7 +231,7 @@ current HEAD 的 Shadow-only 与 Shadow + COLD 对照为 N=3/组；唯一实验�
 | 输出一致性 | 38 / 38 output SHA-256 identical |
 | Trace 完整性 | 33 / 33 Trace runs 的 enabled sink 均为 zero dropped events |
 | Memory Object 终态 | `pending=0`、`active=0`、`invariant violations=0` |
-| 相关 CTest | 5 / 5 passed |
+| 相关 CTest | 8 / 8 passed |
 
 这些检查说明实验路径保持输出一致、trace 完整和状态收尾；它们不替代端到端性能或跨环境泛化证据。
 
@@ -206,7 +245,7 @@ current HEAD 的 Shadow-only 与 Shadow + COLD 对照为 N=3/组；唯一实验�
 | Complex scheduling policies | 对阶段优先级、slack、公平保护与老化等进行探索 | 局部指标改善未稳定转化为端到端收益，并可能引入锁、扫描与 late regression | 归档复杂调度路径 |
 | `MADV_COLD` | 将语义上已退出工作集的对象交给 Linux advice | 当前受控 A/B 未显示净收益 | 保留为默认关闭的 research control，见第 6.5 节 |
 
-其他 shadow pressure、cross-layer prediction 等路线及完整负结果见 [技术考古报告](docs/technical-archaeology-report.md) 与 `experiments/expert_prefetch/` 归档。
+其他 shadow pressure、cross-layer prediction 等路线及完整负结果见 [技术考古报告](docs/technical-archaeology-report.md)；对应历史 trace 产物保留在 `llama.cpp/trace_output/` 的历史 run 目录中。
 
 ## 9. Current Status
 
@@ -214,10 +253,13 @@ current HEAD 的 Shadow-only 与 Shadow + COLD 对照为 N=3/组；唯一实验�
 
 | Mechanism | Status |
 | --- | --- |
+| 资源约束感知的模型映射准入（DEFAULT / POPULATE / SKIP） | 当前主线；12 GiB Auto 相比强制 populate 的端到端结果见第 3.1 节 |
+| 推理阶段感知的文件预读控制（FADV_SEQUENTIAL → 首次 Decode 前 FADV_NORMAL） | 当前主线；减少跨 Expert 邻页过取（−57.0%），端到端持平，见第 3.2 节 |
+| MoE 语义内存对象管理（Router → (layer, expert, tensor) → mmap 虚拟地址区间） | 当前主线；102,186 demands / 0 unmatched / 0 violation，见第 3.3 节 |
 | Trace Infrastructure | 当前稳定基础设施；运行后校验 sink 完整性与输出一致性 |
-| Router-driven Expert Prefetch | opt-in mainline profile；未观察到稳定性能加速 |
+| Router-driven Expert Prefetch | opt-in profile；未观察到稳定性能加速，压力档位行为见第 3.3 节 |
 | Memory Object Lifecycle | 已实现并验证 demand / slot / 终态语义 |
-| Semantic Working Set | 已实现并验证 admission / eviction / readmission / protection 语义 |
+| Semantic Working Set | 已实现并验证 admission / eviction / readmission / protection 语义；当前策略性能为负（+92.9% wall），见第 4.5 节 |
 
 ### Research controls
 
@@ -376,14 +418,16 @@ bash llama.cpp/trace/run_scenario_b.sh
 
 结果位于 `llama.cpp/trace_output/scenario_b/final_b_{baseline,performance,report}/`。只有两个输出 hash 一致且 performance 组的 `hint issued > 0` 时，才能比较性能指标；报告不自动宣称性能收益。
 
+12 GiB 档位已有一次完整实测（`experiments/scenario_b_12g/`，server 模式；正式证据见 `experiments/report_result/10_prefetch_12g_reclaim_anchor.md`）：created task 20,184，其中 rejected_pressure 2,181、rejected_value 0，最终 issued hint 18,003；cgroup `pgscan=7,307,338`、`pgsteal=2,703,337`、`memory.events.max=81,142`，即真实发生 cgroup reclaim；未发生 OOM / oom_kill，输出 hash 一致。该 12 GiB server 运行与 16–19 GiB transient `llama-cli` sweep（token 数、trace profile、provenance 均不同）不可直接横向比较，只作为独立的 tight-memory anchor：它说明在真实 reclaim 压力下 pressure gate 会拒绝部分 task，但 value gate 未拒绝、hint 仍在发出。
+
 ### 10.9 相关 CTest
 
 ```bash
 ctest --test-dir llama.cpp/build --output-on-failure \
-  -R '^(test-router-tensor-observation-sync|test-router-control-decoupling|test-trace-control-profile|test-expert-hint-priority|test-expert-task-lifecycle|test-expert-memory-object|test-expert-calibration-shadow)$'
+  -R '^(test-mmap-phase-advice|test-router-tensor-observation-sync|test-router-control-decoupling|test-trace-control-profile|test-expert-hint-priority|test-expert-task-lifecycle|test-expert-memory-object|test-expert-calibration-shadow)$'
 ```
 
-这些测试检查局部同步、priority、task lifecycle、Memory Object 与 calibration shadow 语义；单测通过不构成性能收益。
+这些测试检查 mmap phase admission、局部同步、priority、task lifecycle、Memory Object 与 calibration shadow 语义；单测通过不构成性能收益。
 
 ## 11. Repository Layout
 
@@ -391,7 +435,7 @@ ctest --test-dir llama.cpp/build --output-on-failure \
 | --- | --- |
 | `llama.cpp/` | 上游 `llama.cpp` 源码及本项目的 CPU/MoE trace 集成 |
 | `llama.cpp/trace/` | Registry、task lifecycle、Memory Object、writer、分析与 pipeline 脚本 |
-| `experiments/expert_prefetch/` | 历史 Expert Prefetch 探索与归档材料（不代表 current HEAD） |
+| `experiments/` | 冻结前实验（mmap 压力、prefetch 压力窗口、decode-normal A/B、机制审计等）及其 RESULT/REPORT |
 | `docs/` | 设计、证据、考古与交付文档 |
 | `docs/assets/` | README / 答辩使用的 SVG 与 PNG 图表 |
 | `docs/data/` | 图表指标、实验身份与 claim boundary 数据索引 |
@@ -405,6 +449,7 @@ ctest --test-dir llama.cpp/build --output-on-failure \
 - Working Set 是 semantic capacity constraint，不是严格物理 memory cap。
 - Memory Object Lifecycle 在该 workload 上有可测运行开销与高方差；其核心证据是状态正确性。
 - 未可靠采集 swap peak，因此不报告 swap peak 性能结论。
+- 12 GiB server anchor 与 16–19 GiB transient sweep 的运行模式、token 数、trace profile 与 provenance 不同，不放在同一张表内直接比较。
 - KV 仅被观测，不包含在线 KV 内存管理策略。
 
 ## 13. Evidence and Documentation

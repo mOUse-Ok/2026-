@@ -11,7 +11,7 @@
 - **高可信推断**：由多条独立证据共同支持，但缺少一次直接记录。
 - **不确定**：缺少关键一手证据；不会把它写成项目已证明的能力。
 
-已做的可复核检查包括：全量可达提交的 first-parent 时间线、当前代码和构建配置、当前流水线脚本、`experiments/expert_prefetch` 的归档数据与 provenance、以及构建目录中的五个自定义 CTest。后者覆盖 router 同步、priority、task lifecycle、Memory Object 和 Calibration Shadow。新增的 Residency Attribution 还需要通过实际 trace 进一步检查数据质量；这些检查都不自动证明真实模型上的时延或内存收益。
+已做的可复核检查包括：全量可达提交的 first-parent 时间线、当前代码和构建配置、当前流水线脚本、Expert Prefetch 历史归档数据与 provenance（考古时的 `experiments/expert_prefetch` 归档，后随实验目录重组移出当前树，结论已沉淀至本报告与各 RESULT 文档）、以及构建目录中的自定义 CTest（考古时为五个，当前 HEAD 为八个：mmap phase admission、router 同步、priority、task lifecycle、Memory Object、Calibration Shadow 等）。新增的 Residency Attribution 还需要通过实际 trace 进一步检查数据质量；这些检查都不自动证明真实模型上的时延或内存收益。
 
 相反，以下事项**不能**由仓库证明：最初的 Qwen 命令行、硬件/内核环境、初始 baseline 的完整原始日志，以及 HEAD 上一组干净、受控、可复现的端到端性能结果。根提交只有 `.gitignore` 和导入的 `llama.cpp`，因此“最初已经在 Qwen 上跑通并得到某数字”是合理背景，却不是 Git 可验证的事实。
 

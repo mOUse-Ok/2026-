@@ -367,7 +367,7 @@ def correctness() -> None:
         ("38 / 38", "output SHA-256\nidentical"),
         ("33 / 33", "trace runs\nzero dropped events"),
         ("0 / 0 / 0", "Memory Object\npending / active / violations"),
-        ("5 / 5", "targeted CTest\npassed"),
+        ("8 / 8", "targeted CTest\npassed"),
     ]
     for i, (headline, caption) in enumerate(cards):
         x = 0.035 + i * 0.192

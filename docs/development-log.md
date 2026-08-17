@@ -1,5 +1,7 @@
 # 开发过程记录
 
+> **Historical / Archived — Not Current Mainline**：本文是开发过程的历史记录，反映各阶段当时的设计与结论。当前冻结主线（模型映射准入、阶段感知预读、MoE 语义内存对象）以根 README 第 3 节为准；本文提到的 `feedback_slack`、`stage_deadline_score`、连续 aging 等均已退出主线，仅作历史理解。
+
 ## 说明
 
 本文档记录初赛阶段以及后续收敛阶段的主要开发过程、关键问题、解决方法和阶段性结论。更细粒度的本地实验流水记录保存在 `llama.cpp/trace_output/contest_runs/progress_log.md`，该路径用于本地实验记录，不提交仓库。

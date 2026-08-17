@@ -1,5 +1,7 @@
 # 测试报告
 
+> **Note**：本文按时间累积记录各阶段测试。其中 `feedback_slack`、`stage_deadline_score`、Shadow Slack（M4A）等章节属于**历史阶段测试记录（Not Current Mainline）**，对应机制已退出主线；当前有效入口与测试基线见 [reproduce.md](reproduce.md) 与根 README 第 7、10.9 节（8/8 CTest、14/14 Python tests）。
+
 ## 1. 测试目标
 
 本项目的测试同时覆盖功能正确性、实验数据完整性和性能结论可信度。测试不只检查程序能否运行，还检查一次实验是否具备可比较条件：代码版本、模型、输入、推理参数、缓存状态、内存限制和 trace 完整性必须可追溯。

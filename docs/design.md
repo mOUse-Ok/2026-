@@ -16,6 +16,8 @@ LLM 推理同时需要模型权重、运行时张量和持续增长的 KV cache�
 
 赛题要求从操作系统视角分析参数加载、KV cache、专家激活、数据换入换出和预取行为。本项目选择用户态路线：保留完整 `llama.cpp` 工程，通过 trace 获得内核不可见的 layer、expert、phase 和 route score，再使用 Linux `madvise`、`posix_fadvise` 与 cgroup v2 开展可关闭、可复现的实验。
 
+> **当前冻结主线（代码冻结后口径）**：本文描述的 Memory Object / Working Set / Shadow 等语义机制属于第三条主线（MoE 语义内存对象管理）及研究探索。另两条已冻结主线为：① 资源约束感知的模型映射准入（依据 mmap 大小、Sparse MoE 结构、cgroup/MemAvailable headroom 决策 DEFAULT / POPULATE / SKIP，见 `src/llama-mmap.cpp` 的 `llama_mmap_populate_admit`）；② 推理阶段感知的文件预读控制（mmap 时 `POSIX_FADV_SEQUENTIAL`、首次 Decode 前切 `POSIX_FADV_NORMAL`，见 `src/llama-mmap.cpp` 的 `llama_mmap_decode_normal_once`）。三者的端到端数字与边界以根 README 第 3 节为准。
+
 ## 总体设计
 
 | 模块 | 主要路径 | 职责 |
@@ -191,7 +193,7 @@ Stage-aware heap 和 Late starvation 风险属于 M2.5 的历史结果；当前 
 
 ### 离线策略模拟
 
-`simulate_expert_cache.py` 使用已有 trace 比较不同 expert cache 预算和替换策略，避免每个候选都重跑大模型。`simulate_kv_cache_policy.py` 估算完整预留、按块提交、KV 量化、滑动窗口和预算策略的内存上界。
+历史脚本 `simulate_expert_cache.py` 曾使用已有 trace 比较不同 expert cache 预算和替换策略；该脚本已随 Expert Cache 负结果路线一并移出当前树，不应作为复现入口。`simulate_kv_cache_policy.py` 估算完整预留、按块提交、KV 量化、滑动窗口和预算策略的内存上界。
 
 历史脚本 `stage_scheduling_analysis.py` 曾从 detail trace 生成 `stage_scheduling_opportunity.json`；该脚本和对应运行时矩阵已移出当前树，不应作为复现入口。
 

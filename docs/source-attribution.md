@@ -30,7 +30,6 @@
 - `llama.cpp/src/llama-context.cpp` 中的 step trace 接入
 - `llama.cpp/trace/analyze_trace.py`
 - `llama.cpp/trace/trace_metrics.py`
-- `llama.cpp/trace/simulate_expert_cache.py`
 - `llama.cpp/trace/simulate_kv_cache_policy.py`
 - `llama.cpp/trace/compare_trace_runs.py`
 - `llama.cpp/trace/summarize_repeat_runs.py`
@@ -63,6 +62,9 @@
 
 主要公开来源：
 
+- Denning Working Set（The Working Set Model for Program Behavior，P. J. Denning，CACM 11(5), 1968）：<https://dl.acm.org/doi/10.1145/363095.363141>
+- Application-Controlled File Caching（Implementation and Performance of Application-Controlled File Caching，Cao / Felten / Li，OSDI 1994，USENIX）
+- Informed Prefetching and Caching（Patterson / Gibson / Ginting / Stodolsky / Zelenka，SOSP 1995，ACM）
 - PagedAttention / vLLM：<https://arxiv.org/abs/2309.06180>，<https://github.com/vllm-project/vllm>
 - vAttention：<https://arxiv.org/abs/2405.04437>
 - FlashAttention：<https://arxiv.org/abs/2205.14135>，<https://github.com/Dao-AILab/flash-attention>
@@ -72,7 +74,8 @@
 - H2O：<https://arxiv.org/abs/2306.14048>，<https://github.com/FMInference/H2O>
 - KIVI：<https://arxiv.org/abs/2402.02750>，<https://github.com/jy-yuan/KIVI>
 - DuoAttention：<https://arxiv.org/abs/2410.10819>，<https://github.com/mit-han-lab/duo-attention>
-- MoE-Infinity：<https://arxiv.org/abs/2401.14361>，<https://github.com/TorchMoE/MoE-Infinity>
+- MoE-Infinity（MoE-Infinity: Activation-Aware Expert Offloading for Efficient MoE Serving，Xue / Fu / Lu / Mai / Marina，University of Edinburgh，arXiv 2024）：<https://arxiv.org/abs/2401.14361>，<https://github.com/TorchMoE/MoE-Infinity>
+- ProMoE（ProMoE: Fast MoE-based LLM Serving using Proactive Caching，Song / Zhong / Chen / Chen，SJTU IPADS & ZJU，arXiv 2024）：<https://arxiv.org/abs/2410.22134>
 - SpecMD：<https://arxiv.org/abs/2602.03921>
 - ST-MoE：<https://arxiv.org/abs/2606.15453>
 - FlexInfer：<https://arxiv.org/abs/2503.03777>

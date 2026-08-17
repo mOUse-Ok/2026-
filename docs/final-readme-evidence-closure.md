@@ -17,7 +17,7 @@ Runtime Rescue 已有“检测到坏状态后暂停/限速 COLD、恢复发 hint
 |---|---|---|
 | **HEAD-Qwen** | 本轮的当前 `01817a0` binary + 真实 Qwen 运行 | P0 五次 OFF/ON、当前 Lifecycle/COLD guard。 |
 | **历史 Qwen** | `dc44a60` 提交前的 dirty 工作树运行；有 manifest 和 raw JSONL | Lifecycle 五次、Working Set scan、COLD A/B、Rescue/Calibration 阶段结果。用于机制和历史结论，不能冒充 HEAD 性能数字。 |
-| **单元** | 当前 HEAD CTest | 状态机、优先级、router 同步、memory object 与 calibration 公式。 |
+| **单元** | 当前 HEAD CTest | mmap phase admission、状态机、优先级、router 同步、memory object 与 calibration 公式。 |
 
 HEAD-Qwen 的 manifest 均记录 `git_dirty=true`，原因是本工作区已有未跟踪的 `docs/technical-archaeology-report.md`；运行前 `git diff --name-only` 为空，且所有 manifest 指向同一 HEAD、同一 binary SHA-256、同一模型 size/mtime、同一 prompt hash 和同一 cgroup。原有 `summarize_repeat_runs.py` 正确地拒绝 dirty manifest，因此本报告直接从原始 `analysis/metrics.json`、`process_metrics.json` 与 JSONL 汇总，**没有改写 manifest 来绕过校验**。
 
@@ -208,7 +208,7 @@ Calibration Shadow 的设计为 observation-only（`expert_calibration_shadow.h`
 | 当前 COLD | 两个 HEAD-Qwen guard | 每次 46,256 issued、0 failed、0 protected violation；存在 post-COLD readmission。 |
 | 当前 Rescue guard | `EXPERT_RUNTIME_RESCUE_SUMMARY` | 触发计数 0；无 suspend/bypass；输出一致。 |
 | 历史 Working Set | 256/512/1024 budget summaries | admission/eviction/readmission/protection 全部实际计数；256 MiB 的 protection 边界被显式记录。 |
-| 当前单元 | 5 个 CTest | router tensor sync、priority、lifecycle、memory object、calibration shadow 全通过。 |
+| 当前单元 | 8 个 CTest | mmap phase admission、router tensor sync、priority、lifecycle、memory object、calibration shadow 全通过。 |
 
 ## 9. 最终 README Claim → Evidence 表
 
@@ -223,7 +223,7 @@ Calibration Shadow 的设计为 observation-only（`expert_calibration_shadow.h`
 | 过度回收会造成 Prefetch degradation | COLD A/B + Rescue windows | 6 A/B + stage runs | COLD 线性能反噬；trigger 前 issued collapse | “将 COLD 保留为受保护的研究控制器。” |
 | Runtime Rescue 的恢复动作 | 历史 step summaries | 至少 2 trigger runs | detect、suspend、bypass、post-trigger issuance 都发生 | “实验性 guard 可在检测到定义的坏状态后暂停 COLD。” |
 | 正常状态下 Rescue 是否误触发 | HEAD false-positive guard | 1 ON + 1 OFF | ON trigger=0，COLD/WS/output 保持一致 | “一个高-issue guard 样本保持静默。” |
-| 整体 correctness | P0 + guard + unit tests | 12 HEAD Qwen + 5 CTest | 输出 hash 一致，trace 完整，状态不变量闭合 | “实验路径保留输出一致性与 trace 完整性检查。” |
+| 整体 correctness | P0 + guard + unit tests | 12 HEAD Qwen + 8 CTest | 输出 hash 一致，trace 完整，状态不变量闭合 | “实验路径保留输出一致性与 trace 完整性检查。” |
 
 ## 10. 可视化所需的数据表
 

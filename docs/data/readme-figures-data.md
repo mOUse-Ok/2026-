@@ -25,7 +25,7 @@ experiment directory, this index says so instead of reconstructing one.
 | `working-set-budget` | V2 §5 historical budget scan; V2 does not preserve one directory/commit identity for each point | Historical; one recorded 16-decode-token workload per budget | Evictions, readmissions, major faults | Historical mechanism evidence | Capacity-constrained working-set behavior is observable | Current-HEAD performance, a strict physical memory cap, or an improvement claim |
 | `cold-ablation` | `llama.cpp/trace_output/final-readme-v2/cold_shadow_1..3`; `cold_cold_1..3` | 01817a0; 3 shadow + 3 COLD | Wall/fault mean, issued, failed, advised bytes, readmissions | Current HEAD | In this controlled A/B, COLD-enabled runs are associated with higher wall time and faults | `madvise` success means pages were physically reclaimed; causal speedup/slowdown beyond the controlled comparison |
 | `runtime-rescue-timeline` | `llama.cpp/trace_output/final-readme-v2/rescue_on_4/memory_trace.jsonl`; exported as `runtime-rescue-on4-step-data.csv` | 01817a0; one selected current-HEAD trace; broader V2 A/B is N=5 per group | Decode-step issued count, major-fault delta, control state | Current HEAD mechanism trace | Trigger → gate bypass → COLD suspension is observable in this trace | A causal end-to-end speedup proof, or a per-step physical-reclamation measurement |
-| `correctness-summary` | `llama.cpp/trace_output/final-readme-v2/`; V2 §9 | 01817a0; 38 Qwen runs, 33 trace runs, 5 CTests | Exit codes, output SHA, trace drops, MO closure, CTest | Current HEAD | Closed-run correctness/reliability checks passed | Performance, generalization, or production-readiness proof |
+| `correctness-summary` | `llama.cpp/trace_output/final-readme-v2/`; V2 §9 | 01817a0; 38 Qwen runs, 33 trace runs, 8 CTests | Exit codes, output SHA, trace drops, MO closure, CTest | Current HEAD | Closed-run correctness/reliability checks passed | Performance, generalization, or production-readiness proof |
 
 ## Exact data transcription
 
@@ -92,7 +92,7 @@ This is state-machine evidence. It must retain the figure's caption:
 | Output equivalence | 38 / 38 identical output SHA-256 |
 | Trace integrity | 33 / 33 trace runs with zero dropped events |
 | Memory Object final invariant | pending = 0; active = 0; violations = 0 |
-| Targeted tests | 5 / 5 CTest passed |
+| Targeted tests | 8 / 8 CTest passed |
 
 ## Citation and reuse rules
 

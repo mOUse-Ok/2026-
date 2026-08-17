@@ -177,7 +177,7 @@ Plain llama.cpp (trace compiled out)
 | 6. COLD 会破坏 Prefetch？ | COLD 真实执行且与更高 faults/wall 相关；历史线更显著 | “COLD 可能伤害预取，故保持实验性。” |
 | 7. Rescue 能恢复坏状态？ | 2 pilots/ON4/ON5 有 trigger→suspend→bypass→4,800 post hints | “坏状态检测后可暂停 COLD 并恢复 hint 发出。” |
 | 8. 正常时 Rescue 静默？ | 当前同配置正常态 N=3 都未触发 | “在三个有实际 early issuance 的正常样本中保持静默。” |
-| 9. 整套系统正确？ | 38/38 hash、exit、trace 完整；5 CTest；所有终态不变量闭合 | “实验路径保持输出一致、trace 完整与状态收尾。” |
+| 9. 整套系统正确？ | 38/38 hash、exit、trace 完整；8 CTest；所有终态不变量闭合 | “实验路径保持输出一致、trace 完整与状态收尾。” |
 
 ## 12. README 最终可以写的话
 
