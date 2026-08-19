@@ -1,239 +1,108 @@
 # 开发过程记录
 
-> **Historical / Archived — Not Current Mainline**：本文是开发过程的历史记录，反映各阶段当时的设计与结论。当前冻结主线（模型映射准入、阶段感知预读、MoE 语义内存对象）以根 README 第 3 节为准；本文提到的 `feedback_slack`、`stage_deadline_score`、连续 aging 等均已退出主线，仅作历史理解。
+> **Historical / Archived — Not Current Mainline**：本文是开发过程的历史记录，按大阶段反映各时期的设计与结论。当前主线（模型映射准入、阶段感知预读、MoE 语义内存对象）以根 README 第 3 节为准；本文提到的 `feedback_slack`、`stage_deadline_score`、连续 aging 等均已退出主线，仅作历史理解。
 
 ## 说明
 
-本文档记录初赛阶段以及后续收敛阶段的主要开发过程、关键问题、解决方法和阶段性结论。更细粒度的本地实验流水记录保存在 `llama.cpp/trace_output/contest_runs/progress_log.md`，该路径用于本地实验记录，不提交仓库。
+本文档按大阶段记录初赛与后续收敛过程中的主要开发工作、关键问题、解决方法和阶段性结论。更细粒度的本地实验流水记录保存在 `llama.cpp/trace_output/contest_runs/progress_log.md`，该路径用于本地实验记录，不提交仓库。
 
-## 阶段 1：建立 trace 与 baseline
+## 大阶段一：观测链路建立与 OS hint 原型探索
 
 ### 目标
 
-建立可运行的 LLM 推理访存分析链路，观察 tensor load、KV cache、expert routing、RSS、swap 和 page faults。
+建立可运行的 LLM 推理访存分析链路，观察 tensor load、KV cache、expert routing、RSS、swap 和 page faults，并试验各类 OS 内存提示。
 
-### 处理
+### 主要工作
 
-- 在 `llama.cpp/trace/` 中扩展 trace sink。
-- 使用 `run_trace_pipeline.sh` 自动运行推理、收集 JSONL trace、生成分析结果。
-- 使用 `analyze_trace.py` 聚合关键指标。
+- 在 `llama.cpp/trace/` 扩展 trace sink；`run_trace_pipeline.sh` 自动运行推理并收集 JSONL trace；`analyze_trace.py` 聚合关键指标。
+- 实现默认关闭的 OS hint 实验路径：`madvise(MADV_WILLNEED / MADV_SEQUENTIAL)`、`posix_fadvise(POSIX_FADV_WILLNEED / POSIX_FADV_SEQUENTIAL)` 与 expert-aware prefetch，全部通过环境变量开启，不改变默认推理行为。
+- trace-driven 离线模拟 `lru` / `lfu` / `window_lfu` / `least_stale` 等替换策略（128–1024 MiB 预算），评估有限 cache budget 下替代 route prefetch 的可行性（含修正 `least_stale` heap 排序方向错误）。
+- 测试 route top-k 截断与 slice coalescing 以降低 syscall 数量。
+- 将同步 hint 调用改为用户态异步队列（`EXPERT_ASYNC_SUMMARY` 记录 enqueue / issued / queue depth）。
+- 尝试 deadline-aware priority（`score` / `deadline` / `deadline_score`）与 route hint TTL；引入 `summarize_repeat_runs.py` 与 N 次重复矩阵。
 
-### 结果
+### 阶段性结论
 
-baseline 能稳定产出 tensor、KV、expert、memory trace，为后续 OS hint 实验提供对照。
+- baseline 稳定产出 tensor / KV / expert / memory trace，为后续实验提供对照。
+- 早期样本曾显示 expert prefetch 可能降低 major faults 和 decode latency，但受实验条件影响，未直接作为性能结论。
+- 负结果：朴素 LRU/LFU 在 ≤1 GiB 预算下 miss/eviction 过高；top-k 显著破坏 prefetch coverage；coalescing 受限于 expert slice 地址连续性——简单截断不可行。
+- 异步化能消除 syscall 对 decode 路径的直接影响，但 FIFO 调度不足；`decode_ttl1` 减少 hint calls 但延迟与 RSS 无稳定优势。
 
-## 阶段 2：安全 OS hint 原型
-
-### 问题
-
-LLM 推理首次访问权重和 MoE expert slice 时存在 major faults 集中爆发，decode latency 受到影响。
-
-### 解决方法
-
-实现默认关闭的 OS hint 实验路径：
-
-- `madvise(MADV_WILLNEED)`
-- `madvise(MADV_SEQUENTIAL)`
-- `posix_fadvise(POSIX_FADV_WILLNEED)`
-- expert-aware prefetch
-
-所有策略通过环境变量开启，避免改变默认推理行为。
-
-### 结论
-
-早期样本曾显示 expert-aware prefetch 可能降低 major faults 和 decode latency，但同时提高 RSS 并产生大量 hint calls。该观察受实验条件影响，后续没有直接作为当前性能结论。
-
-## 阶段 3：Expert cache 替换策略模拟
+## 大阶段二：主动控制探索与回退
 
 ### 问题
 
-需要判断 LRU/LFU/window-LFU/least-stale 是否能在有限 cache budget 下替代 route prefetch。
+静态排序不知道系统是否正在 refault，也不能判断任务出队时是否已错过使用期限；简单跨层预测可能增加误取页面和 RSS。
 
-### 解决方法
-
-实现 trace-driven 离线模拟，比较：
-
-- `route`
-- `lru`
-- `lfu`
-- `window_lfu`
-- `least_stale`
-
-并测试 128/256/512/768/1024 MiB 预算。
-
-### 遇到的问题
-
-heap 化 `least_stale` eviction 时初版排序方向错误，可能淘汰更早复用的 item。修正后改为优先淘汰预计更晚复用的 item。
-
-### 结论
-
-在当前 trace 下，朴素 LRU/LFU 类策略在 <=1 GiB 预算下 miss 和 eviction 过高，不适合作为真实运行主候选。
-
-## 阶段 4：Route top-k 和 coalescing
-
-### 问题
-
-完整 route prefetch 保留 coverage，但 hint calls 太高。需要减少 syscall 数量。
-
-### 解决方法
-
-- 测试 `LLM_MEM_TRACE_OPT_EXPERT_PREFETCH_TOPK=1/2/4/6`。
-- 实现 route slice coalescing。
-
-### 结论
-
-top-k 会显著破坏 prefetch coverage，major faults 回升明显。coalescing 受限于 expert slice 地址连续性，收益有限。因此不能通过简单截断解决问题。
-
-## 阶段 5：异步 expert prefetch
-
-### 问题
-
-同步 hint call 会干扰 decode 关键路径。
-
-### 解决方法
-
-实现用户态异步 hint queue：
-
-- `LLM_MEM_TRACE_OPT_EXPERT_ASYNC`
-- `LLM_MEM_TRACE_OPT_EXPERT_ASYNC_QUEUE`
-- `LLM_MEM_TRACE_OPT_EXPERT_ASYNC_WORKERS`
-
-增加 `EXPERT_ASYNC_SUMMARY`，记录 enqueue、issued、fallback、queue depth 等指标。
-
-### 结论
-
-异步化能降低 syscall 对 decode 路径的直接影响，但 FIFO 不够，需要优先级调度。
-
-## 阶段 6：Deadline-aware priority
-
-### 问题
-
-异步队列如果不区分任务紧迫度，可能先处理距离使用点较远的 expert slice。
-
-### 解决方法
-
-实现 priority mode：
-
-- `score`
-- `deadline`
-- `deadline_score`
-
-其中 `deadline_score` 先按 step/layer 接近程度排序，再按 route score 排序。
-
-### 阶段观察
-
-早期 N=3 重复实验中，`deadline_score` 在当时的采集口径下表现较好，因此被选入正式复测候选。该结论不再作为最终获胜结论。
-
-## 阶段 7：Route TTL 与重复实验
-
-### 问题
-
-需要减少重复 hint，并避免单次运行噪声影响结论。
-
-### 解决方法
-
-- 实现 route hint TTL。
-- 将大量 skip 明细改成 `EXPERT_ROUTE_HINT_SUMMARY`。
-- 新增 `summarize_repeat_runs.py` 聚合 N 次运行。
-- 新增 `run_finalist_repeat_matrix.sh` 固化最终矩阵。
-
-### 阶段观察
-
-`decode_ttl1` 在早期数据中减少了 hint calls，但延迟和 RSS 未显示稳定优势。N=3 数据保留为研发记录，后续性能结论改用更严格的受控重复实验。
-
-## 阶段 8：可信基准修订
-
-### 问题
-
-复核旧实验后发现，单次运行是否可比较缺少强制证据：推理阶段计时边界、文件缓存状态、trace 丢失、全进程 faults、输入输出一致性和运行顺序都可能影响结论。
-
-### 解决方法
-
-- 以一次 `process_ubatch()` 为权威范围增加 `STEP_BEGIN/STEP_END`，旧 `TOKEN_END` 仅保留兼容。
-- 为每个 trace sink 增加 `enqueued/written/dropped` 计数；正式证据要求零丢失。
-- 增加 `evidence` 与 `benchmark` profile，区分完整观测和低开销性能测试。
-- 使用文件级 `POSIX_FADV_DONTNEED` 准备冷缓存，失败时拒绝运行。
-- 使用 GNU time 采集全进程 wall time、峰值 RSS、major/minor faults 和文件 I/O。
-- 每次运行生成 Manifest、缓存准备结果、进程指标、trace summary、输出哈希和分析指标。
-- 正式矩阵采用四方案位置轮换，默认 N=8；聚合器拒绝脏仓库、缺失产物、条件不一致和输出不一致的样本。
-- 修正 Pareto 缺失值处理，删除脚本自动生成的固定“最佳策略”结论。
-
-### 阶段结论
-
-旧 N=3 数据可用于候选筛选，但证据强度不足以支撑最终排名。下一次正式结论必须来自 clean commit、可验证冷缓存、零丢失 trace、固定 cgroup 条件和 N=8 位置轮换矩阵。
-
-## 阶段 9（历史探索）：双反馈、slack 取消与成本门控预测
-
-### 问题
-
-旧 `deadline_score` 只按 step/layer 和 router score 静态排序，不知道系统是否正在 refault，也不能判断任务出队时是否已经错过使用期限。简单跨层预测还可能增加误取页面和 RSS。
-
-### 解决方法
+### 主要工作
 
 - 读取 cgroup v2 memory current/high/max、swap、PSI 和 workingset refault 增量，将压力分为四级并动态缩放 expert 预算。
-- 使用每层执行时间和 hint 系统调用时间 EWMA 估计 slack；priority heap 按真实 deadline 排序。
-- worker 出队时重新检查 deadline、压力和 value ratio，支持取消，不回退到推理线程同步调用。
-- 增加有 100 us 等待上限的 micro-batch 和相邻区间合并。
-- 按 token 在线学习相邻层 expert 转移，生成有最小样本和置信度要求的 top-2 候选。
-- 预测候选继续接受成本和压力门控，单独报告 precision/recall 与实际 predicted prefetch 数。
+- 用每层执行时间和 hint 系统调用时间 EWMA 估计 slack，priority heap 按真实 deadline 排序；worker 出队时复查 deadline、压力和 value ratio，支持取消。
+- 增加有 100 µs 等待上限的 micro-batch 与相邻区间合并；按 token 在线学习相邻层 expert 转移，生成带最小样本和置信度要求的 top-2 预测候选。
 
-### 功能观察
+### 阶段性结论
 
-`feedback_slack_predict` 短 smoke 中预测 precision 为 60.13%，set hit rate 为 80.13%。当时 WSL 根 cgroup 呈高 PSI/refault，控制器共执行 636 次 hint，其中 72 次来自跨层预测，并按 slack 取消 24 项。该结果说明控制链生效，但不构成性能改善证据。
+- `feedback_slack_predict` 短 smoke 中预测 precision 60.13%、set hit rate 80.13%；控制器共执行 636 次 hint，其中 72 次来自跨层预测，按 slack 取消 24 项——控制链生效，但不构成性能改善证据。
+- 该方向整体作为历史探索回退：连续 aging、reserved service、复杂 pressure/shadow、Stage priority 等支线不再进入主线，可执行 controller 收敛为 `off` 与 `expert_prefetch`。这次清理降低了文档和代码把实验性想法误写成稳定能力的风险。
 
-## 阶段 10：控制器收敛与实验路径清理（2026-08-03～08-07）
+## 大阶段三：实验方法论加固与语义内存对象
 
-### 处理
+### 问题
 
-- 对专家预取任务、Router 读取同步和最大等待保护进行了最后一轮检查。
-- 回退连续 aging、reserved service、复杂 pressure/shadow 和 Stage priority 等支线。
-- 删除不再进入当前主线的实验脚本和测试，并将本地 `experiments/` 归档目录从版本控制中排除。
+单次运行是否可比较缺少强制证据；hint 之外还需要把“哪些语义对象正在被使用”显式建模。
 
-### 阶段结论
+### 主要工作
 
-当前可执行 pipeline 收敛为 `off` 与 `expert_prefetch` 两个 controller；旧的
-`feedback_slack`、`feedback_slack_predict`、`stage_deadline_score` 等名称只保留在历史报告中。
-这次清理降低了文档和代码把实验性想法误写成稳定能力的风险。
+- 可信基准修订：以 `process_ubatch()` 为权威范围增加 `STEP_BEGIN/STEP_END`；每个 trace sink 增加 `enqueued/written/dropped` 计数（正式证据要求零丢失）；增加 `evidence` 与 `benchmark` profile；文件级 `POSIX_FADV_DONTNEED` 冷缓存准备（失败时拒绝运行）；GNU time 采集全进程指标；每次运行生成 Manifest 与输出哈希；正式矩阵四方案位置轮换，聚合器拒绝脏仓库、缺失产物与输出不一致的样本。
+- Memory Object：以 `(layer, expert, tensor)` 为核心的状态追踪，含 Working Set、eviction/probation、slot、stale demand 等语义记录，并配定向单元测试。
+- Calibration Shadow（默认关闭）：记录 prefetch、fault 和 COLD candidate 的环境尺度。
+- Residency Attribution：`RESIDENCY_DEMAND` 事件，按 Routed Expert / Shared Expert / Attention / Embedding / Norm 等对象类别统计 resident/nonresident bytes；`TRACE_PROFILE=attribution` 支持 Unlimited 与 `MemoryMax=7G` 的对象级观察。
 
-## 阶段 11：Memory Object 与 Calibration Shadow（2026-08-08）
+### 阶段性结论
 
-### 处理
+- 旧 N=3 数据仅用于候选筛选；正式结论必须来自 clean commit、可验证冷缓存、零丢失 trace、固定 cgroup 条件和位置轮换重复矩阵。
+- Memory Object 首先验证状态闭环和观测字段（demand / first-use / lifecycle），不直接宣称性能收益；Residency Attribution 用于解释“哪些语义对象在使用前更可能不驻留”，不是 Major Fault 的因果归因。
 
-- 增加以 `(layer, expert, tensor)` 为核心的 Memory Object 状态追踪。
-- 增加 Working Set、eviction/probation、slot 和 stale demand 等语义记录。
-- 增加默认关闭的 Calibration Shadow，记录 prefetch、fault 和 COLD candidate 的环境尺度。
-- 为 Memory Object 和 Calibration Shadow 增加定向单元测试。
+## 大阶段四：三条主线机制成型
 
-### 阶段结论
+在上述观测链路、实验方法论与语义对象的基础上，系统沿“文件预读原语 → 阶段感知切换”和“cgroup/冷缓存方法论 → 资源感知准入”两条演化线，形成最终三条主线机制（正式口径与数字见根 README 第 3 节）。
 
-这部分首先验证状态闭环和观测字段，不直接宣称性能收益；后续如果要形成性能结论，仍需单独的受控模型运行。
+### 1. 资源约束感知的模型映射准入（`LLAMA_MMAP_POPULATE_POLICY`）
 
-## 阶段 12：README 与证据整理（2026-08-10）
+- 动机：`MAP_POPULATE` 预填充是全有或全无；模型接近或超过 cgroup 限额时，强制预填充会触发大量 reclaim/refault 循环。
+- 机制：根据模型 mmap 大小、Sparse MoE 结构（活跃 Expert 占比）、cgroup 限额与 `MemAvailable` 计算的 fit ratio / headroom，在 `DEFAULT / POPULATE / SKIP / AUTO` 中决策 mmap 策略。
+- 实验：M2 压力实验（3 MemoryMax × 3 policy × N=3 = 27 runs，Latin square 交错，冷缓存准备，输出 SHA 全部一致、无 OOM）。12 GiB 下 `AUTO` 相比强制 `POPULATE`：wall −34.1%、major faults −21.7%、decode p95 −11.1%、TPS +13.95%。边界：不声称避免 OOM、不声称全局最优、不声称跨模型泛化。正式证据见 `experiments/report_result/07_m2_mmap_pressure_result.md`。
 
-根据当前 HEAD 的代码和已有实验，对 README、图表、证据边界和技术考古材料进行整理。主要调整是把“可运行机制”“历史结果”“负结果”和“尚未证明的性能收益”分开，避免用早期 N=3 数字代表当前系统。
+### 2. 推理阶段感知的文件预读控制（`LLAMA_MMAP_DECODE_NORMAL`）
 
-## 阶段 13：对象级 Residency Attribution（2026-08-12）
+- 动机：`POSIX_FADV_SEQUENTIAL` 对顺序加载友好，但 Decode 阶段 MoE 的 expert 访问由 Router 决定，预读窗口会造成跨 Expert 邻页过取。
+- 机制：mmap 时施加 `POSIX_FADV_SEQUENTIAL`，在首次 Decode 前切换回 `POSIX_FADV_NORMAL`。
+- 实验：严格 A/B（20 GiB cgroup、skip-populate cold-page、N=3 interleaved、单一变量）。未路由相邻 Expert 新增驻留页 2246.7 → 965.0（−57.0%）；Router 选中 Expert 5265 → 5265 保持一致；端到端性能基本持平。准确表述是**减少跨 Expert 邻页过取**，不是端到端性能提升。正式证据见 `experiments/report_result/09_decode_normal_ab_result.md`。
 
-### 处理
+### 3. MoE Expert 语义内存对象管理
 
-- 在语义 tensor demand 前增加 `RESIDENCY_DEMAND` 事件。
-- 按 Routed Expert、Shared Expert、Attention、Embedding、Norm 等对象类别统计 resident/nonresident bytes 和页级信息。
-- 增加 `analyze_residency_attribution.py`、`summarize_experiment_4b.py` 和 `run_experiment_4b.sh`。
-- 增加 `TRACE_PROFILE=attribution`，支持 Unlimited 与 `MemoryMax=7G` 的对象级观察实验。
+- 映射链：`Router` → `(layer, expert)` → `ExpertTensorRegistry` → `(layer, expert, tensor)` → mmap 虚拟地址区间 → Expert Memory Object。
+- 状态闭环证据：16 GiB 档 semantic demands 102,186 / unmatched 0 / invariant violation 0；demand / first-use / lifecycle 全部闭合。
 
-### 阶段结论
+### Router Prefetch 压力窗口（行为边界，非性能贡献）
 
-Residency Attribution 用于解释“哪些语义对象在使用前更可能不驻留”，不是 Major Fault 的因果归因，也不是性能提升证明。当前仍以 N=1/小规模观察和脚本链路为主，正式结论需要后续人工整理。
+- 16–19 GiB transient sweep：19G Moderate 发出 5,067 hint、18G/17G High 分别发出 102,172 / 102,177、16G Critical 全部抑制（0 hint），四档均无 reclaim；16G 为 value-gate 全抑制档位。
+- 12 GiB server tight-memory anchor：真实 reclaim（pgscan 7,307,338 / pgsteal 2,703,337 / events.max 81,142）下 created 20,184、rejected_pressure 2,181、rejected_value 0、issued 18,003，无 OOM，输出一致。
+- 两组运行模式、token 数、trace profile、provenance 不同，不可直接横向比较，均不作为 Prefetch 性能收益证据。正式口径：Router 提供 Expert 需求，系统结合内存压力、任务价值和需求时效决定是否执行 OS Hint。证据见 `experiments/report_result/08_prefetch_pressure_window_result.md` 与 `10_prefetch_12g_reclaim_anchor.md`。
+
+### Working Set / DONTNEED 边界结果
+
+Working Set wall 约 +92.9%、DONTNEED 约 +41.6%；结论为“逻辑 Working Set budget 不等同于物理 Page Cache residency”，作为负结果/边界保留。
+
+## 大阶段五：文档与证据整理（收尾）
+
+- 把“可运行机制”“历史结果”“负结果”和“尚未证明的性能收益”分开，将 README 重组为三项核心贡献，避免用早期 N=3 数字代表当前系统。
+- 统一测试口径（8/8 CTest、14/14 Python Trace Tests），修正 M2 RESULT.md 中与冻结 CSV 不符的陈旧数字，补全 Related Work 出处。
+- 将四份正式证据（07–10）入库 `experiments/report_result/`，原始大体积实验载荷按仓库约定不入库。
 
 ## 当前状态
 
-- 当前主线：`off`、`expert_prefetch`、trace 完整性校验、异步 hint 和 deadline-score。
-- 当前实验性扩展：Memory Object、Working Set、Calibration Shadow、`MADV_COLD` 和 Residency Attribution，默认关闭或单独运行。
-- 历史归档：通用 expert cache、Stage priority、slack/pressure 主动控制、跨层预测、continuous aging 和 reserved service。
-- 当前更可信的项目定位是语义内存观测与专家 hint 实验平台，尚未证明跨环境稳定的端到端加速。
-
-## 后续计划
-
-- 在当前 HEAD 上完成最小 `off`/`expert_prefetch` 受控矩阵，确认输出、trace 和指标口径一致。
-- 单独复核 Memory Object、Calibration Shadow 和 Residency Attribution 的开关影响，避免把观察成本混入性能结果。
-- 根据实验数据补充不同内存上限、输入长度和模型条件；没有足够证据时保持结论为阶段性观察。
+- 主线：①资源约束感知的模型映射准入；②推理阶段感知的文件预读控制；③MoE 语义内存对象管理（正式口径见根 README 第 3 节）。
+- Controller 现状：可执行 controller 收敛为 `off` 与 `expert_prefetch`；Router Prefetch 不作性能收益声明。
+- 研究机制（默认关闭或单独运行）：Memory Object、Working Set、Calibration Shadow、`MADV_COLD`、Residency Attribution。
+- 历史归档：通用 expert cache、Stage priority、slack/pressure 主动控制、跨层预测、continuous aging、reserved service。

@@ -19,17 +19,17 @@
 | Application-Controlled File Caching（Cao / Felten / Li，OSDI 1994） | 应用参与文件缓存决策优于纯 LRU | 思想来源：启发“Runtime 比 OS 更了解后续访问”的用户态 hint 路线 |
 | Informed Prefetching and Caching（Patterson et al.，SOSP 1995） | 用披露的访问信息指导预取与缓存 | 思想来源：启发 trace → hint → first-use 反馈闭环的实验形态 |
 
-### 相近 MoE 工作
+### 相近工作
 
 | 项目或方向 | 主要能力 | 本项目的关系与差异 |
 | --- | --- | --- |
 | MoE-Infinity（Xue et al.，arXiv 2024） | 序列级 expert 激活追踪、缓存与预取 | 相近工作：同处 expert 语义缓存问题空间；本项目把真实路由信息映射到 Linux 页面提示，并记录物理内存和缺页反馈 |
 | ProMoE（Song et al.，arXiv 2024） | Expert offloading 场景中的预测、预取与主动缓存（proactive caching） | 相近工作：面向 PCIe host→GPU offloading 的预测式预取；本项目面向 CPU mmap / Page Cache，不搬运 tensor |
 | SpecMD Least-Stale | 基于陈旧程度的替换决策 | 本项目仅在离线 trace 模拟器中实现和比较，不把模拟命中率等同于运行时收益 |
-| PagedAttention、vAttention | KV cache 分页和虚拟内存管理 | 本项目已有 KV trace、预算模拟和 cgroup 压力矩阵，尚未声称完成运行时分页 KV allocator |
+| PagedAttention、vAttention | KV cache 分页和虚拟内存管理 | 本项目已有 KV trace、预算模拟和 cgroup 压力矩阵 |
 | Linux MGLRU、DAMON、PSI、cgroup v2 | 页面回收、访问监测、压力观测和资源限制 | 本项目不修改内核，利用模型语义补充内核不可见的信息，并通过官方接口施加提示和采集反馈 |
 | FlexInfer、SP-MoE | 设备端卸载、异步预取、批量 I/O 和及时到达模型 | 本项目不做 CPU-GPU tensor 搬运，而是控制 Linux 文件映射页；异步 hint 是保留的实验路径 |
-| OD-MoE 等跨层预测工作 | 提前预测后续层 expert 并及时加载 | 本项目曾做过无训练的相邻层预测探索，但当前已归档，不把预测准确率写成系统收益 |
+
 
 ## 2. 相对基础 llama.cpp 的新增能力
 
@@ -67,7 +67,7 @@ Controller 入口当前为 `off` 与 `expert_prefetch`；双反馈、slack、Sta
 
 ## 5. 与简单 top-k 预取的差异
 
-历史探索中，直接减少 routed expert 数量虽然降低 hint 数，却可能损失预取覆盖率并增加 major faults。当前路线保留语义覆盖，通过异步执行、优先级和 TTL 降低关键路径干扰。COLD、Working Set 和 Residency Attribution 主要用于研究对象状态与驻留风险，不能简单等同于页回收或性能提升。
+历史探索中，直接减少 routed expert 数量虽然降低 hint 数，却可能损失预取覆盖率并增加 major faults。当前路线保留语义覆盖，通过异步执行、优先级和 TTL 降低关键路径干扰。COLD、Working Set 和 Residency Attribution 主要用于研究对象状态与驻留风险。
 
 ## 6. 可信度方面的改进
 
